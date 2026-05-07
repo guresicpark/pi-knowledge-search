@@ -1,6 +1,6 @@
 # pi-knowledge-search
 
-Hybrid search over local files for [pi](https://github.com/badlogic/pi). Indexes directories of text/markdown files using vector embeddings **and** SQLite FTS5 keyword search, watches for changes in real-time, and exposes a `knowledge_search` tool the LLM can call.
+Hybrid search over local files for [pi](https://github.com/badlogic/pi). Indexes directories of text/markdown files using vector embeddings **and** SQLite FTS5 keyword search, and exposes a `knowledge_search` tool the LLM can call. Indexing runs on session startup (file changes mid-session are picked up on next restart or via `/knowledge-sync`).
 
 ## How search works
 
@@ -194,9 +194,10 @@ Every config field can be overridden via environment variables. This is useful f
 ## How it works
 
 1. On session start, loads the index from disk and incrementally syncs — only re-embeds new or modified files
-2. Starts a file watcher for real-time updates (debounced, 2s)
-3. Registers a `knowledge_search` tool the LLM calls with natural language queries
-4. Returns ranked results with file paths, relevance scores, and content excerpts
+2. Registers a `knowledge_search` tool the LLM calls with natural language queries
+3. Returns ranked results with file paths, relevance scores, and content excerpts
+
+Sync runs on session startup only. Files changed mid-session won't be searchable until the next session start or a manual `/knowledge-reindex`.
 
 The index is stored at `~/.pi/knowledge-search/index.json`.
 
@@ -216,7 +217,6 @@ Typical numbers for ~500 markdown files (~20MB):
 | ----------------------------- | ------ |
 | Full index build              | ~7s    |
 | Incremental sync (no changes) | ~12ms  |
-| File re-embed (watcher)       | ~200ms |
 | Search query                  | ~250ms |
 | Index file size               | ~5MB   |
 
