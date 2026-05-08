@@ -76,6 +76,7 @@ function makeConfig(dir: string, dimensions = 4): Config {
     provider: null,
     indexDir: dir,
     knowledgeBases: [],
+    overview: { inject: false, maxDepth: 2, maxFoldersPerDir: 20, maxKeywordsPerFolder: 5 },
   };
 }
 

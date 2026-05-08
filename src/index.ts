@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, SessionEntry } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { fork } from "node:child_process";
 import * as fs from "node:fs";
@@ -7,6 +7,8 @@ import { loadConfig, saveConfig, getConfigPath, type Config, type ConfigFile } f
 import { createEmbedder } from "./embedder.js";
 import { KnowledgeIndex } from "./index-store.js";
 import { BedrockKBSearcher } from "./kb-searcher.js";
+import { buildOverview, formatOverview } from "./overview.js";
+import { resolveNote, readNote } from "./kb-reader.js";
 
 export default function (pi: ExtensionAPI) {
   let index: KnowledgeIndex | null = null;
@@ -15,6 +17,61 @@ export default function (pi: ExtensionAPI) {
   let sessionCwd: string | undefined;
   let syncDone = false;
   let workerExitExpected = false;
+
+  /**
+   * Build and inject the folder+keyword overview as a custom message.
+   * @param force When true, inject even if one is already present.
+   *              Used by /knowledge-overview after config changes or vault growth.
+   * @returns Information about what happened for user-facing feedback.
+   */
+  function injectOverview(
+    ctx: {
+      sessionManager: { getEntries: () => SessionEntry[] };
+    },
+    force: boolean
+  ):
+    | { status: "skipped"; reason: string }
+    | { status: "injected"; totalNotes: number; sourceCount: number } {
+    if (!index || !currentConfig) return { status: "skipped", reason: "not configured" };
+    if (!force && !currentConfig.overview.inject) {
+      return { status: "skipped", reason: "overview.inject=false" };
+    }
+    if (index.size() === 0) return { status: "skipped", reason: "index is empty" };
+
+    if (!force) {
+      const alreadyInjected = ctx.sessionManager
+        .getEntries()
+        .some(
+          (e: SessionEntry) =>
+            e.type === "custom_message" && e.customType === "knowledge-overview"
+        );
+      if (alreadyInjected) return { status: "skipped", reason: "already injected" };
+    }
+
+    const overview = buildOverview(index.listFiles(), currentConfig.dirs, {
+      maxDepth: currentConfig.overview.maxDepth,
+      maxFoldersPerDir: currentConfig.overview.maxFoldersPerDir,
+      maxKeywordsPerFolder: currentConfig.overview.maxKeywordsPerFolder,
+    });
+    const text = formatOverview(overview);
+    if (!text) return { status: "skipped", reason: "empty overview" };
+
+    pi.sendMessage({
+      customType: "knowledge-overview",
+      content: text,
+      display: true,
+      details: {
+        totalNotes: overview.totalNotes,
+        sourceCount: overview.sources.length,
+        forced: force,
+      },
+    });
+    return {
+      status: "injected",
+      totalNotes: overview.totalNotes,
+      sourceCount: overview.sources.length,
+    };
+  }
 
   // ------------------------------------------------------------------
   // Lifecycle
@@ -46,6 +103,20 @@ export default function (pi: ExtensionAPI) {
     if (!index) {
       syncDone = true;
       return; // KB-only mode — no local index to sync
+    }
+
+    // ----------------------------------------------------------------
+    // Inject a folder+keyword overview of the vault as a custom message,
+    // unless one is already in the session or the user disabled it.
+    // Runs off whatever the index has loaded from disk — the worker's
+    // incremental sync below will update the store for future sessions.
+    // ----------------------------------------------------------------
+    try {
+      injectOverview(ctx, false);
+    } catch (err: unknown) {
+      // Overview is a nice-to-have — never let it break startup.
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`knowledge-search: overview injection failed: ${msg}`);
     }
 
     // Sync in a child process so it never blocks the main event loop
@@ -320,6 +391,27 @@ export default function (pi: ExtensionAPI) {
   // Reindex command
   // ------------------------------------------------------------------
 
+  pi.registerCommand("knowledge-overview", {
+    description:
+      "Rebuild and re-inject the knowledge-search vault overview (use after config changes or vault growth)",
+    handler: async (_args, ctx) => {
+      try {
+        const result = injectOverview(ctx, true);
+        if (result.status === "injected") {
+          ctx.ui.notify(
+            `Overview re-injected: ${result.totalNotes} notes, ${result.sourceCount} source dir(s).`,
+            "info"
+          );
+        } else {
+          ctx.ui.notify(`Overview not injected: ${result.reason}.`, "warning");
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        ctx.ui.notify(`Overview injection failed: ${msg}`, "error");
+      }
+    },
+  });
+
   pi.registerCommand("knowledge-reindex", {
     description: "Force full re-index of all configured knowledge directories",
     handler: async (_args, ctx) => {
@@ -427,6 +519,121 @@ export default function (pi: ExtensionAPI) {
       } catch (err: any) {
         throw new Error(`knowledge-search failed: ${err.message}`);
       }
+    },
+  });
+
+  // ------------------------------------------------------------------
+  // Read tool — resolve a note reference (wikilink, basename, fuzzy name)
+  // to a file in the indexed vault and return its content. Complements
+  // knowledge_search by letting the agent pull a known note without first
+  // running grep/find to get an absolute path.
+  // ------------------------------------------------------------------
+  const readParams = Type.Object({
+    name: Type.String({
+      description:
+        "Note reference: filename, basename, relative path, or [[wikilink]]. Examples: 'evergreen/hybrid-search', 'Hybrid search.md', '[[Hybrid search]]', '[[evergreen/hybrid-search|alias]]'.",
+    }),
+    max_bytes: Type.Optional(
+      Type.Number({
+        description: "Truncate output to at most this many bytes (default 65536).",
+      })
+    ),
+  });
+  type ReadDetails = { resolvedPath?: string; candidates?: string[]; truncated?: boolean };
+
+  pi.registerTool<typeof readParams, ReadDetails>({
+    name: "kb_read",
+    label: "KB Read",
+    description:
+      "Read a note from the knowledge base by name, relative path, or [[wikilink]]. Resolves fuzzy references without needing an absolute path — use this when you know the note's title/filename but not its full path on disk.",
+    promptGuidelines: [
+      "Use kb_read when a note is referenced by name or [[wikilink]] — don't run find/grep first.",
+      "Use the standard `read` tool for non-indexed files or when you already have an absolute path.",
+    ],
+    parameters: readParams,
+    async execute(_toolCallId, params) {
+      if (!index || index.size() === 0) {
+        const msg = !index
+          ? "knowledge-search is not configured. Run /knowledge-search-setup to set it up."
+          : !syncDone
+            ? "Index is still syncing in the background. Try again in a moment."
+            : "Index is empty.";
+        return { content: [{ type: "text", text: msg }], details: {} };
+      }
+
+      const result = resolveNote(params.name, index.listFiles(), {
+        fileExtensions: currentConfig?.fileExtensions,
+        cwd: sessionCwd,
+      });
+
+      if (result.matches.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No note matched "${result.normalizedRef}". Try knowledge_search with a topic query to find related notes.`,
+            },
+          ],
+          details: {},
+        };
+      }
+
+      if (!result.unique && result.matches.length > 1) {
+        const home = process.env.HOME || "";
+        const listed = result.matches
+          .map((m, i) => {
+            const display = home && m.absPath.startsWith(home) ? m.absPath.replace(home, "~") : m.absPath;
+            return `${i + 1}. ${display}  _(${m.reason})_`;
+          })
+          .join("\n");
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `"${result.normalizedRef}" is ambiguous. ${result.matches.length} candidates:\n\n${listed}\n\n` +
+                `Call kb_read again with a more specific path (e.g. the exact relative path) to disambiguate.`,
+            },
+          ],
+          details: { candidates: result.matches.map((m) => m.absPath) },
+        };
+      }
+
+      const match = result.matches[0];
+      let note;
+      try {
+        note = readNote(match.absPath, {
+          maxBytes: params.max_bytes,
+        });
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text", text: `Failed to read ${match.absPath}: ${msg}` }],
+          details: {},
+        };
+      }
+
+      const home = process.env.HOME || "";
+      const display = home && note.path.startsWith(home) ? note.path.replace(home, "~") : note.path;
+      const truncNote = note.truncated
+        ? `\n\n_(truncated: showing first ${note.content.length} of ${note.totalBytes} bytes)_`
+        : "";
+      const section = result.subheading ? ` — section "${result.subheading}"` : "";
+      // When a single low-confidence match slips through (fuzzy substring), flag
+      // the reason so the agent can decide whether to trust the result or refine
+      // the reference. High-confidence tiers are resolved silently.
+      const fuzzyNote = !result.unique
+        ? `\n\n_(fuzzy match via ${match.reason} — if this isn't the note you meant, re-run kb_read with a more specific path)_`
+        : "";
+      const header = `# ${display}${section}${truncNote}${fuzzyNote}\n\n`;
+
+      return {
+        content: [{ type: "text", text: header + note.content }],
+        details: {
+          resolvedPath: match.absPath,
+          truncated: note.truncated,
+        },
+      };
     },
   });
 }

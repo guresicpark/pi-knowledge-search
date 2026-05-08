@@ -1,6 +1,8 @@
 # pi-knowledge-search
 
-Hybrid search over local files for [pi](https://github.com/badlogic/pi). Indexes directories of text/markdown files using vector embeddings **and** SQLite FTS5 keyword search, and exposes a `knowledge_search` tool the LLM can call. Indexing runs on session startup (file changes mid-session are picked up on next restart or via `/knowledge-sync`).
+Hybrid search over local files for [pi](https://github.com/badlogic/pi). Indexes directories of text/markdown files using vector embeddings **and** SQLite FTS5 keyword search, and exposes `knowledge_search` + `kb_read` tools the LLM can call. Indexing runs on session startup (file changes mid-session are picked up on next restart or via `/knowledge-sync`).
+
+On session start, injects a folder+keyword overview of the indexed vault as a custom message so the model knows what’s worth searching for before it asks.
 
 ## How search works
 
@@ -10,6 +12,42 @@ Every query runs against two backends in parallel and fuses the results via Reci
 - **BM25 full-text** via SQLite FTS5 — good for exact matches, proper nouns, error strings, file paths, code identifiers
 
 Docs that both backends agree on get boosted; either backend alone still surfaces relevant hits. If the embedder fails transiently, search falls back to pure BM25; if the FTS side-car is empty, it falls back to pure vector. Existing users upgrade seamlessly — the FTS side-car is backfilled from the vector index on first load with no re-embedding needed.
+
+## Tools
+
+The extension registers two LLM-facing tools:
+
+| Tool | What it does |
+|------|--------------|
+| `knowledge_search` | Hybrid vector + BM25 search over indexed files (and any Bedrock Knowledge Bases). Returns passage-level excerpts ranked by Reciprocal Rank Fusion. |
+| `kb_read` | Resolve a note reference — `[[wikilink]]`, basename, or relative path — to an indexed file and return its full content. Use when the model knows a note's name but not its full path, instead of running find/grep first. |
+
+`kb_read` handles `[[Foo]]`, `[[Foo|alias]]`, `[[Foo#Heading]]`, bare names with or without extension (`Foo`, `Foo.md`), and relative paths (`evergreen/foo`). Multi-match references get a disambiguation prompt instead of guessing.
+
+## Overview injection
+
+On session start, pi-knowledge-search injects a one-shot folder+keyword summary of the indexed vault as a custom message. This gives the model a prior on what's in the knowledge base without having to discover the structure through trial-and-error searches.
+
+The overview is built from whatever the index has loaded from disk — no extra scan — and includes:
+
+- Folders grouped at configurable depth, sorted by note count
+- Top keywords per folder (TF-IDF over filenames and headings)
+- Optional `NAPKIN.md` / `README.md` / `_about.md` body as folder context
+
+Override settings in the config file:
+
+```json
+{
+  "overview": {
+    "inject": true,
+    "maxDepth": 2,
+    "maxFoldersPerDir": 20,
+    "maxKeywordsPerFolder": 5
+  }
+}
+```
+
+Or via env vars: `KNOWLEDGE_SEARCH_OVERVIEW_INJECT=false` disables injection, `KNOWLEDGE_SEARCH_OVERVIEW_MAX_DEPTH=3` deepens bucketing, etc.
 
 ## Install
 
@@ -207,6 +245,7 @@ The index is stored at `~/.pi/knowledge-search/index.json`.
 | ------------------------- | ----------------------------------------------- |
 | `/knowledge-search-setup` | Interactive setup wizard                        |
 | `/knowledge-add-kb`       | Add a Bedrock Knowledge Base as a search source |
+| `/knowledge-overview`     | Force-rebuild and re-inject the vault overview  |
 | `/knowledge-reindex`      | Force a full re-index                           |
 
 ## Performance

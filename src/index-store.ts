@@ -83,6 +83,41 @@ export class KnowledgeIndex {
   }
 
   /**
+   * Aggregate all chunks into a per-file view: one entry per indexed file with
+   * the merged list of section headings found across its chunks. Used by the
+   * overview builder and the kb_read resolver — both want file-level data, not
+   * chunk-level.
+   */
+  listFiles(): Array<{
+    absPath: string;
+    relPath: string;
+    sourceDir: string;
+    headings: string[];
+  }> {
+    const byPath = new Map<
+      string,
+      { absPath: string; relPath: string; sourceDir: string; headings: string[] }
+    >();
+    for (const [key, entry] of Object.entries(this.data.entries)) {
+      const absPath = this.absPathFromKey(key);
+      let agg = byPath.get(absPath);
+      if (!agg) {
+        agg = {
+          absPath,
+          relPath: entry.relPath,
+          sourceDir: entry.sourceDir,
+          headings: [],
+        };
+        byPath.set(absPath, agg);
+      }
+      if (entry.heading && entry.heading !== "intro" && !agg.headings.includes(entry.heading)) {
+        agg.headings.push(entry.heading);
+      }
+    }
+    return Array.from(byPath.values());
+  }
+
+  /**
    * Threshold above which the load/save paths switch to streaming. V8's
    * string length limit is ~512MB (2^29 - 24 bytes on 64-bit). A single
    * call to `readFileSync(path, "utf-8")` or `JSON.stringify(hugeObject)`

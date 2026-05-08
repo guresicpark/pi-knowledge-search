@@ -17,6 +17,19 @@ export interface Config {
   indexDir: string;
   /** Optional Bedrock Knowledge Bases to search */
   knowledgeBases: KnowledgeBaseConfig[];
+  /** Session-start overview injection settings */
+  overview: OverviewConfig;
+}
+
+export interface OverviewConfig {
+  /** Inject a folder+keyword summary as a custom message on session start. Default: true. */
+  inject: boolean;
+  /** Max folder depth to group files into. Default: 2. */
+  maxDepth: number;
+  /** Max folders shown per source dir (ranked by note count). Default: 20. */
+  maxFoldersPerDir: number;
+  /** Max keywords surfaced per folder. Default: 5. */
+  maxKeywordsPerFolder: number;
 }
 
 export type ProviderConfig =
@@ -32,6 +45,7 @@ export interface ConfigFile {
   excludeDirs?: string[];
   dimensions?: number;
   knowledgeBases?: KnowledgeBaseConfig[];
+  overview?: Partial<OverviewConfig>;
   provider?:
     | { type: "openai"; apiKey?: string; model?: string }
     | { type: "openai-compatible"; apiKey?: string; model?: string; baseUrl?: string }
@@ -260,6 +274,22 @@ export function loadConfig(cwd?: string): Config | null {
 
   const indexDir = getIndexDir(cwd);
 
+  // Overview config — cheap and usually wanted, so defaults lean on.
+  const overviewFile = file?.overview ?? {};
+  const overview = {
+    inject: envBool("KNOWLEDGE_SEARCH_OVERVIEW_INJECT") ?? overviewFile.inject ?? true,
+    maxDepth:
+      envInt("KNOWLEDGE_SEARCH_OVERVIEW_MAX_DEPTH") ?? overviewFile.maxDepth ?? 2,
+    maxFoldersPerDir:
+      envInt("KNOWLEDGE_SEARCH_OVERVIEW_MAX_FOLDERS") ??
+      overviewFile.maxFoldersPerDir ??
+      20,
+    maxKeywordsPerFolder:
+      envInt("KNOWLEDGE_SEARCH_OVERVIEW_MAX_KEYWORDS") ??
+      overviewFile.maxKeywordsPerFolder ??
+      5,
+  };
+
   return {
     dirs,
     fileExtensions,
@@ -268,6 +298,7 @@ export function loadConfig(cwd?: string): Config | null {
     provider,
     indexDir,
     knowledgeBases: file?.knowledgeBases ?? [],
+    overview,
   };
 }
 
@@ -292,4 +323,13 @@ function envStr(key: string): string | undefined {
 function envInt(key: string): number | undefined {
   const v = envStr(key);
   return v ? parseInt(v, 10) : undefined;
+}
+
+/** Boolean env: 1/true/yes/on -> true, 0/false/no/off -> false, else undefined. */
+function envBool(key: string): boolean | undefined {
+  const v = envStr(key)?.toLowerCase();
+  if (!v) return undefined;
+  if (["1", "true", "yes", "on"].includes(v)) return true;
+  if (["0", "false", "no", "off"].includes(v)) return false;
+  return undefined;
 }

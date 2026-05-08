@@ -122,6 +122,13 @@ function loadConfig(cwd) {
     }
   }
   const indexDir = getIndexDir(cwd);
+  const overviewFile = file?.overview ?? {};
+  const overview = {
+    inject: envBool("KNOWLEDGE_SEARCH_OVERVIEW_INJECT") ?? overviewFile.inject ?? true,
+    maxDepth: envInt("KNOWLEDGE_SEARCH_OVERVIEW_MAX_DEPTH") ?? overviewFile.maxDepth ?? 2,
+    maxFoldersPerDir: envInt("KNOWLEDGE_SEARCH_OVERVIEW_MAX_FOLDERS") ?? overviewFile.maxFoldersPerDir ?? 20,
+    maxKeywordsPerFolder: envInt("KNOWLEDGE_SEARCH_OVERVIEW_MAX_KEYWORDS") ?? overviewFile.maxKeywordsPerFolder ?? 5
+  };
   return {
     dirs,
     fileExtensions,
@@ -129,7 +136,8 @@ function loadConfig(cwd) {
     dimensions,
     provider,
     indexDir,
-    knowledgeBases: file?.knowledgeBases ?? []
+    knowledgeBases: file?.knowledgeBases ?? [],
+    overview
   };
 }
 function envStr(key) {
@@ -139,6 +147,13 @@ function envStr(key) {
 function envInt(key) {
   const v = envStr(key);
   return v ? parseInt(v, 10) : void 0;
+}
+function envBool(key) {
+  const v = envStr(key)?.toLowerCase();
+  if (!v) return void 0;
+  if (["1", "true", "yes", "on"].includes(v)) return true;
+  if (["0", "false", "no", "off"].includes(v)) return false;
+  return void 0;
 }
 
 // src/embedder.ts
@@ -837,6 +852,32 @@ var KnowledgeIndex = class _KnowledgeIndex {
   }
   chunkCount() {
     return Object.keys(this.data.entries).length;
+  }
+  /**
+   * Aggregate all chunks into a per-file view: one entry per indexed file with
+   * the merged list of section headings found across its chunks. Used by the
+   * overview builder and the kb_read resolver — both want file-level data, not
+   * chunk-level.
+   */
+  listFiles() {
+    const byPath = /* @__PURE__ */ new Map();
+    for (const [key, entry] of Object.entries(this.data.entries)) {
+      const absPath = this.absPathFromKey(key);
+      let agg = byPath.get(absPath);
+      if (!agg) {
+        agg = {
+          absPath,
+          relPath: entry.relPath,
+          sourceDir: entry.sourceDir,
+          headings: []
+        };
+        byPath.set(absPath, agg);
+      }
+      if (entry.heading && entry.heading !== "intro" && !agg.headings.includes(entry.heading)) {
+        agg.headings.push(entry.heading);
+      }
+    }
+    return Array.from(byPath.values());
   }
   /**
    * Threshold above which the load/save paths switch to streaming. V8's
