@@ -69,6 +69,8 @@ Or try without installing:
 pi -e git:github.com/samfoy/pi-knowledge-search
 ```
 
+Requires **Node 24+** — `node:sqlite` must include FTS5, which Node 22's bundled SQLite does not. On Node 22 you'll get `Error: no such table: chunks` at startup because the FTS5 virtual table never gets created.
+
 ## Setup
 
 Run the interactive setup command inside pi:

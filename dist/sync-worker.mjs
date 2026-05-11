@@ -653,9 +653,35 @@ function mergeTiny(chunks, minSize, maxSize) {
 }
 
 // src/fts-index.ts
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync as DatabaseSync2 } from "node:sqlite";
 import { mkdirSync as mkdirSync2 } from "node:fs";
 import { join as join2 } from "node:path";
+
+// src/fts5-probe.ts
+import { DatabaseSync } from "node:sqlite";
+var cached = null;
+function assertFts5Available() {
+  if (cached === true) return;
+  if (cached === false) throw new Error(fts5ErrorMessage());
+  const db = new DatabaseSync(":memory:");
+  try {
+    db.exec("CREATE VIRTUAL TABLE _fts5_probe USING fts5(x)");
+    cached = true;
+  } catch {
+    cached = false;
+    throw new Error(fts5ErrorMessage());
+  } finally {
+    try {
+      db.close();
+    } catch {
+    }
+  }
+}
+function fts5ErrorMessage() {
+  return `SQLite FTS5 is not available in this Node runtime. pi-knowledge-search requires Node 24+ (where node:sqlite ships with FTS5 compiled in). Current: Node ${process.versions.node}. Upgrade Node and restart pi.`;
+}
+
+// src/fts-index.ts
 var FtsChunkIndex = class {
   db = null;
   dbPath;
@@ -665,7 +691,8 @@ var FtsChunkIndex = class {
   }
   load() {
     if (this.db) return;
-    this.db = new DatabaseSync(this.dbPath);
+    assertFts5Available();
+    this.db = new DatabaseSync2(this.dbPath);
     this.db.exec("PRAGMA busy_timeout = 5000;");
     this.db.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
@@ -815,7 +842,7 @@ var FtsChunkIndex = class {
 };
 function toFtsQuery(q) {
   const terms = q.replace(/["^*():{}[\]]/g, " ").split(/\s+/).map((t) => t.trim()).filter((t) => t.length > 0).map((t) => `"${t}"`);
-  return terms.join(" ");
+  return terms.join(" OR ");
 }
 
 // src/index-store.ts

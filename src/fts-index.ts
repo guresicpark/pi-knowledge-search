@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { assertFts5Available } from "./fts5-probe.js";
 
 /**
  * Entry shape passed into `upsert`. Mirrors the fields of an `IndexEntry`
@@ -61,6 +62,11 @@ export class FtsChunkIndex {
 
   load(): void {
     if (this.db) return;
+    // Fail fast with an actionable message on Node runtimes without FTS5
+    // (Node 22's bundled SQLite omits it). Without this probe the
+    // CREATE VIRTUAL TABLE below leaves the DB file with no tables and
+    // later queries surface "no such table: chunks".
+    assertFts5Available();
     this.db = new DatabaseSync(this.dbPath);
     this.db.exec("PRAGMA busy_timeout = 5000;");
     this.db.exec(`
