@@ -74,6 +74,27 @@ function globalIndexDir(): string {
  *
  * Returns null when no project-local override is configured.
  */
+/**
+ * Emit a warning when a settings block contains keys outside a known
+ * schema. Catches silent typos like `LocalPath` vs `localPath` — an unknown
+ * key is usually a misspelled known key that got silently ignored, leaving
+ * the user wondering why their config didn't take effect.
+ */
+function warnUnknownKeys(block: unknown, blockName: string, knownKeys: readonly string[]): void {
+  if (!block || typeof block !== "object") return;
+  const unknown = Object.keys(block as Record<string, unknown>).filter((k) => !knownKeys.includes(k));
+  if (unknown.length === 0) return;
+  console.error(
+    `pi-knowledge-search: ignoring unknown key(s) in settings.json "${blockName}" block: ${unknown.join(", ")} (expected: ${knownKeys.join(", ")})`,
+  );
+}
+
+// Keys pi-knowledge-search reads from settings.json. The bulk of config lives
+// in a separate config.json (see getConfigPath) — only localPath comes from
+// the settings.json block directly.
+const PI_KNOWLEDGE_SEARCH_SETTINGS_KEYS = ["localPath"] as const;
+const PI_TOTAL_RECALL_KNOWN_KEYS = ["localPath"] as const;
+
 export function resolveLocalBase(cwd?: string): string | null {
   if (!cwd) return null;
   try {
@@ -82,12 +103,14 @@ export function resolveLocalBase(cwd?: string): string | null {
 
     // Package-specific override wins.
     const ks = settings["pi-knowledge-search"];
+    warnUnknownKeys(ks, "pi-knowledge-search", PI_KNOWLEDGE_SEARCH_SETTINGS_KEYS);
     if (ks && typeof ks === "object" && typeof ks.localPath === "string" && ks.localPath) {
       return ks.localPath;
     }
 
     // pi-total-recall cascade.
     const tr = settings["pi-total-recall"];
+    warnUnknownKeys(tr, "pi-total-recall", PI_TOTAL_RECALL_KNOWN_KEYS);
     if (tr && typeof tr === "object" && typeof tr.localPath === "string" && tr.localPath) {
       return path.join(tr.localPath, "knowledge-search");
     }
