@@ -14,9 +14,15 @@
   },
   "pi": {
     "extensions": [
-      "./src/index.ts"
+      "./dist/index.js"
     ]
   },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@sinclair/typebox": "*"
@@ -35,7 +41,11 @@
   },
   "scripts": {
     "test": "node --test --import tsx src/**/*.test.ts",
-    "build:worker": "esbuild src/sync-worker.ts --bundle --platform=node --format=esm --outfile=dist/sync-worker.mjs --external:better-sqlite3 --packages=external",
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --sourcemap --packages=external --external:@earendil-works/pi-coding-agent --external:@sinclair/typebox && esbuild src/sync-worker.ts --bundle --platform=node --format=esm --outfile=dist/sync-worker.mjs --packages=external --external:@earendil-works/pi-coding-agent --external:@sinclair/typebox",
+    "build:worker": "esbuild src/sync-worker.ts --bundle --platform=node --format=esm --outfile=dist/sync-worker.mjs --packages=external --external:@earendil-works/pi-coding-agent --external:@sinclair/typebox",
+    "check": "tsc --noEmit",
+    "dev": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --sourcemap --watch --packages=external --external:@earendil-works/pi-coding-agent --external:@sinclair/typebox",
+    "prepare": "npm run build",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
@@ -45,6 +55,7 @@
   "devDependencies": {
     "@eslint/js": "^9.17.0",
     "@types/node": "^25.6.0",
+    "esbuild": "^0.28.0",
     "eslint": "^9.17.0",
     "eslint-config-prettier": "^9.1.0",
     "globals": "^15.14.0",

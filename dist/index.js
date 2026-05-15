@@ -1,4 +1,8 @@
-#!/usr/bin/env node
+// src/index.ts
+import { Type } from "@sinclair/typebox";
+import { fork } from "node:child_process";
+import * as fs5 from "node:fs";
+import { join as join5 } from "node:path";
 
 // src/config.ts
 import * as fs from "node:fs";
@@ -152,6 +156,12 @@ function loadConfig(cwd) {
     overview
   };
 }
+function saveConfig(config, cwd) {
+  const configPath = getConfigPath(cwd);
+  const dir = path.dirname(configPath);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+}
 function envStr(key) {
   const v = process.env[key]?.trim();
   return v || void 0;
@@ -169,16 +179,16 @@ function envBool(key) {
 }
 
 // src/embedder.ts
-function createEmbedder(config2, dimensions) {
-  switch (config2.type) {
+function createEmbedder(config, dimensions) {
+  switch (config.type) {
     case "openai":
-      return new OpenAIEmbedder(config2.apiKey, config2.model, dimensions, void 0);
+      return new OpenAIEmbedder(config.apiKey, config.model, dimensions, void 0);
     case "openai-compatible":
-      return new OpenAIEmbedder(config2.apiKey ?? "", config2.model, dimensions, config2.baseUrl);
+      return new OpenAIEmbedder(config.apiKey ?? "", config.model, dimensions, config.baseUrl);
     case "bedrock":
-      return new BedrockEmbedder(config2.profile, config2.region, config2.model, dimensions);
+      return new BedrockEmbedder(config.profile, config.region, config.model, dimensions);
     case "ollama":
-      return new OllamaEmbedder(config2.url, config2.model);
+      return new OllamaEmbedder(config.url, config.model);
   }
 }
 function truncate(text, maxChars = 1e4) {
@@ -868,15 +878,15 @@ var KnowledgeIndex = class _KnowledgeIndex {
   dirty = false;
   saveTimer = null;
   fts;
-  constructor(config2, embedder2) {
-    this.config = config2;
-    this.embedder = embedder2;
+  constructor(config, embedder) {
+    this.config = config;
+    this.embedder = embedder;
     this.data = {
       version: INDEX_VERSION,
-      dimensions: config2.dimensions,
+      dimensions: config.dimensions,
       entries: {}
     };
-    this.fts = new FtsChunkIndex(config2.indexDir);
+    this.fts = new FtsChunkIndex(config.indexDir);
   }
   /** True when no embedder is configured — search runs pure BM25. */
   get isFtsOnly() {
@@ -990,7 +1000,7 @@ var KnowledgeIndex = class _KnowledgeIndex {
     if (chunks.length > 0) this.fts.upsertMany(chunks);
   }
   streamLoadJson(file) {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve2, reject) => {
       const stream = fs2.createReadStream(file, { highWaterMark: 256 * 1024 });
       const parser = makeParser();
       const assembler = Assembler.connectTo(parser);
@@ -1002,10 +1012,10 @@ var KnowledgeIndex = class _KnowledgeIndex {
         else ok();
       };
       assembler.on("done", (asm) => {
-        settle(() => resolve(asm.current));
+        settle(() => resolve2(asm.current));
       });
-      stream.on("error", (e) => settle(() => resolve(null), () => reject(e)));
-      parser.on("error", (e) => settle(() => resolve(null), () => reject(e)));
+      stream.on("error", (e) => settle(() => resolve2(null), () => reject(e)));
+      parser.on("error", (e) => settle(() => resolve2(null), () => reject(e)));
       stream.pipe(parser);
     });
   }
@@ -1063,15 +1073,15 @@ var KnowledgeIndex = class _KnowledgeIndex {
     stream.once("error", (err) => {
       streamError = err;
     });
-    const write = (chunk) => new Promise((resolve, reject) => {
+    const write = (chunk) => new Promise((resolve2, reject) => {
       if (streamError) {
         reject(streamError);
         return;
       }
       if (stream.write(chunk)) {
-        resolve();
+        resolve2();
       } else {
-        stream.once("drain", () => streamError ? reject(streamError) : resolve());
+        stream.once("drain", () => streamError ? reject(streamError) : resolve2());
       }
     });
     try {
@@ -1090,8 +1100,8 @@ var KnowledgeIndex = class _KnowledgeIndex {
       stream.destroy();
       throw err;
     }
-    await new Promise((resolve, reject) => {
-      stream.end((err) => err ? reject(err) : resolve());
+    await new Promise((resolve2, reject) => {
+      stream.end((err) => err ? reject(err) : resolve2());
     });
   }
   scheduleSave() {
@@ -1529,35 +1539,1045 @@ function dotProduct(a, b) {
   return sum;
 }
 
-// src/sync-worker.ts
-process.on("uncaughtException", (err) => {
-  process.stderr.write(`knowledge-search worker uncaught: ${err.message}
-`);
-  process.exit(1);
-});
-process.on("unhandledRejection", (reason) => {
-  process.stderr.write(`knowledge-search worker unhandled rejection: ${reason}
-`);
-  process.exit(1);
-});
-var config = loadConfig(process.env.KNOWLEDGE_SEARCH_CWD || void 0);
-if (!config || config.dirs.length === 0) {
-  process.exit(0);
+// src/kb-searcher.ts
+var BedrockKBSearcher = class {
+  configs;
+  clients = /* @__PURE__ */ new Map();
+  initPromise = null;
+  constructor(configs) {
+    this.configs = configs;
+  }
+  async init() {
+    if (this.initPromise) return this.initPromise;
+    this.initPromise = this._init();
+    return this.initPromise;
+  }
+  async _init() {
+    try {
+      const { BedrockAgentRuntimeClient } = await import("@aws-sdk/client-bedrock-agent-runtime");
+      const { fromIni } = await import("@aws-sdk/credential-providers");
+      for (const config of this.configs) {
+        const region = config.region || "us-east-1";
+        const profile = config.profile || "default";
+        const cacheKey = `${region}:${profile}`;
+        if (!this.clients.has(config.id)) {
+          const existing = [...this.clients.values()].find(
+            (c) => (c.config.region || "us-east-1") === region && (c.config.profile || "default") === profile
+          );
+          if (existing) {
+            this.clients.set(config.id, {
+              client: existing.client,
+              config
+            });
+          } else {
+            const client = new BedrockAgentRuntimeClient({
+              region,
+              credentials: fromIni({ profile })
+            });
+            this.clients.set(config.id, { client, config });
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`knowledge-search: Failed to initialize Bedrock KB client: ${err.message}`);
+      this.configs = [];
+    }
+  }
+  async search(query, limit, signal) {
+    if (this.configs.length === 0) return [];
+    await this.init();
+    const { RetrieveCommand } = await import("@aws-sdk/client-bedrock-agent-runtime");
+    const searches = this.configs.map(async (config) => {
+      const entry = this.clients.get(config.id);
+      if (!entry) return [];
+      try {
+        const command = new RetrieveCommand({
+          knowledgeBaseId: config.id,
+          retrievalQuery: { text: query },
+          retrievalConfiguration: {
+            vectorSearchConfiguration: {
+              numberOfResults: limit
+            }
+          }
+        });
+        const response = await entry.client.send(command, {
+          abortSignal: signal
+        });
+        const results = [];
+        for (const result of response.retrievalResults || []) {
+          const score = result.score ?? 0;
+          if (score < 0.15) continue;
+          const uri = result.location?.s3Location?.uri ?? result.location?.webLocation?.url ?? result.location?.confluenceLocation?.url ?? result.location?.salesforceLocation?.url ?? result.location?.sharePointLocation?.url ?? "unknown";
+          const label = config.label ? ` [${config.label}]` : " [KB]";
+          results.push({
+            path: `${uri}${label}`,
+            score,
+            excerpt: result.content?.text || "",
+            heading: ""
+          });
+        }
+        return results;
+      } catch (err) {
+        console.error(`knowledge-search: KB ${config.id} search failed: ${err.message}`);
+        return [];
+      }
+    });
+    const allResults = (await Promise.all(searches)).flat();
+    return allResults.sort((a, b) => b.score - a.score).slice(0, limit);
+  }
+};
+
+// src/overview.ts
+import * as fs3 from "node:fs";
+import * as path3 from "node:path";
+var STOPWORDS = /* @__PURE__ */ new Set([
+  // Common English stopwords.
+  "the",
+  "and",
+  "for",
+  "are",
+  "but",
+  "not",
+  "you",
+  "all",
+  "can",
+  "had",
+  "her",
+  "was",
+  "one",
+  "our",
+  "out",
+  "day",
+  "get",
+  "has",
+  "him",
+  "his",
+  "how",
+  "its",
+  "may",
+  "new",
+  "now",
+  "old",
+  "see",
+  "two",
+  "way",
+  "who",
+  "boy",
+  "did",
+  "use",
+  "man",
+  "with",
+  "this",
+  "that",
+  "from",
+  "they",
+  "them",
+  "were",
+  "have",
+  "what",
+  "when",
+  "your",
+  "which",
+  "their",
+  "there",
+  "about",
+  "into",
+  "than",
+  "more",
+  "some",
+  "just",
+  "like",
+  "will",
+  "also",
+  "been",
+  "over",
+  "only",
+  "then",
+  "well",
+  "other",
+  "these",
+  "would",
+  "could",
+  "should",
+  "being",
+  "where",
+  "while",
+  "still",
+  "very",
+  "most",
+  "much",
+  "such",
+  "many",
+  "even",
+  "make",
+  "made",
+  "used",
+  "using",
+  "does",
+  "each",
+  "both",
+  "here",
+  "want",
+  "need",
+  "back",
+  "take",
+  "come",
+  "came",
+  "give",
+  "given",
+  "find",
+  "found",
+  "last",
+  "same",
+  "work",
+  "works",
+  // Markdown/note boilerplate.
+  "note",
+  "notes",
+  "readme",
+  "about",
+  "index",
+  "todo",
+  "todos",
+  "done",
+  "draft",
+  "drafts",
+  "markdown",
+  "file",
+  "files",
+  "folder",
+  "folders",
+  "section",
+  "sections",
+  // Generic doc words that rarely disambiguate folders.
+  "page",
+  "pages",
+  "link",
+  "links",
+  "item",
+  "items",
+  "list",
+  "lists",
+  "content",
+  "contents",
+  "overview",
+  "summary",
+  "intro",
+  "introduction",
+  "details",
+  "detail",
+  "example",
+  "examples"
+]);
+function tokenize(text) {
+  const out = [];
+  const parts = text.toLowerCase().split(/[^a-z0-9]+/);
+  for (const p of parts) {
+    if (p.length < 3 || p.length > 24) continue;
+    if (STOPWORDS.has(p)) continue;
+    if (/^\d+$/.test(p)) continue;
+    out.push(p);
+  }
+  return out;
 }
-var embedder = config.provider ? createEmbedder(config.provider, config.dimensions) : null;
-var index = new KnowledgeIndex(config, embedder);
-await index.load();
-index.sync().then(({ added, updated, removed }) => {
-  const result = JSON.stringify({
-    added,
-    updated,
-    removed,
-    size: index.size(),
-    chunks: index.chunkCount()
+function bucketFolder(relPath, maxDepth) {
+  const posix = relPath.split(path3.sep).join("/");
+  const parts = posix.split("/");
+  const dirParts = parts.slice(0, -1);
+  if (dirParts.length === 0) return "";
+  return dirParts.slice(0, maxDepth).join("/");
+}
+function extractKeywords(filesByFolder, maxKeywords) {
+  const folderTf = /* @__PURE__ */ new Map();
+  const df = /* @__PURE__ */ new Map();
+  const totalFolders = filesByFolder.size;
+  for (const [folder, files] of filesByFolder) {
+    const tf = /* @__PURE__ */ new Map();
+    for (const f of files) {
+      const basename4 = path3.basename(f.relPath, path3.extname(f.relPath));
+      for (const tok of tokenize(basename4)) {
+        tf.set(tok, (tf.get(tok) ?? 0) + 2);
+      }
+      const headings = f.headings.slice(0, 6);
+      for (const h of headings) {
+        for (const tok of tokenize(h)) {
+          tf.set(tok, (tf.get(tok) ?? 0) + 1);
+        }
+      }
+    }
+    folderTf.set(folder, tf);
+    for (const term of tf.keys()) {
+      df.set(term, (df.get(term) ?? 0) + 1);
+    }
+  }
+  const result = /* @__PURE__ */ new Map();
+  for (const [folder, tf] of folderTf) {
+    const scored = [];
+    for (const [term, count] of tf) {
+      const docFreq = df.get(term) ?? 1;
+      const idf = Math.log((totalFolders + 1) / (docFreq + 1)) + 1;
+      const score = count * idf;
+      scored.push({ term, score });
+    }
+    scored.sort((a, b) => b.score - a.score || a.term.localeCompare(b.term));
+    result.set(
+      folder,
+      scored.slice(0, maxKeywords).map((s) => s.term)
+    );
+  }
+  return result;
+}
+var CONTEXT_NOTE_CANDIDATES = ["NAPKIN.md", "README.md", "_about.md", "ABOUT.md"];
+var FOLDER_ABOUT_CANDIDATES = ["_about.md", "README.md"];
+function readTrimmed(absPath, maxChars) {
+  try {
+    const raw = fs3.readFileSync(absPath, "utf-8");
+    const body = raw.replace(/^---\n[\s\S]*?\n---\n?/, "").trim();
+    if (!body) return void 0;
+    if (body.length <= maxChars) return body;
+    return body.slice(0, maxChars).trimEnd() + "\u2026";
+  } catch {
+    return void 0;
+  }
+}
+function findContextNote(sourceDir) {
+  for (const name of CONTEXT_NOTE_CANDIDATES) {
+    const p = path3.join(sourceDir, name);
+    if (fs3.existsSync(p)) {
+      const text = readTrimmed(p, 400);
+      if (text) return text;
+    }
+  }
+  return void 0;
+}
+function findFolderAbout(sourceDir, folder) {
+  if (!folder) return void 0;
+  for (const name of FOLDER_ABOUT_CANDIDATES) {
+    const p = path3.join(sourceDir, folder, name);
+    if (fs3.existsSync(p)) {
+      const text = readTrimmed(p, 240);
+      if (text) return text;
+    }
+  }
+  return void 0;
+}
+function buildOverview(files, sourceDirs, opts = {}) {
+  const maxDepth = Math.max(1, opts.maxDepth ?? 2);
+  const maxFolders = Math.max(1, opts.maxFoldersPerDir ?? 20);
+  const maxKeywords = Math.max(1, opts.maxKeywordsPerFolder ?? 5);
+  const bySource = /* @__PURE__ */ new Map();
+  for (const sd of sourceDirs) bySource.set(sd, /* @__PURE__ */ new Map());
+  for (const f of files) {
+    let bucket = bySource.get(f.sourceDir);
+    if (!bucket) {
+      bucket = /* @__PURE__ */ new Map();
+      bySource.set(f.sourceDir, bucket);
+    }
+    const folder = bucketFolder(f.relPath, maxDepth);
+    let arr = bucket.get(folder);
+    if (!arr) {
+      arr = [];
+      bucket.set(folder, arr);
+    }
+    arr.push(f);
+  }
+  const sources = [];
+  let totalNotes = 0;
+  for (const [sourceDir, folders] of bySource) {
+    const keywords = extractKeywords(folders, maxKeywords);
+    const folderList = [];
+    for (const [folder, fileList] of folders) {
+      folderList.push({
+        path: folder,
+        noteCount: fileList.length,
+        keywords: keywords.get(folder) ?? [],
+        aboutText: findFolderAbout(sourceDir, folder)
+      });
+    }
+    folderList.sort(
+      (a, b) => b.noteCount - a.noteCount || a.path.localeCompare(b.path)
+    );
+    const trimmedFolders = folderList.slice(0, maxFolders);
+    const sourceTotal = folderList.reduce((s, f) => s + f.noteCount, 0);
+    totalNotes += sourceTotal;
+    sources.push({
+      dir: sourceDir,
+      displayName: path3.basename(sourceDir) || sourceDir,
+      contextNote: findContextNote(sourceDir),
+      folders: trimmedFolders
+    });
+  }
+  return { sources, totalNotes };
+}
+function formatOverview(overview) {
+  if (overview.totalNotes === 0) return "";
+  const lines = [];
+  lines.push("## Knowledge-search vault overview");
+  lines.push(
+    `You have a local knowledge base indexed by pi-knowledge-search. Use the \`knowledge_search\` tool for semantic/keyword lookup and \`kb_read\` to pull a note by name or \`[[wikilink]]\`.`
+  );
+  lines.push("");
+  const home = process.env.HOME || "";
+  for (const src of overview.sources) {
+    const dirDisplay = home && src.dir.startsWith(home) ? src.dir.replace(home, "~") : src.dir;
+    lines.push(`### ${dirDisplay}`);
+    if (src.contextNote) {
+      lines.push("");
+      lines.push(src.contextNote);
+    }
+    lines.push("");
+    if (src.folders.length === 0) {
+      lines.push("_(no indexed files)_");
+      lines.push("");
+      continue;
+    }
+    for (const folder of src.folders) {
+      const label = folder.path || "(root)";
+      lines.push(`- **${label}/** \u2014 ${folder.noteCount} note${folder.noteCount === 1 ? "" : "s"}`);
+      if (folder.keywords.length > 0) {
+        lines.push(`  - keywords: ${folder.keywords.join(", ")}`);
+      }
+      if (folder.aboutText) {
+        const oneLine = folder.aboutText.replace(/\s+/g, " ").slice(0, 180);
+        lines.push(`  - ${oneLine}`);
+      }
+    }
+    lines.push("");
+  }
+  return lines.join("\n").trimEnd();
+}
+
+// src/kb-reader.ts
+import * as fs4 from "node:fs";
+import * as path4 from "node:path";
+function normalizeRef(ref) {
+  let s = ref.trim();
+  s = s.replace(/^\[\[/, "").replace(/\]\]$/, "");
+  const pipeIdx = s.indexOf("|");
+  if (pipeIdx !== -1) s = s.slice(0, pipeIdx);
+  s = s.trim();
+  let subheading;
+  const hashIdx = s.indexOf("#");
+  if (hashIdx !== -1) {
+    subheading = s.slice(hashIdx + 1).trim() || void 0;
+    s = s.slice(0, hashIdx).trim();
+  }
+  return { ref: s, subheading };
+}
+var DEFAULT_EXTS = [".md", ".txt"];
+function normBasename(p, exts) {
+  const base = path4.basename(p);
+  for (const ext of exts) {
+    if (base.toLowerCase().endsWith(ext)) {
+      return base.slice(0, base.length - ext.length).toLowerCase();
+    }
+  }
+  return base.toLowerCase();
+}
+function hasKnownExt(s, exts) {
+  const lower = s.toLowerCase();
+  return exts.some((e) => lower.endsWith(e));
+}
+function resolveNote(rawRef, indexedFiles, opts = {}) {
+  const exts = (opts.fileExtensions ?? DEFAULT_EXTS).map(
+    (e) => e.startsWith(".") ? e : "." + e
+  );
+  const maxMatches = opts.maxMatches ?? 10;
+  const { ref, subheading } = normalizeRef(rawRef);
+  if (!ref) {
+    return { matches: [], unique: false, normalizedRef: "", subheading };
+  }
+  const matches = [];
+  const seen = /* @__PURE__ */ new Set();
+  function push(m) {
+    if (seen.has(m.absPath)) return;
+    seen.add(m.absPath);
+    matches.push(m);
+  }
+  if (path4.isAbsolute(ref)) {
+    const hit = indexedFiles.find((f) => f.absPath === ref);
+    if (hit) push({ ...hit, reason: "absolute" });
+  }
+  if (opts.cwd && !path4.isAbsolute(ref) && (ref.includes("/") || ref.includes(path4.sep))) {
+    const abs = path4.resolve(opts.cwd, ref);
+    const hit = indexedFiles.find((f) => f.absPath === abs);
+    if (hit) push({ ...hit, reason: "absolute" });
+  }
+  for (const f of indexedFiles) {
+    const rel = f.relPath;
+    if (rel === ref) {
+      push({ ...f, reason: "relative-to-source" });
+      continue;
+    }
+    if (hasKnownExt(ref, exts)) continue;
+    for (const ext of exts) {
+      if (rel === ref + ext) {
+        push({ ...f, reason: "relative-to-source" });
+        break;
+      }
+    }
+  }
+  const refLower = ref.toLowerCase();
+  const refBaseLower = normBasename(ref, exts);
+  for (const f of indexedFiles) {
+    const b = path4.basename(f.relPath);
+    if (b === ref || !hasKnownExt(ref, exts) && exts.some((e) => b === ref + e)) {
+      push({ ...f, reason: "basename-exact" });
+    }
+  }
+  for (const f of indexedFiles) {
+    const bLower = normBasename(f.relPath, exts);
+    if (bLower === refBaseLower) {
+      push({ ...f, reason: "basename-ci" });
+    }
+  }
+  if (ref.includes("/")) {
+    const targets = hasKnownExt(ref, exts) ? [ref] : exts.map((e) => ref + e);
+    const targetsLower = targets.map((t) => t.toLowerCase());
+    for (const f of indexedFiles) {
+      const rLower = f.relPath.toLowerCase();
+      for (const t of targetsLower) {
+        if (rLower.endsWith("/" + t) || rLower === t) {
+          push({ ...f, reason: "relpath-suffix" });
+          break;
+        }
+      }
+    }
+  }
+  if (matches.length === 0) {
+    for (const f of indexedFiles) {
+      const bLower = normBasename(f.relPath, exts);
+      if (bLower.includes(refBaseLower) || refBaseLower.includes(bLower)) {
+        push({ ...f, reason: "substring" });
+      } else if (f.relPath.toLowerCase().includes(refLower)) {
+        push({ ...f, reason: "substring" });
+      }
+      if (matches.length >= maxMatches) break;
+    }
+  }
+  const trimmed = matches.slice(0, maxMatches);
+  const highConfidenceReasons = [
+    "absolute",
+    "relative-to-source",
+    "basename-exact",
+    "basename-ci",
+    "relpath-suffix"
+  ];
+  const highConfidence = trimmed.filter((m) => highConfidenceReasons.includes(m.reason));
+  const unique = highConfidence.length === 1;
+  return { matches: trimmed, unique, normalizedRef: ref, subheading };
+}
+function readNote(absPath, opts = {}) {
+  const maxBytes = opts.maxBytes ?? 64 * 1024;
+  const buf = fs4.readFileSync(absPath);
+  const total = buf.length;
+  if (buf.length <= maxBytes) {
+    return {
+      path: absPath,
+      content: buf.toString("utf-8"),
+      truncated: false,
+      totalBytes: total
+    };
+  }
+  let end = maxBytes;
+  while (end > 0 && (buf[end] & 192) === 128) {
+    end--;
+  }
+  const slice = buf.subarray(0, end);
+  const text = slice.toString("utf-8");
+  const lastNewline = text.lastIndexOf("\n");
+  const newlineNearby = lastNewline >= 0 && lastNewline > end - 2048;
+  const safe = newlineNearby ? text.slice(0, lastNewline) : text;
+  return {
+    path: absPath,
+    content: safe,
+    truncated: true,
+    totalBytes: total
+  };
+}
+
+// src/index.ts
+function index_default(pi) {
+  let index = null;
+  let kbSearcher = null;
+  let currentConfig = null;
+  let sessionCwd;
+  let syncDone = false;
+  let workerExitExpected = false;
+  function injectOverview(ctx, force) {
+    if (!index || !currentConfig) return { status: "skipped", reason: "not configured" };
+    if (!force && !currentConfig.overview.inject) {
+      return { status: "skipped", reason: "overview.inject=false" };
+    }
+    if (index.size() === 0) return { status: "skipped", reason: "index is empty" };
+    if (!force) {
+      const alreadyInjected = ctx.sessionManager.getEntries().some(
+        (e) => e.type === "custom_message" && e.customType === "knowledge-overview"
+      );
+      if (alreadyInjected) return { status: "skipped", reason: "already injected" };
+    }
+    const overview = buildOverview(index.listFiles(), currentConfig.dirs, {
+      maxDepth: currentConfig.overview.maxDepth,
+      maxFoldersPerDir: currentConfig.overview.maxFoldersPerDir,
+      maxKeywordsPerFolder: currentConfig.overview.maxKeywordsPerFolder
+    });
+    const text = formatOverview(overview);
+    if (!text) return { status: "skipped", reason: "empty overview" };
+    pi.sendMessage({
+      customType: "knowledge-overview",
+      content: text,
+      display: true,
+      details: {
+        totalNotes: overview.totalNotes,
+        sourceCount: overview.sources.length,
+        forced: force
+      }
+    });
+    return {
+      status: "injected",
+      totalNotes: overview.totalNotes,
+      sourceCount: overview.sources.length
+    };
+  }
+  pi.on("session_start", async (_event, ctx) => {
+    sessionCwd = ctx.cwd;
+    try {
+      currentConfig = loadConfig(sessionCwd);
+    } catch {
+      return;
+    }
+    if (!currentConfig) return;
+    let indexLoaded = Promise.resolve();
+    if (currentConfig.provider) {
+      const embedder = createEmbedder(currentConfig.provider, currentConfig.dimensions);
+      index = new KnowledgeIndex(currentConfig, embedder);
+      indexLoaded = index.load();
+    } else if (currentConfig.dirs.length > 0) {
+      index = new KnowledgeIndex(currentConfig, null);
+      indexLoaded = index.load();
+    }
+    if (currentConfig.knowledgeBases.length > 0) {
+      kbSearcher = new BedrockKBSearcher(currentConfig.knowledgeBases);
+    }
+    if (!index) {
+      syncDone = true;
+      return;
+    }
+    indexLoaded.then(() => {
+      try {
+        injectOverview(ctx, false);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`knowledge-search: overview injection failed: ${msg}`);
+      }
+    }).catch((err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`knowledge-search: index load failed: ${msg}`);
+    });
+    const MAX_WORKER_RESTARTS = 3;
+    const RESTART_WINDOW_MS = 6e4;
+    let workerRestartCount = 0;
+    let workerRestartWindowStart = Date.now();
+    function spawnWorker() {
+      const workerPath = join5(import.meta.dirname, "..", "dist", "sync-worker.mjs");
+      const worker = fork(workerPath, [], {
+        stdio: ["ignore", "pipe", "pipe", "ipc"],
+        // Suppress "node:sqlite is experimental" warning — node:sqlite is stable
+        // enough for our read/write usage and the warning pollutes pi startup.
+        execArgv: ["--no-warnings=ExperimentalWarning"],
+        // Forward sessionCwd so the worker resolves the same project-local
+        // settings.json (pi-knowledge-search.localPath / pi-total-recall cascade).
+        env: { ...process.env, KNOWLEDGE_SEARCH_CWD: sessionCwd ?? process.env.KNOWLEDGE_SEARCH_CWD ?? "" }
+      });
+      let stdout = "";
+      worker.stdout?.on("data", (chunk) => {
+        stdout += chunk.toString();
+      });
+      worker.stderr?.on("data", (chunk) => {
+        console.error(`knowledge-search worker: ${chunk.toString().trim()}`);
+      });
+      worker.on("error", (err) => {
+        console.error(`knowledge-search: worker error: ${err.message}`);
+      });
+      worker.on("exit", async (code, signal) => {
+        syncDone = true;
+        if (code === 0 && stdout) {
+          try {
+            const result = JSON.parse(stdout);
+            await index.load();
+            const changes = result.added + result.updated + result.removed;
+            if (changes > 0) {
+              ctx.ui.setStatus(
+                "knowledge-search",
+                `Index: +${result.added} ~${result.updated} -${result.removed} (${result.size} files, ${result.chunks} chunks)`
+              );
+              setTimeout(() => ctx.ui.setStatus("knowledge-search", ""), 5e3);
+            }
+          } catch {
+          }
+        } else if (code !== 0 && !workerExitExpected) {
+          const now = Date.now();
+          if (now - workerRestartWindowStart > RESTART_WINDOW_MS) {
+            workerRestartCount = 0;
+            workerRestartWindowStart = now;
+          }
+          workerRestartCount++;
+          if (workerRestartCount > MAX_WORKER_RESTARTS) {
+            console.error(
+              `knowledge-search: worker crashed ${workerRestartCount} times within ${RESTART_WINDOW_MS / 1e3}s, giving up`
+            );
+          } else {
+            console.error(
+              `knowledge-search: worker exited unexpectedly (code=${code}, signal=${signal}), restarting (${workerRestartCount}/${MAX_WORKER_RESTARTS})...`
+            );
+            setTimeout(() => {
+              if (!workerExitExpected) spawnWorker();
+            }, 2e3);
+          }
+        }
+      });
+      worker.unref();
+    }
+    spawnWorker();
   });
-  process.stdout.write(result);
-  process.exit(0);
-}).catch((err) => {
-  process.stderr.write(err.message);
-  process.exit(1);
-});
+  pi.on("session_shutdown", async () => {
+    workerExitExpected = true;
+    await index?.close();
+  });
+  pi.registerCommand("knowledge-search-setup", {
+    description: "Configure knowledge search directories and embedding provider",
+    handler: async (_args, ctx) => {
+      const dirsInput = await ctx.ui.input(
+        "Directories to index (comma-separated):",
+        "~/notes, ~/docs"
+      );
+      if (!dirsInput) {
+        ctx.ui.notify("Setup cancelled.", "info");
+        return;
+      }
+      const dirs = dirsInput.split(",").map((d) => d.trim()).filter(Boolean);
+      if (dirs.length === 0) {
+        ctx.ui.notify("No directories specified.", "warning");
+        return;
+      }
+      const extsInput = await ctx.ui.input("File extensions to index:", ".md, .txt");
+      const fileExtensions = (extsInput || ".md, .txt").split(",").map((e) => e.trim()).filter(Boolean);
+      const excludeInput = await ctx.ui.input(
+        "Directory names to exclude:",
+        "node_modules, .git, .obsidian, .trash"
+      );
+      const excludeDirs = (excludeInput || "node_modules, .git, .obsidian, .trash").split(",").map((d) => d.trim()).filter(Boolean);
+      const providerChoice = await ctx.ui.select("Embedding provider:", [
+        "none \u2014 FTS-only keyword search (zero-config, no API key needed)",
+        "openai \u2014 OpenAI API (text-embedding-3-small)",
+        "bedrock \u2014 AWS Bedrock (Titan Embeddings v2)",
+        "ollama \u2014 Local Ollama (nomic-embed-text)"
+      ]);
+      if (!providerChoice) {
+        ctx.ui.notify("Setup cancelled.", "info");
+        return;
+      }
+      const providerType = providerChoice.split(" ")[0];
+      let configFile;
+      switch (providerType) {
+        case "none": {
+          configFile = { dirs, fileExtensions, excludeDirs };
+          break;
+        }
+        case "openai": {
+          const apiKey = await ctx.ui.input(
+            "OpenAI API key (or env var name):",
+            process.env.OPENAI_API_KEY ? "(using OPENAI_API_KEY from env)" : ""
+          );
+          const model = await ctx.ui.input("Model:", "text-embedding-3-small");
+          configFile = {
+            dirs,
+            fileExtensions,
+            excludeDirs,
+            provider: {
+              type: "openai",
+              apiKey: apiKey?.startsWith("(") ? void 0 : apiKey || void 0,
+              model: model || "text-embedding-3-small"
+            }
+          };
+          break;
+        }
+        case "bedrock": {
+          const profile = await ctx.ui.input("AWS profile:", "default");
+          const region = await ctx.ui.input("AWS region:", "us-east-1");
+          const model = await ctx.ui.input("Model:", "amazon.titan-embed-text-v2:0");
+          configFile = {
+            dirs,
+            fileExtensions,
+            excludeDirs,
+            provider: {
+              type: "bedrock",
+              profile: profile || "default",
+              region: region || "us-east-1",
+              model: model || "amazon.titan-embed-text-v2:0"
+            }
+          };
+          break;
+        }
+        case "ollama": {
+          const url = await ctx.ui.input("Ollama URL:", "http://localhost:11434");
+          const model = await ctx.ui.input("Model:", "nomic-embed-text");
+          configFile = {
+            dirs,
+            fileExtensions,
+            excludeDirs,
+            provider: {
+              type: "ollama",
+              url: url || "http://localhost:11434",
+              model: model || "nomic-embed-text"
+            }
+          };
+          break;
+        }
+      }
+      saveConfig(configFile, sessionCwd);
+      ctx.ui.notify(`Config saved to ${getConfigPath(sessionCwd)}. Run /reload to activate.`, "info");
+    }
+  });
+  pi.registerCommand("knowledge-add-kb", {
+    description: "Add a Bedrock Knowledge Base as a search source",
+    handler: async (_args, ctx) => {
+      const kbId = await ctx.ui.input("Bedrock Knowledge Base ID:", "");
+      if (!kbId) {
+        ctx.ui.notify("Cancelled.", "info");
+        return;
+      }
+      const label = await ctx.ui.input("Label (optional, for display):", "");
+      const region = await ctx.ui.input("AWS region:", "us-east-1");
+      const profile = await ctx.ui.input("AWS profile:", "default");
+      let existing;
+      try {
+        const loaded = loadConfig(sessionCwd);
+        if (loaded) {
+          const raw = fs5.readFileSync(getConfigPath(sessionCwd), "utf-8");
+          existing = JSON.parse(raw);
+        } else {
+          existing = {};
+        }
+      } catch {
+        existing = {};
+      }
+      if (!existing.knowledgeBases) existing.knowledgeBases = [];
+      if (existing.knowledgeBases.some((kb) => kb.id === kbId)) {
+        ctx.ui.notify(`KB ${kbId} already configured.`, "warning");
+        return;
+      }
+      existing.knowledgeBases.push({
+        id: kbId,
+        region: region || "us-east-1",
+        profile: profile || "default",
+        ...label ? { label } : {}
+      });
+      saveConfig(existing, sessionCwd);
+      ctx.ui.notify(
+        `Added KB ${kbId}${label ? ` (${label})` : ""}. Run /reload to activate.`,
+        "info"
+      );
+    }
+  });
+  pi.registerCommand("knowledge-overview", {
+    description: "Rebuild and re-inject the knowledge-search vault overview (use after config changes or vault growth)",
+    handler: async (_args, ctx) => {
+      try {
+        const result = injectOverview(ctx, true);
+        if (result.status === "injected") {
+          ctx.ui.notify(
+            `Overview re-injected: ${result.totalNotes} notes, ${result.sourceCount} source dir(s).`,
+            "info"
+          );
+        } else {
+          ctx.ui.notify(`Overview not injected: ${result.reason}.`, "warning");
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        ctx.ui.notify(`Overview injection failed: ${msg}`, "error");
+      }
+    }
+  });
+  pi.registerCommand("knowledge-reindex", {
+    description: "Force full re-index of all configured knowledge directories",
+    handler: async (_args, ctx) => {
+      if (!index) {
+        ctx.ui.notify("Not configured. Run /knowledge-search-setup first.", "warning");
+        return;
+      }
+      ctx.ui.notify("Re-indexing...", "info");
+      try {
+        await index.rebuild();
+        ctx.ui.notify(
+          `Re-indexed: ${index.size()} files (${index.chunkCount()} chunks)`,
+          "info"
+        );
+      } catch (err) {
+        ctx.ui.notify(`Re-index failed: ${err.message}`, "error");
+      }
+    }
+  });
+  const searchParams = Type.Object({
+    query: Type.String({ description: "Natural language search query" }),
+    limit: Type.Optional(
+      Type.Number({
+        description: "Max results to return (default 8, max 20)"
+      })
+    )
+  });
+  pi.registerTool({
+    name: "knowledge_search",
+    label: "Knowledge Search",
+    description: "Semantic search over local knowledge files. Returns the most relevant file excerpts for a natural language query. Use for finding past notes, investigations, decisions, documentation, and context. Prefer this over grep when you need conceptual or fuzzy matching rather than exact text.",
+    promptGuidelines: [
+      'Use knowledge_search for conceptual queries (e.g. "how did we handle X", "what was decided about Y"). Use grep/read for exact text or known filenames.'
+    ],
+    parameters: searchParams,
+    async execute(toolCallId, params, signal) {
+      const hasLocalIndex = index && index.size() > 0;
+      const hasKB = !!kbSearcher;
+      if (!hasLocalIndex && !hasKB) {
+        const msg = !index && !kbSearcher ? "knowledge-search is not configured. The user can run /knowledge-search-setup to set it up." : !syncDone && index ? "Index is still syncing in the background. Try again in a moment." : "Index is empty.";
+        return { content: [{ type: "text", text: msg }], details: {} };
+      }
+      const limit = Math.min(params.limit ?? 8, 20);
+      try {
+        const [localResults, kbResults] = await Promise.all([
+          hasLocalIndex ? index.search(params.query, limit, signal) : [],
+          hasKB ? kbSearcher.search(params.query, limit, signal) : []
+        ]);
+        const results = [...localResults, ...kbResults].sort((a, b) => b.score - a.score).slice(0, limit);
+        if (results.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `No relevant results found for: "${params.query}"`
+              }
+            ],
+            details: {}
+          };
+        }
+        const home = process.env.HOME || "";
+        const output = results.map((r, i) => {
+          const displayPath = r.path.replace(home, "~");
+          const score = (r.score * 100).toFixed(1);
+          const heading = r.heading && r.heading !== "intro" ? ` > ${r.heading}` : "";
+          return `### ${i + 1}. ${displayPath}${heading} (${score}% match)
+
+${r.excerpt}`;
+        }).join("\n\n---\n\n");
+        const indexInfo = hasLocalIndex ? `${index.size()} files, ${index.chunkCount()} chunks indexed` : "";
+        const kbInfo = hasKB ? `${currentConfig.knowledgeBases.length} knowledge base(s)` : "";
+        const sourceInfo = [indexInfo, kbInfo].filter(Boolean).join(" + ");
+        const header = `Found ${results.length} results for "${params.query}" (${sourceInfo}):
+
+`;
+        return {
+          content: [{ type: "text", text: header + output }],
+          details: { resultCount: results.length, indexSize: index?.size() ?? 0 }
+        };
+      } catch (err) {
+        throw new Error(`knowledge-search failed: ${err.message}`);
+      }
+    }
+  });
+  const readParams = Type.Object({
+    name: Type.String({
+      description: "Note reference: filename, basename, relative path, or [[wikilink]]. Examples: 'evergreen/hybrid-search', 'Hybrid search.md', '[[Hybrid search]]', '[[evergreen/hybrid-search|alias]]'."
+    }),
+    max_bytes: Type.Optional(
+      Type.Number({
+        description: "Truncate output to at most this many bytes (default 65536)."
+      })
+    )
+  });
+  pi.registerTool({
+    name: "kb_read",
+    label: "KB Read",
+    description: "Read a note from the knowledge base by name, relative path, or [[wikilink]]. Resolves fuzzy references without needing an absolute path \u2014 use this when you know the note's title/filename but not its full path on disk.",
+    promptGuidelines: [
+      "Use kb_read when a note is referenced by name or [[wikilink]] \u2014 don't run find/grep first.",
+      "Use the standard `read` tool for non-indexed files or when you already have an absolute path."
+    ],
+    parameters: readParams,
+    async execute(_toolCallId, params) {
+      if (!index || index.size() === 0) {
+        const msg = !index ? "knowledge-search is not configured. Run /knowledge-search-setup to set it up." : !syncDone ? "Index is still syncing in the background. Try again in a moment." : "Index is empty.";
+        return { content: [{ type: "text", text: msg }], details: {} };
+      }
+      const result = resolveNote(params.name, index.listFiles(), {
+        fileExtensions: currentConfig?.fileExtensions,
+        cwd: sessionCwd
+      });
+      if (result.matches.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No note matched "${result.normalizedRef}". Try knowledge_search with a topic query to find related notes.`
+            }
+          ],
+          details: {}
+        };
+      }
+      if (!result.unique && result.matches.length > 1) {
+        const home2 = process.env.HOME || "";
+        const listed = result.matches.map((m, i) => {
+          const display2 = home2 && m.absPath.startsWith(home2) ? m.absPath.replace(home2, "~") : m.absPath;
+          return `${i + 1}. ${display2}  _(${m.reason})_`;
+        }).join("\n");
+        return {
+          content: [
+            {
+              type: "text",
+              text: `"${result.normalizedRef}" is ambiguous. ${result.matches.length} candidates:
+
+${listed}
+
+Call kb_read again with a more specific path (e.g. the exact relative path) to disambiguate.`
+            }
+          ],
+          details: { candidates: result.matches.map((m) => m.absPath) }
+        };
+      }
+      const match = result.matches[0];
+      let note;
+      try {
+        note = readNote(match.absPath, {
+          maxBytes: params.max_bytes
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text", text: `Failed to read ${match.absPath}: ${msg}` }],
+          details: {}
+        };
+      }
+      const home = process.env.HOME || "";
+      const display = home && note.path.startsWith(home) ? note.path.replace(home, "~") : note.path;
+      const truncNote = note.truncated ? `
+
+_(truncated: showing first ${note.content.length} of ${note.totalBytes} bytes)_` : "";
+      const section = result.subheading ? ` \u2014 section "${result.subheading}"` : "";
+      const fuzzyNote = !result.unique ? `
+
+_(fuzzy match via ${match.reason} \u2014 if this isn't the note you meant, re-run kb_read with a more specific path)_` : "";
+      const header = `# ${display}${section}${truncNote}${fuzzyNote}
+
+`;
+      return {
+        content: [{ type: "text", text: header + note.content }],
+        details: {
+          resolvedPath: match.absPath,
+          truncated: note.truncated
+        }
+      };
+    }
+  });
+}
+export {
+  index_default as default
+};
+//# sourceMappingURL=index.js.map
