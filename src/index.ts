@@ -131,6 +131,9 @@ export default function (pi: ExtensionAPI) {
       const workerPath = join(import.meta.dirname, "..", "dist", "sync-worker.mjs");
       const worker = fork(workerPath, [], {
         stdio: ["ignore", "pipe", "pipe", "ipc"],
+        // Suppress "node:sqlite is experimental" warning — node:sqlite is stable
+        // enough for our read/write usage and the warning pollutes pi startup.
+        execArgv: ["--no-warnings=ExperimentalWarning"],
         // Forward sessionCwd so the worker resolves the same project-local
         // settings.json (pi-knowledge-search.localPath / pi-total-recall cascade).
         env: { ...process.env, KNOWLEDGE_SEARCH_CWD: sessionCwd ?? process.env.KNOWLEDGE_SEARCH_CWD ?? "" },

@@ -9,16 +9,28 @@ function globalConfigFile() {
 function globalIndexDir() {
   return path.join(process.env.HOME || "/tmp", ".pi", "knowledge-search");
 }
+function warnUnknownKeys(block, blockName, knownKeys) {
+  if (!block || typeof block !== "object") return;
+  const unknown = Object.keys(block).filter((k) => !knownKeys.includes(k));
+  if (unknown.length === 0) return;
+  console.error(
+    `pi-knowledge-search: ignoring unknown key(s) in settings.json "${blockName}" block: ${unknown.join(", ")} (expected: ${knownKeys.join(", ")})`
+  );
+}
+var PI_KNOWLEDGE_SEARCH_SETTINGS_KEYS = ["localPath"];
+var PI_TOTAL_RECALL_KNOWN_KEYS = ["localPath"];
 function resolveLocalBase(cwd) {
   if (!cwd) return null;
   try {
     const raw = fs.readFileSync(path.join(cwd, ".pi", "settings.json"), "utf-8");
     const settings = JSON.parse(raw) ?? {};
     const ks = settings["pi-knowledge-search"];
+    warnUnknownKeys(ks, "pi-knowledge-search", PI_KNOWLEDGE_SEARCH_SETTINGS_KEYS);
     if (ks && typeof ks === "object" && typeof ks.localPath === "string" && ks.localPath) {
       return ks.localPath;
     }
     const tr = settings["pi-total-recall"];
+    warnUnknownKeys(tr, "pi-total-recall", PI_TOTAL_RECALL_KNOWN_KEYS);
     if (tr && typeof tr === "object" && typeof tr.localPath === "string" && tr.localPath) {
       return path.join(tr.localPath, "knowledge-search");
     }
