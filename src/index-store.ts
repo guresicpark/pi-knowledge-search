@@ -145,6 +145,12 @@ export class KnowledgeIndex {
   async load(): Promise<void> {
     this.fts.load();
 
+    // Yield before the (potentially 99 MB) JSON parse — keeps the heavy
+    // I/O off the same microtask drain as session_start /
+    // before_agent_start, so pi's outbound model HTTP request fires
+    // before we touch the index file.
+    await new Promise<void>((r) => setImmediate(r));
+
     const indexFile = path.join(this.config.indexDir, "index.json");
     if (fs.existsSync(indexFile)) {
       try {

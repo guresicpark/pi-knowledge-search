@@ -86,14 +86,19 @@ export default function (pi: ExtensionAPI) {
     }
     if (!currentConfig) return;
 
+    let indexLoaded: Promise<void> = Promise.resolve();
     if (currentConfig.provider) {
       const embedder = createEmbedder(currentConfig.provider, currentConfig.dimensions);
       index = new KnowledgeIndex(currentConfig, embedder);
-      await index.load();
+      // Fire-and-forget: don't block session_start on the (potentially
+      // 99 MB) JSON.parse. injectOverview below awaits this promise; the
+      // outbound model HTTP request can fire as soon as session_start
+      // returns. See plan: Slice B'.
+      indexLoaded = index.load();
     } else if (currentConfig.dirs.length > 0) {
       // FTS-only mode — no embedder, keyword search still works zero-config.
       index = new KnowledgeIndex(currentConfig, null);
-      await index.load();
+      indexLoaded = index.load();
     }
 
     if (currentConfig.knowledgeBases.length > 0) {
@@ -110,14 +115,26 @@ export default function (pi: ExtensionAPI) {
     // unless one is already in the session or the user disabled it.
     // Runs off whatever the index has loaded from disk — the worker's
     // incremental sync below will update the store for future sessions.
+    //
+    // Gated on indexLoaded so the synchronous JSON.parse stays off the
+    // session_start critical path; injectOverview itself runs in a
+    // microtask after load() resolves, while pi's outbound model HTTP
+    // already fired during session_start's earlier return.
     // ----------------------------------------------------------------
-    try {
-      injectOverview(ctx, false);
-    } catch (err: unknown) {
-      // Overview is a nice-to-have — never let it break startup.
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`knowledge-search: overview injection failed: ${msg}`);
-    }
+    indexLoaded
+      .then(() => {
+        try {
+          injectOverview(ctx, false);
+        } catch (err: unknown) {
+          // Overview is a nice-to-have — never let it break startup.
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`knowledge-search: overview injection failed: ${msg}`);
+        }
+      })
+      .catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`knowledge-search: index load failed: ${msg}`);
+      });
 
     // Sync in a child process so it never blocks the main event loop
     const MAX_WORKER_RESTARTS = 3;
