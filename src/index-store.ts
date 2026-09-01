@@ -916,7 +916,9 @@ export class KnowledgeIndex {
         }
         this.walkDir(absPath, sourceDir, results);
       } else if (entry.isFile()) {
-        const ext = path.extname(entry.name);
+        // Case-insensitive extension match (like pi-local-rag) so README.MD
+        // and config.JSON index the same as their lowercase forms.
+        const ext = path.extname(entry.name).toLowerCase();
         if (!this.config.fileExtensions.includes(ext)) continue;
         const relPath = path.relative(sourceDir, absPath);
         if (this.shouldSkip(relPath, entry.name)) continue;

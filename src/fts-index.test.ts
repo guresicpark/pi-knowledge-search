@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { KnowledgeIndex, type SyncProgress } from "./index-store.js";
 import { FtsChunkIndex, toFtsQuery } from "./fts-index.js";
-import type { Config } from "./config.js";
+import { DEFAULT_FILE_EXTENSIONS, type Config } from "./config.js";
 import type { Embedder } from "./embedder.js";
 
 // ---------------------------------------------------------------------------
@@ -548,6 +548,36 @@ describe("KnowledgeIndex FTS-only mode (no embedder)", () => {
     assert.equal(last.currentFile, "a.md");
     assert.ok(events.some((e) => e.phase === "scan"));
     assert.ok(events.some((e) => e.phase === "save"));
+  });
+
+  it("default extensions index nomic's text group, not code files", async () => {
+    fs.writeFileSync(path.join(vaultDir, "a.md"), "# Note\n\nSome markdown prose worth indexing.");
+    fs.writeFileSync(path.join(vaultDir, "data.json"), JSON.stringify({ topic: "rollbacks", steps: 3 }));
+    fs.writeFileSync(path.join(vaultDir, "conf.YAML"), "topic: rollbacks\nsteps: 3\n");
+    fs.writeFileSync(path.join(vaultDir, "script.ts"), "export const x = 1; // code is not in nomic's group\n");
+
+    const indexDir = path.join(tmpDir, "idx-default-exts");
+    fs.mkdirSync(indexDir);
+    const idx = new KnowledgeIndex(
+      {
+        dirs: [vaultDir],
+        fileExtensions: DEFAULT_FILE_EXTENSIONS,
+        excludeDirs: [],
+        dimensions: 512,
+        provider: null,
+        modelSignature: null,
+        indexDir,
+        autoInject: false,
+        overview: { inject: false, maxDepth: 2, maxFoldersPerDir: 20, maxKeywordsPerFolder: 5 },
+      },
+      null
+    );
+    await idx.load();
+    await idx.sync();
+
+    const indexed = idx.listFiles().map((f) => f.relPath).sort();
+    assert.deepStrictEqual(indexed, ["a.md", "conf.YAML", "data.json"]);
+    await idx.close();
   });
 
   it("search() returns BM25 results in FTS-only mode", async () => {

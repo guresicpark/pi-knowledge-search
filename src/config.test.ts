@@ -138,12 +138,32 @@ describe("config", () => {
 
     const config = loadConfig();
     assert.ok(config);
-    assert.deepStrictEqual(config.fileExtensions, [".md", ".txt"]);
+    // Defaults mirror pi-local-rag's nomic text group (DEFAULT_DOC_EXTS).
+    assert.deepStrictEqual(config.fileExtensions, [
+      ".md", ".mdx", ".txt", ".rst",
+      ".html", ".htm",
+      ".json", ".jsonc", ".yaml", ".yml", ".toml", ".ini", ".xml", ".csv", ".tsv",
+      ".env", ".gitignore", ".dockerfile",
+    ]);
     assert.ok(config.excludeDirs.includes("node_modules"));
     assert.ok(config.excludeDirs.includes(".git"));
     assert.ok(config.excludeDirs.includes(".obsidian"));
     assert.ok(config.excludeDirs.includes(".trash"));
     assert.equal(config.dimensions, 768);
+  });
+
+  it("lowercases file extensions from file and env", () => {
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({
+        dirs: ["/tmp/docs"],
+        fileExtensions: [".MD", ".Txt"],
+      })
+    );
+    assert.deepStrictEqual(loadConfig()?.fileExtensions, [".md", ".txt"]);
+
+    process.env.KNOWLEDGE_SEARCH_EXTENSIONS = ".JSON, .Yaml";
+    assert.deepStrictEqual(loadConfig()?.fileExtensions, [".json", ".yaml"]);
   });
 
   it("resolves ~ in directory paths", () => {

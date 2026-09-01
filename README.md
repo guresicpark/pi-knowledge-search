@@ -92,7 +92,6 @@ You can also edit the config file directly:
 ```json
 {
   "dirs": ["~/notes", "~/docs"],
-  "fileExtensions": [".md", ".txt"],
   "excludeDirs": ["node_modules", ".git", ".obsidian", ".trash"],
   "autoInject": true,
   "provider": {
@@ -102,7 +101,17 @@ You can also edit the config file directly:
 }
 ```
 
+All fields except `dirs` are optional — the example shows the defaults for `excludeDirs` and `autoInject`. Omit `fileExtensions` to get the full default list below, or set it explicitly to narrow down (e.g. `[".md", ".txt"]` for a notes-only vault).
+
 The `model` field is optional — omit it for the nomic default. `autoInject` (default `true`) controls the per-turn knowledge lookup; it is re-enabled automatically at startup while the index holds vectors. Omit the whole `provider` block for **FTS-only mode**: zero-config pure BM25 keyword search, no model download.
+
+Default `fileExtensions` mirror the extensions pi-local-rag's nomic model indexes:
+
+```
+.md .mdx .txt .rst .html .htm .json .jsonc .yaml .yml .toml .ini .xml .csv .tsv .env .gitignore .dockerfile
+```
+
+(.pdf/.docx also go to nomic in pi-local-rag but need extraction libraries and are not indexed here.) Extension matching is case-insensitive; code extensions (`.ts`, `.py`, …) are not in nomic's group — set `fileExtensions` explicitly if you want them.
 
 > **Migrating from remote providers:** OpenAI, OpenAI-compatible, Bedrock, and Ollama embedding providers were removed — this extension is local-only now. A config naming a removed provider throws a migration error at startup; switch to `"transformers"` (or remove the `provider` block). Switching engines removes all existing embeddings and re-embeds once on the next sync.
 

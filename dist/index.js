@@ -8,6 +8,26 @@ import { isAbsolute as isAbsolute2, join as join6, relative as relative2, resolv
 // src/config.ts
 import * as fs from "node:fs";
 import * as path from "node:path";
+var DEFAULT_FILE_EXTENSIONS = [
+  ".md",
+  ".mdx",
+  ".txt",
+  ".rst",
+  ".html",
+  ".htm",
+  ".json",
+  ".jsonc",
+  ".yaml",
+  ".yml",
+  ".toml",
+  ".ini",
+  ".xml",
+  ".csv",
+  ".tsv",
+  ".env",
+  ".gitignore",
+  ".dockerfile"
+];
 function defaultConfigFile(cwd) {
   return path.join(cwd || process.cwd(), ".pi", "knowledge-search.json");
 }
@@ -66,7 +86,7 @@ function loadConfig(cwd) {
   const resolvePath = (p) => p.replace(/^~/, home);
   const dirs = (envDirs ? envDirs.split(",").map((d) => d.trim()) : file?.dirs ?? []).map(resolvePath).filter(Boolean);
   if (dirs.length === 0) return null;
-  const fileExtensions = envStr("KNOWLEDGE_SEARCH_EXTENSIONS")?.split(",").map((e) => e.trim()) ?? file?.fileExtensions ?? [".md", ".txt"];
+  const fileExtensions = (envStr("KNOWLEDGE_SEARCH_EXTENSIONS")?.split(",").map((e) => e.trim().toLowerCase()) ?? file?.fileExtensions?.map((e) => e.toLowerCase()) ?? DEFAULT_FILE_EXTENSIONS).filter(Boolean);
   const excludeDirs = envStr("KNOWLEDGE_SEARCH_EXCLUDE")?.split(",").map((d) => d.trim()) ?? file?.excludeDirs ?? ["node_modules", ".git", ".obsidian", ".trash"];
   let provider = null;
   if (file?.provider) {
@@ -1345,7 +1365,7 @@ ${chunkText}`;
         }
         this.walkDir(absPath, sourceDir, results);
       } else if (entry.isFile()) {
-        const ext = path2.extname(entry.name);
+        const ext = path2.extname(entry.name).toLowerCase();
         if (!this.config.fileExtensions.includes(ext)) continue;
         const relPath = path2.relative(sourceDir, absPath);
         if (this.shouldSkip(relPath, entry.name)) continue;
@@ -2368,7 +2388,7 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
     saveConfig(
       {
         dirs: [],
-        fileExtensions: [".md", ".txt"],
+        fileExtensions: DEFAULT_FILE_EXTENSIONS,
         excludeDirs: ["node_modules", ".git", ".obsidian", ".trash"]
       },
       sessionCwd

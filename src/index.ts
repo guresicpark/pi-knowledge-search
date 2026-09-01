@@ -9,7 +9,15 @@ import type { ChildProcess } from "node:child_process";
 import { fork } from "node:child_process";
 import * as fs from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
-import { loadConfig, saveConfig, getConfigPath, getIndexDir, type Config, type ConfigFile } from "./config.js";
+import {
+  loadConfig,
+  saveConfig,
+  getConfigPath,
+  getIndexDir,
+  DEFAULT_FILE_EXTENSIONS,
+  type Config,
+  type ConfigFile,
+} from "./config.js";
 import { createEmbedder, isTransformersModelCached } from "./embedder.js";
 import { KnowledgeIndex, type SyncProgress } from "./index-store.js";
 import { buildOverview, formatOverview } from "./overview.js";
@@ -773,7 +781,7 @@ export default function (pi: ExtensionAPI) {
     saveConfig(
       {
         dirs: [],
-        fileExtensions: [".md", ".txt"],
+        fileExtensions: DEFAULT_FILE_EXTENSIONS,
         excludeDirs: ["node_modules", ".git", ".obsidian", ".trash"],
       },
       sessionCwd

@@ -6,7 +6,7 @@ All settings can be overridden via environment variables. The config file (`{cwd
 | ----------------------------- | ---------------------------------------------------------------- | ------------------------------------ |
 | `KNOWLEDGE_SEARCH_CONFIG`     | Path to config file                                               | `{cwd}/.pi/knowledge-search.json`    |
 | `KNOWLEDGE_SEARCH_DIRS`       | Comma-separated directories to index                              | _(from config file)_                 |
-| `KNOWLEDGE_SEARCH_EXTENSIONS` | Comma-separated file extensions                                   | `.md,.txt`                           |
+| `KNOWLEDGE_SEARCH_EXTENSIONS` | Comma-separated file extensions                                   | nomic text group (see [README](../README.md#config-file)) |
 | `KNOWLEDGE_SEARCH_EXCLUDE`    | Comma-separated directory names to skip                           | `node_modules,.git,.obsidian,.trash` |
 | `KNOWLEDGE_SEARCH_DIMENSIONS` | Embedding vector dimensions                                       | `768` (with a provider; unused FTS-only) |
 | `KNOWLEDGE_SEARCH_INDEX_DIR`  | Where to store the index                                          | `{cwd}/.pi/knowledge-search`         |

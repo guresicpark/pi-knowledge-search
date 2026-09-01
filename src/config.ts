@@ -38,6 +38,19 @@ export interface OverviewConfig {
   maxKeywordsPerFolder: number;
 }
 
+/**
+ * Default file extensions — exactly the text/prose group pi-local-rag's
+ * nomic model indexes (DEFAULT_DOC_EXTS). Binary document types (.pdf,
+ * .docx) also go to nomic there but require extraction libraries
+ * (unpdf/mammoth) and are therefore not included here.
+ */
+export const DEFAULT_FILE_EXTENSIONS = [
+  ".md", ".mdx", ".txt", ".rst",
+  ".html", ".htm",
+  ".json", ".jsonc", ".yaml", ".yml", ".toml", ".ini", ".xml", ".csv", ".tsv",
+  ".env", ".gitignore", ".dockerfile",
+];
+
 /** The only embedding engine: local ONNX inference via Transformers.js. */
 export type ProviderConfig = { type: "transformers"; model: string };
 
@@ -175,10 +188,12 @@ export function loadConfig(cwd?: string): Config | null {
 
   if (dirs.length === 0) return null;
 
-  const fileExtensions = envStr("KNOWLEDGE_SEARCH_EXTENSIONS")
+  const fileExtensions = (envStr("KNOWLEDGE_SEARCH_EXTENSIONS")
     ?.split(",")
-    .map((e) => e.trim()) ??
-    file?.fileExtensions ?? [".md", ".txt"];
+    .map((e) => e.trim().toLowerCase()) ??
+    file?.fileExtensions?.map((e) => e.toLowerCase()) ??
+    DEFAULT_FILE_EXTENSIONS)
+    .filter(Boolean);
 
   const excludeDirs = envStr("KNOWLEDGE_SEARCH_EXCLUDE")
     ?.split(",")
