@@ -10,6 +10,7 @@ All settings can be overridden via environment variables. The config file (`{cwd
 | `KNOWLEDGE_SEARCH_EXCLUDE`    | Comma-separated directory names to skip                           | `node_modules,.git,.obsidian,.trash` |
 | `KNOWLEDGE_SEARCH_DIMENSIONS` | Embedding vector dimensions                                       | `768` (with a provider; unused FTS-only) |
 | `KNOWLEDGE_SEARCH_INDEX_DIR`  | Where to store the index                                          | `{cwd}/.pi/knowledge-search`         |
+| `KNOWLEDGE_SEARCH_AUTO_INJECT` | Per-turn knowledge lookup injection (re-enabled at startup while vectors exist) | `true` |
 
 ### Transformers.js (local ONNX)
 

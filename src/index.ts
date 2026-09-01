@@ -4,10 +4,11 @@ import type {
   SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { Box, Text } from "@earendil-works/pi-tui";
 import type { ChildProcess } from "node:child_process";
 import { fork } from "node:child_process";
 import * as fs from "node:fs";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { loadConfig, saveConfig, getConfigPath, getIndexDir, type Config, type ConfigFile } from "./config.js";
 import { createEmbedder, isTransformersModelCached } from "./embedder.js";
 import { KnowledgeIndex, type SyncProgress } from "./index-store.js";
@@ -88,7 +89,109 @@ export default function (pi: ExtensionAPI) {
   // Lifecycle
   // ------------------------------------------------------------------
 
-  pi.on("session_start", async (_event, ctx) => {
+  // Render the auto-injected "knowledge-lookup" message as a single
+  // summary-line box in the TUI, exactly like pi-local-rag's "RAG lookup"
+  // band. The full chunk context in `content` still goes to the model;
+  // `details.summary` carries the one-line form shown to the user.
+  pi.registerMessageRenderer(
+    "knowledge-lookup",
+    (message, { outputPad }, theme) => {
+      const details = message.details as { summary?: string; error?: boolean } | undefined;
+      const summary = details?.summary;
+      if (!summary) return undefined;
+      const isError = details?.error === true;
+      // Success → green band; error → red band (the same bgs the TUI uses
+      // for succeeded/failed tools). Foreground stays the theme's base text
+      // color so it contrasts with the tinted band; the label gets the
+      // matching success/error fg for reinforcement.
+      const box = new Box(outputPad, 1, (boxTheme) =>
+        theme.bg(isError ? "toolErrorBg" : "toolSuccessBg", boxTheme));
+      const [label, ...rest] = summary.split("—");
+      const rendered = rest.length
+        ? `${theme.fg(isError ? "error" : "success", label.trim())} —${theme.fg("text", rest.join("—"))}`
+        : theme.fg("text", summary);
+      box.addChild(new Text(rendered, 0, 0));
+      return box;
+    }
+  );
+
+  /** Display path for lookup summaries: cwd-relative when inside, else ~-shortened. */
+  function lookupDisplayPath(absPath: string): string {
+    if (sessionCwd) {
+      const rel = relative(sessionCwd, absPath);
+      if (rel !== "" && !rel.startsWith("..") && !isAbsolute(rel)) return rel;
+    }
+    return absPath.replace(process.env.HOME || "", "~");
+  }
+
+  /**
+   * Auto knowledge lookup before every agent turn (like pi-local-rag's
+   * auto-injection): hybrid-search the user's prompt and inject the top
+   * hits as a message right after it. Injected as a trailing message — not
+   * into the system prompt — to keep the provider's KV cache valid and the
+   * hits near the question.
+   */
+  const LOOKUP_TOP_K = 5;
+  const LOOKUP_MIN_SCORE = 0.1;
+  const LOOKUP_PREVIEW_CHARS = 600;
+
+  pi.on("before_agent_start", async (event) => {
+    if (!currentConfig?.autoInject) return;
+    if (!index || index.size() === 0) return;
+    if (!event.prompt.trim()) return;
+
+    let results;
+    try {
+      results = (await index.search(event.prompt, LOOKUP_TOP_K)).filter(
+        (r) => r.score >= LOOKUP_MIN_SCORE
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        message: {
+          customType: "knowledge-lookup",
+          content: `[pi-knowledge-search] Knowledge lookup failed: ${msg}`,
+          display: true,
+          details: { summary: `Knowledge lookup failed — ${msg}`, error: true },
+        },
+      };
+    }
+    if (results.length === 0) return;
+
+    const contextBlock = results
+      .map((r) => {
+        const heading = r.heading && r.heading !== "intro" ? ` > ${r.heading}` : "";
+        return `### ${lookupDisplayPath(r.path)}${heading}\n\n${r.excerpt.slice(0, LOOKUP_PREVIEW_CHARS)}`;
+      })
+      .join("\n\n");
+
+    // One-line summary for the TUI box: file (chunk count), e.g.
+    // "Knowledge lookup — notes/a.md (3), docs/b.md (2)"
+    const countsByFile = new Map<string, number>();
+    for (const r of results) {
+      const p = lookupDisplayPath(r.path);
+      countsByFile.set(p, (countsByFile.get(p) ?? 0) + 1);
+    }
+    const fileSummaries = [...countsByFile.entries()].map(
+      ([file, count]) => `${file} (${count})`
+    );
+    const summary = `Knowledge lookup — ${fileSummaries.join(", ")}`;
+
+    return {
+      message: {
+        customType: "knowledge-lookup",
+        content:
+          `[pi-knowledge-search] Automatic knowledge lookup triggered by the user's message above.\n` +
+          `Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid search (BM25 + vector). ` +
+          `These are search hits, not statements from the user.\n\n` +
+          contextBlock,
+        display: true,
+        details: { summary, error: false },
+      },
+    };
+  });
+
+  pi.on("session_start", async (event, ctx) => {
     sessionCwd = ctx.cwd;
     try {
       currentConfig = loadConfig(sessionCwd);
@@ -130,6 +233,25 @@ export default function (pi: ExtensionAPI) {
     // ----------------------------------------------------------------
     indexLoaded
       .then(() => {
+        // Auto-enable the per-turn knowledge lookup whenever the index
+        // holds vectors, mirroring pi-local-rag's startup auto-enable
+        // (ragEnabled flips on once chunks exist). /knowledge-search off
+        // is therefore a per-session kill-switch: the next startup with
+        // vectors present turns injection back on.
+        if (
+          event.reason === "startup" &&
+          currentConfig?.provider &&
+          index &&
+          index.chunkCount() > 0 &&
+          !currentConfig.autoInject
+        ) {
+          const file = readRawConfig();
+          file.autoInject = true;
+          saveConfig(file as ConfigFile, sessionCwd);
+          currentConfig.autoInject = true;
+          ctx.ui.notify("Knowledge lookup auto-injection enabled", "info");
+        }
+
         try {
           injectOverview(ctx, false);
         } catch (err: unknown) {
@@ -267,6 +389,8 @@ export default function (pi: ExtensionAPI) {
     { value: "exclude", label: "exclude", description: "Manage excluded directory names (-<name> removes)" },
     { value: "index", label: "index", description: "Incrementally index new/changed files" },
     { value: "clear", label: "clear", description: "Clear the index and reset config to defaults" },
+    { value: "on", label: "on", description: "Enable per-turn knowledge lookup injection" },
+    { value: "off", label: "off", description: "Disable per-turn knowledge lookup injection" },
     { value: "help", label: "help", description: "Show all /knowledge-search commands" },
   ];
 
@@ -348,6 +472,16 @@ export default function (pi: ExtensionAPI) {
     lines.push("", "  " + theme.bold("File extensions:"));
     const exts = currentConfig?.fileExtensions ?? [];
     lines.push("    " + theme.fg("muted", exts.join(" ")));
+
+    lines.push(
+      "",
+      "  " +
+        label("Lookup inject:") +
+        (currentConfig?.autoInject
+          ? theme.fg("success", "enabled")
+          : theme.fg("warning", "disabled")) +
+        theme.fg("dim", `  topK=${5}  minScore=${0.1}`),
+    );
 
     lines.push(
       "",
@@ -527,6 +661,16 @@ export default function (pi: ExtensionAPI) {
       syncDone = true;
       clearProgressUI();
 
+      // Like /rag index: flip injection on as soon as the store actually
+      // has vectors, so a fresh index doesn't need a manual `on`.
+      if (currentConfig?.provider && index!.chunkCount() > 0 && !currentConfig.autoInject) {
+        const file = readRawConfig();
+        file.autoInject = true;
+        saveConfig(file as ConfigFile, sessionCwd);
+        currentConfig.autoInject = true;
+        ctx.ui.notify("Knowledge lookup auto-injection enabled", "info");
+      }
+
       const changed = added + updated + removed;
       ctx.ui.notify(
         changed === 0
@@ -657,7 +801,7 @@ export default function (pi: ExtensionAPI) {
   let statusWidgetVisible = false;
 
   pi.registerCommand("knowledge-search", {
-    description: "knowledge-search: (status) | add <dir> | exclude <name> | index | clear | help",
+    description: "knowledge-search: (status) | add <dir> | exclude <name> | index | clear | on | off | help",
     getArgumentCompletions: (prefix: string) => getSubcommandCompletions(prefix),
     handler: async (args, ctx) => {
       const parts = (args || "").trim().split(/\s+/);
@@ -677,6 +821,20 @@ export default function (pi: ExtensionAPI) {
       }
       if (subcommand === "clear") {
         await handleClear(ctx);
+        return;
+      }
+      if (subcommand === "on" || subcommand === "off") {
+        const enabled = subcommand === "on";
+        const file = readRawConfig();
+        file.autoInject = enabled;
+        saveConfig(file as ConfigFile, sessionCwd);
+        if (currentConfig) currentConfig.autoInject = enabled;
+        ctx.ui.notify(
+          enabled
+            ? "Knowledge lookup injection enabled"
+            : "Knowledge lookup injection disabled (re-enabled automatically at next startup while the index has vectors)",
+          "info"
+        );
         return;
       }
       if (subcommand === "help") {

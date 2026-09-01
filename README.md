@@ -1,8 +1,14 @@
 # pi-knowledge-search
 
-Hybrid **local** search over local files for [pi](https://github.com/badlogic/pi). Indexes directories of text/markdown files using local ONNX vector embeddings **and** SQLite FTS5 keyword search, and exposes `knowledge_search` + `kb_read` tools the LLM can call. Everything runs on your machine — no embedding APIs, no cloud services. Indexing runs on session startup (file changes mid-session are picked up on next restart or via `/knowledge-sync`).
+Hybrid **local** search over local files for [pi](https://github.com/badlogic/pi). Indexes directories of text/markdown files using local ONNX vector embeddings **and** SQLite FTS5 keyword search, exposes `knowledge_search` + `kb_read` tools the LLM can call, and auto-injects a knowledge lookup on every prompt (like pi-local-rag's RAG lookup). Everything runs on your machine — no embedding APIs, no cloud services. Indexing runs on session startup; mid-session file changes are picked up with `/knowledge-search index`.
 
 On session start, injects a folder+keyword overview of the indexed vault as a custom message so the model knows what’s worth searching for before it asks.
+
+## Knowledge lookup
+
+Like pi-local-rag's RAG lookup, every user prompt triggers an automatic **knowledge lookup**: the prompt runs through hybrid search (top 5 chunks, min score 0.1) and the hits are injected as a message right after the prompt — full excerpts for the model, and a green `Knowledge lookup — file.md (2), …` summary box for you (red on failure).
+
+Injection is automatically enabled whenever the index holds vectors — at session start and after `/knowledge-search index` — so `/knowledge-search off` acts as a per-session kill-switch that the next startup flips back on (`autoInject` in the config).
 
 ## How search works
 
@@ -73,6 +79,7 @@ Everything is driven by the `/knowledge-search` command (mirroring pi-local-rag'
 /knowledge-search exclude build   # add an excluded directory name (-<name> removes, bare lists)
 /knowledge-search index           # incrementally index new/changed files (progress bar, like /rag)
 /knowledge-search clear           # clear ALL project data + reset settings to defaults (confirm first)
+/knowledge-search on | off        # enable/disable the per-turn knowledge lookup injection
 /knowledge-search help            # list all subcommands
 ```
 
@@ -87,6 +94,7 @@ You can also edit the config file directly:
   "dirs": ["~/notes", "~/docs"],
   "fileExtensions": [".md", ".txt"],
   "excludeDirs": ["node_modules", ".git", ".obsidian", ".trash"],
+  "autoInject": true,
   "provider": {
     "type": "transformers",
     "model": "nomic-ai/nomic-embed-text-v1.5"
@@ -94,7 +102,7 @@ You can also edit the config file directly:
 }
 ```
 
-The `model` field is optional — omit it for the nomic default. Omit the whole `provider` block for **FTS-only mode**: zero-config pure BM25 keyword search, no model download.
+The `model` field is optional — omit it for the nomic default. `autoInject` (default `true`) controls the per-turn knowledge lookup; it is re-enabled automatically at startup while the index holds vectors. Omit the whole `provider` block for **FTS-only mode**: zero-config pure BM25 keyword search, no model download.
 
 > **Migrating from remote providers:** OpenAI, OpenAI-compatible, Bedrock, and Ollama embedding providers were removed — this extension is local-only now. A config naming a removed provider throws a migration error at startup; switch to `"transformers"` (or remove the `provider` block). Switching engines removes all existing embeddings and re-embeds once on the next sync.
 
@@ -116,7 +124,8 @@ Every config field can be overridden via environment variables. This is useful f
 
 1. On session start, loads the index from disk and incrementally syncs — only re-embeds new or modified files (or everything, once, after an embedding-engine change)
 2. Registers a `knowledge_search` tool the LLM calls with natural language queries
-3. Returns ranked results with file paths, relevance scores, and content excerpts
+3. Before every agent turn, runs an automatic knowledge lookup on the prompt and injects the top hits as a message right after it (see [Knowledge lookup](#knowledge-lookup))
+4. Returns ranked results with file paths, relevance scores, and content excerpts
 
 Sync runs on session startup. Files changed mid-session can be picked up with `/knowledge-search index`.
 
@@ -131,19 +140,22 @@ The index is stored at `{cwd}/.pi/knowledge-search/index.json` (project-local; s
 | `/knowledge-search exclude <name>`   | Manage excluded directory names (`-<name>` removes)  |
 | `/knowledge-search index`            | Incrementally index new/changed files                |
 | `/knowledge-search clear`            | Clear all project data; reset settings to defaults  |
+| `/knowledge-search on` / `off`       | Toggle per-turn knowledge lookup injection           |
 | `/knowledge-search help`             | List all subcommands                                 |
 | `/knowledge-overview`                | Force-rebuild and re-inject the vault overview       |
 
 ## Performance
 
-Typical numbers for ~500 markdown files (~20MB):
+Indicative numbers for local ONNX embeddings (nomic-embed-text-v1.5, q8, Apple Silicon, warm model cache) on ~500 markdown files (~20 MB, ~500 chunks):
 
-| Operation                     | Time   |
-| ----------------------------- | ------ |
-| Full index build              | ~7s    |
-| Incremental sync (no changes) | ~12ms  |
-| Search query                  | ~250ms |
-| Index file size               | ~5MB   |
+| Operation                     | Time            |
+| ----------------------------- | --------------- |
+| Full index build              | ~40s (chunked, batched ONNX) |
+| Incremental sync (no changes) | ~15ms           |
+| Search query                  | ~300ms          |
+| Index file size               | ~5MB            |
+
+First run per machine also downloads the nomic model (~111 MB, shared with pi-local-rag) — `/knowledge-search index` shows a notice before the download starts.
 
 ## Project-local storage
 

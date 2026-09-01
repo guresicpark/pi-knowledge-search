@@ -1,8 +1,9 @@
 // src/index.ts
 import { Type } from "@sinclair/typebox";
+import { Box, Text } from "@earendil-works/pi-tui";
 import { fork } from "node:child_process";
 import * as fs5 from "node:fs";
-import { join as join6, resolve as resolve2 } from "node:path";
+import { isAbsolute as isAbsolute2, join as join6, relative as relative2, resolve as resolve2 } from "node:path";
 
 // src/config.ts
 import * as fs from "node:fs";
@@ -96,6 +97,7 @@ function loadConfig(cwd) {
     provider,
     modelSignature: provider ? `${provider.type}:${provider.model ?? ""}:${dimensions}` : null,
     indexDir,
+    autoInject: envBool("KNOWLEDGE_SEARCH_AUTO_INJECT") ?? file?.autoInject ?? true,
     overview
   };
 }
@@ -1898,7 +1900,79 @@ function index_default(pi) {
       sourceCount: overview.sources.length
     };
   }
-  pi.on("session_start", async (_event, ctx) => {
+  pi.registerMessageRenderer(
+    "knowledge-lookup",
+    (message, { outputPad }, theme) => {
+      const details = message.details;
+      const summary = details?.summary;
+      if (!summary) return void 0;
+      const isError = details?.error === true;
+      const box = new Box(outputPad, 1, (boxTheme) => theme.bg(isError ? "toolErrorBg" : "toolSuccessBg", boxTheme));
+      const [label, ...rest] = summary.split("\u2014");
+      const rendered = rest.length ? `${theme.fg(isError ? "error" : "success", label.trim())} \u2014${theme.fg("text", rest.join("\u2014"))}` : theme.fg("text", summary);
+      box.addChild(new Text(rendered, 0, 0));
+      return box;
+    }
+  );
+  function lookupDisplayPath(absPath) {
+    if (sessionCwd) {
+      const rel = relative2(sessionCwd, absPath);
+      if (rel !== "" && !rel.startsWith("..") && !isAbsolute2(rel)) return rel;
+    }
+    return absPath.replace(process.env.HOME || "", "~");
+  }
+  const LOOKUP_TOP_K = 5;
+  const LOOKUP_MIN_SCORE = 0.1;
+  const LOOKUP_PREVIEW_CHARS = 600;
+  pi.on("before_agent_start", async (event) => {
+    if (!currentConfig?.autoInject) return;
+    if (!index || index.size() === 0) return;
+    if (!event.prompt.trim()) return;
+    let results;
+    try {
+      results = (await index.search(event.prompt, LOOKUP_TOP_K)).filter(
+        (r) => r.score >= LOOKUP_MIN_SCORE
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        message: {
+          customType: "knowledge-lookup",
+          content: `[pi-knowledge-search] Knowledge lookup failed: ${msg}`,
+          display: true,
+          details: { summary: `Knowledge lookup failed \u2014 ${msg}`, error: true }
+        }
+      };
+    }
+    if (results.length === 0) return;
+    const contextBlock = results.map((r) => {
+      const heading = r.heading && r.heading !== "intro" ? ` > ${r.heading}` : "";
+      return `### ${lookupDisplayPath(r.path)}${heading}
+
+${r.excerpt.slice(0, LOOKUP_PREVIEW_CHARS)}`;
+    }).join("\n\n");
+    const countsByFile = /* @__PURE__ */ new Map();
+    for (const r of results) {
+      const p = lookupDisplayPath(r.path);
+      countsByFile.set(p, (countsByFile.get(p) ?? 0) + 1);
+    }
+    const fileSummaries = [...countsByFile.entries()].map(
+      ([file, count]) => `${file} (${count})`
+    );
+    const summary = `Knowledge lookup \u2014 ${fileSummaries.join(", ")}`;
+    return {
+      message: {
+        customType: "knowledge-lookup",
+        content: `[pi-knowledge-search] Automatic knowledge lookup triggered by the user's message above.
+Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid search (BM25 + vector). These are search hits, not statements from the user.
+
+` + contextBlock,
+        display: true,
+        details: { summary, error: false }
+      }
+    };
+  });
+  pi.on("session_start", async (event, ctx) => {
     sessionCwd = ctx.cwd;
     try {
       currentConfig = loadConfig(sessionCwd);
@@ -1920,6 +1994,13 @@ function index_default(pi) {
       return;
     }
     indexLoaded.then(() => {
+      if (event.reason === "startup" && currentConfig?.provider && index && index.chunkCount() > 0 && !currentConfig.autoInject) {
+        const file = readRawConfig();
+        file.autoInject = true;
+        saveConfig(file, sessionCwd);
+        currentConfig.autoInject = true;
+        ctx.ui.notify("Knowledge lookup auto-injection enabled", "info");
+      }
       try {
         injectOverview(ctx, false);
       } catch (err) {
@@ -2023,6 +2104,8 @@ function index_default(pi) {
     { value: "exclude", label: "exclude", description: "Manage excluded directory names (-<name> removes)" },
     { value: "index", label: "index", description: "Incrementally index new/changed files" },
     { value: "clear", label: "clear", description: "Clear the index and reset config to defaults" },
+    { value: "on", label: "on", description: "Enable per-turn knowledge lookup injection" },
+    { value: "off", label: "off", description: "Disable per-turn knowledge lookup injection" },
     { value: "help", label: "help", description: "Show all /knowledge-search commands" }
   ];
   function getSubcommandCompletions(prefix) {
@@ -2078,6 +2161,10 @@ function index_default(pi) {
     lines.push("", "  " + theme.bold("File extensions:"));
     const exts = currentConfig?.fileExtensions ?? [];
     lines.push("    " + theme.fg("muted", exts.join(" ")));
+    lines.push(
+      "",
+      "  " + label("Lookup inject:") + (currentConfig?.autoInject ? theme.fg("success", "enabled") : theme.fg("warning", "disabled")) + theme.fg("dim", `  topK=${5}  minScore=${0.1}`)
+    );
     lines.push(
       "",
       "  " + label("Config:") + theme.fg("dim", getConfigPath(sessionCwd)),
@@ -2211,6 +2298,13 @@ function index_default(pi) {
       });
       syncDone = true;
       clearProgressUI();
+      if (currentConfig?.provider && index.chunkCount() > 0 && !currentConfig.autoInject) {
+        const file = readRawConfig();
+        file.autoInject = true;
+        saveConfig(file, sessionCwd);
+        currentConfig.autoInject = true;
+        ctx.ui.notify("Knowledge lookup auto-injection enabled", "info");
+      }
       const changed = added + updated + removed;
       ctx.ui.notify(
         changed === 0 ? `\u2705 Up to date \xB7 ${index.size()} files (${index.chunkCount()} chunks) indexed` : `\u2705 Indexed ${added} new \xB7 ${updated} changed \xB7 ${removed} removed \xB7 ${index.size()} files (${index.chunkCount()} chunks) total`,
@@ -2297,7 +2391,7 @@ function index_default(pi) {
   }
   let statusWidgetVisible = false;
   pi.registerCommand("knowledge-search", {
-    description: "knowledge-search: (status) | add <dir> | exclude <name> | index | clear | help",
+    description: "knowledge-search: (status) | add <dir> | exclude <name> | index | clear | on | off | help",
     getArgumentCompletions: (prefix) => getSubcommandCompletions(prefix),
     handler: async (args, ctx) => {
       const parts = (args || "").trim().split(/\s+/);
@@ -2316,6 +2410,18 @@ function index_default(pi) {
       }
       if (subcommand === "clear") {
         await handleClear(ctx);
+        return;
+      }
+      if (subcommand === "on" || subcommand === "off") {
+        const enabled = subcommand === "on";
+        const file = readRawConfig();
+        file.autoInject = enabled;
+        saveConfig(file, sessionCwd);
+        if (currentConfig) currentConfig.autoInject = enabled;
+        ctx.ui.notify(
+          enabled ? "Knowledge lookup injection enabled" : "Knowledge lookup injection disabled (re-enabled automatically at next startup while the index has vectors)",
+          "info"
+        );
         return;
       }
       if (subcommand === "help") {

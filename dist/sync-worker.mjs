@@ -92,6 +92,7 @@ function loadConfig(cwd) {
     provider,
     modelSignature: provider ? `${provider.type}:${provider.model ?? ""}:${dimensions}` : null,
     indexDir,
+    autoInject: envBool("KNOWLEDGE_SEARCH_AUTO_INJECT") ?? file?.autoInject ?? true,
     overview
   };
 }

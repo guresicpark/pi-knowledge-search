@@ -21,6 +21,8 @@ export interface Config {
   modelSignature: string | null;
   /** Where to store the index */
   indexDir: string;
+  /** Inject a knowledge lookup into the conversation on every user prompt. Default: true. */
+  autoInject: boolean;
   /** Session-start overview injection settings */
   overview: OverviewConfig;
 }
@@ -49,6 +51,7 @@ export interface ConfigFile {
   fileExtensions?: string[];
   excludeDirs?: string[];
   dimensions?: number;
+  autoInject?: boolean;
   overview?: Partial<OverviewConfig>;
   provider?: { type: string; model?: string };
 }
@@ -230,6 +233,7 @@ export function loadConfig(cwd?: string): Config | null {
     provider,
     modelSignature: provider ? `${provider.type}:${provider.model ?? ""}:${dimensions}` : null,
     indexDir,
+    autoInject: envBool("KNOWLEDGE_SEARCH_AUTO_INJECT") ?? file?.autoInject ?? true,
     overview,
   };
 }

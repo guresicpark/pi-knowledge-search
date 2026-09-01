@@ -76,6 +76,7 @@ function makeConfig(dir: string, dimensions = 4): Config {
     provider: null,
     modelSignature: null,
     indexDir: dir,
+    autoInject: false,
     overview: { inject: false, maxDepth: 2, maxFoldersPerDir: 20, maxKeywordsPerFolder: 5 },
   };
 }
@@ -291,7 +292,8 @@ describe("KnowledgeIndex embedding signature", () => {
       provider: null,
       modelSignature: signature,
       indexDir: dir,
-      overview: { inject: false, maxDepth: 2, maxFoldersPerDir: 20, maxKeywordsPerFolder: 5 },
+      autoInject: false,
+    overview: { inject: false, maxDepth: 2, maxFoldersPerDir: 20, maxKeywordsPerFolder: 5 },
     };
   }
 

@@ -19,6 +19,7 @@ const envKeys = [
   "KNOWLEDGE_SEARCH_EXCLUDE",
   "KNOWLEDGE_SEARCH_DIMENSIONS",
   "KNOWLEDGE_SEARCH_TRANSFORMERS_MODEL",
+  "KNOWLEDGE_SEARCH_AUTO_INJECT",
   "KNOWLEDGE_SEARCH_INDEX_DIR",
 ];
 
@@ -232,6 +233,29 @@ describe("config", () => {
     const config = loadConfig();
     assert.ok(config);
     assert.equal(config.modelSignature, "transformers:Xenova/all-MiniLM-L6-v2:256");
+  });
+
+  it("autoInject defaults to true and can be overridden by file and env", () => {
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({
+        dirs: ["/tmp/docs"],
+        provider: { type: "transformers" },
+      })
+    );
+    assert.equal(loadConfig()?.autoInject, true);
+
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({
+        dirs: ["/tmp/docs"],
+        autoInject: false,
+      })
+    );
+    assert.equal(loadConfig()?.autoInject, false);
+
+    process.env.KNOWLEDGE_SEARCH_AUTO_INJECT = "1";
+    assert.equal(loadConfig()?.autoInject, true);
   });
 
   it("throws a helpful migration error for removed provider types", () => {
