@@ -73,8 +73,7 @@ function makeConfig(dir: string, dimensions = 4): Config {
     fileExtensions: [".md"],
     excludeDirs: [],
     dimensions,
-    provider: null,
-    modelSignature: null,
+    modelSignature: "transformers:nomic-ai/nomic-embed-text-v1.5:768",
     indexDir: dir,
     autoInject: false,
     overview: { inject: false, maxDepth: 2, maxFoldersPerDir: 20, maxKeywordsPerFolder: 5 },
@@ -283,14 +282,13 @@ describe("KnowledgeIndex embedding signature", () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  function makeSigConfig(dir: string, signature: string | null, dimensions = 4): Config {
+  function makeSigConfig(dir: string, signature: string, dimensions = 4): Config {
     return {
       dirs: ["/tmp/does-not-matter"],
       fileExtensions: [".md"],
       excludeDirs: [],
       dimensions,
-      provider: null,
-      modelSignature: signature,
+        modelSignature: signature,
       indexDir: dir,
       autoInject: false,
     overview: { inject: false, maxDepth: 2, maxFoldersPerDir: 20, maxKeywordsPerFolder: 5 },
@@ -345,7 +343,7 @@ describe("KnowledgeIndex embedding signature", () => {
 
   it("FTS-only load ignores a signature mismatch (vectors unused)", async () => {
     writeIndex(3, "transformers:nomic-ai/nomic-embed-text-v1.5:4");
-    const idx = new KnowledgeIndex(makeSigConfig(tmpDir, null), null);
+    const idx = new KnowledgeIndex(makeSigConfig(tmpDir, "other-engine:whatever:4"), null);
     await idx.load();
     assert.equal(idx.chunkCount(), 3);
     await idx.close();

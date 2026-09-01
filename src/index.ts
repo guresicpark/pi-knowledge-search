@@ -18,7 +18,7 @@ import {
   type Config,
   type ConfigFile,
 } from "./config.js";
-import { createEmbedder, isTransformersModelCached } from "./embedder.js";
+import { createEmbedder, EMBEDDING_MODEL, isTransformersModelCached } from "./embedder.js";
 import { KnowledgeIndex, type SyncProgress } from "./index-store.js";
 import { buildOverview, formatOverview } from "./overview.js";
 import { resolveNote, readNote } from "./kb-reader.js";
@@ -208,25 +208,13 @@ export default function (pi: ExtensionAPI) {
     }
     if (!currentConfig) return;
 
-    let indexLoaded: Promise<void> = Promise.resolve();
-    if (currentConfig.provider) {
-      const embedder = createEmbedder(currentConfig.provider, currentConfig.dimensions);
-      index = new KnowledgeIndex(currentConfig, embedder);
-      // Fire-and-forget: don't block session_start on the (potentially
-      // 99 MB) JSON.parse. injectOverview below awaits this promise; the
-      // outbound model HTTP request can fire as soon as session_start
-      // returns. See plan: Slice B'.
-      indexLoaded = index.load();
-    } else if (currentConfig.dirs.length > 0) {
-      // FTS-only mode — no embedder, keyword search still works zero-config.
-      index = new KnowledgeIndex(currentConfig, null);
-      indexLoaded = index.load();
-    }
-
-    if (!index) {
-      syncDone = true;
-      return; // Nothing to sync
-    }
+    // The engine is always nomic — every configured index embeds.
+    index = new KnowledgeIndex(currentConfig, createEmbedder());
+    // Fire-and-forget: don't block session_start on the (potentially
+    // 99 MB) JSON.parse. injectOverview below awaits this promise; the
+    // outbound model HTTP request can fire as soon as session_start
+    // returns.
+    const indexLoaded: Promise<void> = index.load();
 
     // ----------------------------------------------------------------
     // Inject a folder+keyword overview of the vault as a custom message,
@@ -242,13 +230,14 @@ export default function (pi: ExtensionAPI) {
     indexLoaded
       .then(() => {
         // Auto-enable the per-turn knowledge lookup whenever the index
-        // holds vectors, mirroring pi-local-rag's startup auto-enable
-        // (ragEnabled flips on once chunks exist). /knowledge-search off
-        // is therefore a per-session kill-switch: the next startup with
-        // vectors present turns injection back on.
+        // holds chunks — with the always-nomic engine, chunks imply
+        // vectors. Mirrors pi-local-rag's startup auto-enable (ragEnabled
+        // flips on once chunks exist). /knowledge-search off is therefore a
+        // per-session kill-switch: the next startup with an indexed vault
+        // turns injection back on.
         if (
           event.reason === "startup" &&
-          currentConfig?.provider &&
+          currentConfig &&
           index &&
           index.chunkCount() > 0 &&
           !currentConfig.autoInject
@@ -438,10 +427,7 @@ export default function (pi: ExtensionAPI) {
    */
   async function ensureIndexLoaded(): Promise<void> {
     if (index) return;
-    const embedder = currentConfig?.provider
-      ? createEmbedder(currentConfig.provider, currentConfig.dimensions)
-      : null;
-    index = new KnowledgeIndex(currentConfig!, embedder);
+    index = new KnowledgeIndex(currentConfig!, createEmbedder());
     await index.load();
   }
 
@@ -451,9 +437,12 @@ export default function (pi: ExtensionAPI) {
     const label = (text: string) => theme.fg("dim", text.padEnd(20));
     const lines: string[] = [theme.bold("pi-knowledge-search"), ""];
 
-    lines.push("  " + label("Embedding engine:") + (currentConfig?.provider
-      ? theme.fg("success", currentConfig.provider.model) + theme.fg("dim", "  (local ONNX via Transformers.js)")
-      : theme.fg("warning", "none") + theme.fg("dim", "  (FTS-only keyword search)")));
+    lines.push(
+      "  " +
+        label("Embedding engine:") +
+        theme.fg("success", EMBEDDING_MODEL) +
+        theme.fg("dim", "  (local ONNX via Transformers.js — fixed, not configurable)")
+    );
 
     if (index) {
       lines.push("  " + label("Indexed:") + theme.fg("success", `${index.size()} files · ${index.chunkCount()} chunks`));
@@ -524,14 +513,7 @@ export default function (pi: ExtensionAPI) {
 
     const file = readRawConfig();
     const dirs = new Set([...(file.dirs ?? []), ...resolved]);
-    const before = file.dirs?.length ?? 0;
     file.dirs = [...dirs];
-
-    // Fresh configs default to the local ONNX engine; an existing provider
-    // block (or its absence, FTS-only) is preserved as-is.
-    if (!file.provider && before === 0) {
-      file.provider = { type: "transformers" };
-    }
 
     saveConfig(file as ConfigFile, sessionCwd);
 
@@ -540,7 +522,6 @@ export default function (pi: ExtensionAPI) {
     const added = resolved.filter((d) => !(currentConfig?.dirs ?? []).includes(d));
     if (currentConfig) {
       currentConfig.dirs = [...dirs];
-      if (!currentConfig.provider && file.provider) currentConfig.provider = { type: "transformers", model: "nomic-ai/nomic-embed-text-v1.5" };
     } else {
       currentConfig = loadConfig(sessionCwd);
     }
@@ -626,12 +607,9 @@ export default function (pi: ExtensionAPI) {
       // Cold-start notice: a missing model triggers a ~111 MB download that
       // can stall the first index for minutes — say so before it happens
       // (mirrors pi-local-rag's onModelLoad).
-      if (
-        currentConfig.provider?.type === "transformers" &&
-        !isTransformersModelCached(currentConfig.provider.model)
-      ) {
+      if (!isTransformersModelCached(EMBEDDING_MODEL)) {
         ctx.ui.notify(
-          `⏳ Loading embedding model: ${currentConfig.provider.model} — first run downloads it (~111 MB, this can take a few minutes)`,
+          `⏳ Loading embedding model: ${EMBEDDING_MODEL} — first run downloads it (~111 MB, this can take a few minutes)`,
           "info"
         );
       }
@@ -670,8 +648,9 @@ export default function (pi: ExtensionAPI) {
       clearProgressUI();
 
       // Like /rag index: flip injection on as soon as the store actually
-      // has vectors, so a fresh index doesn't need a manual `on`.
-      if (currentConfig?.provider && index!.chunkCount() > 0 && !currentConfig.autoInject) {
+      // has chunks (always-nomic ⇒ vectors), so a fresh index doesn't need
+      // a manual `on`.
+      if (currentConfig && index!.chunkCount() > 0 && !currentConfig.autoInject) {
         const file = readRawConfig();
         file.autoInject = true;
         saveConfig(file as ConfigFile, sessionCwd);
@@ -774,10 +753,10 @@ export default function (pi: ExtensionAPI) {
       // config written next still applies.
     }
 
-    // Reset the config to fresh install defaults at the default location
-    // (no provider — the next `add` re-defaults the engine to local
-    // Transformers.js). The HuggingFace model cache is machine-wide and
-    // shared with pi-local-rag, so it is intentionally NOT touched.
+    // Reset the config to fresh install defaults at the default location.
+    // The embedding engine is not part of the config — it is always nomic.
+    // The HuggingFace model cache is machine-wide and shared with
+    // pi-local-rag, so it is intentionally NOT touched.
     saveConfig(
       {
         dirs: [],

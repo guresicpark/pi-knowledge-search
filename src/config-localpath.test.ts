@@ -180,7 +180,6 @@ describe("config.localPath resolution", () => {
       path.join(tmpLocal, "config.json"),
       JSON.stringify({
         dirs: ["/tmp/project-docs"],
-        provider: { type: "transformers" },
       }),
       "utf-8"
     );
@@ -205,7 +204,6 @@ describe("config.localPath resolution", () => {
       path.join(tmpProject, ".pi", "knowledge-search.json"),
       JSON.stringify({
         dirs: ["/tmp/project-docs"],
-        provider: { type: "transformers" },
       }),
       "utf-8"
     );
@@ -224,7 +222,6 @@ describe("config.localPath resolution", () => {
     saveConfig(
       {
         dirs: ["/tmp/save-test"],
-        provider: { type: "transformers" },
       },
       tmpProject
     );
@@ -245,8 +242,7 @@ describe("config.localPath resolution", () => {
       saveConfig(
         {
           dirs: ["/tmp/deep"],
-          provider: { type: "transformers" },
-        },
+          },
         tmpProject
       );
       assert.ok(fs.existsSync(path.join(freshBase, "nested", "deep", "config.json")));

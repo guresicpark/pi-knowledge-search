@@ -8,6 +8,98 @@ import { isAbsolute as isAbsolute2, join as join6, relative as relative2, resolv
 // src/config.ts
 import * as fs from "node:fs";
 import * as path from "node:path";
+
+// src/embedder.ts
+import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+var EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5";
+var EMBEDDING_DIMENSIONS = 768;
+function createEmbedder() {
+  return new TransformersEmbedder(EMBEDDING_MODEL);
+}
+function truncate(text, maxChars = 1e4) {
+  return text.length > maxChars ? text.slice(0, maxChars) : text;
+}
+function summarizeErrors(errs, max = 3) {
+  const list = [...errs];
+  const shown = list.slice(0, max).join("; ");
+  return list.length > max ? `${shown} (+${list.length - max} more)` : shown;
+}
+var TRANSFORMERS_QUERY_PREFIX = "search_query: ";
+var TRANSFORMERS_DOC_PREFIX = "search_document: ";
+var TRANSFORMERS_BATCH_SIZE = 16;
+function resolveTransformersCacheDir() {
+  if (process.env.PI_RAG_MODEL_CACHE) return process.env.PI_RAG_MODEL_CACHE;
+  if (process.env.TRANSFORMERS_CACHE) return process.env.TRANSFORMERS_CACHE;
+  if (process.env.HF_HOME) return join(process.env.HF_HOME, "transformers");
+  return join(homedir(), ".cache", "huggingface", "transformers");
+}
+function isTransformersModelCached(model) {
+  return existsSync(join(resolveTransformersCacheDir(), model, "onnx", "model_quantized.onnx"));
+}
+var TransformersEmbedder = class {
+  model;
+  pipelinePromise = null;
+  constructor(model) {
+    this.model = model;
+  }
+  /**
+   * Lazily load the ONNX feature-extraction pipeline (q8 quantized weights).
+   * The load promise is cached so concurrent first calls share a single
+   * download; a failed load is evicted so the next call retries.
+   */
+  getPipeline() {
+    if (!this.pipelinePromise) {
+      this.pipelinePromise = (async () => {
+        const { pipeline, env } = await import("@huggingface/transformers");
+        env.cacheDir = resolveTransformersCacheDir();
+        return pipeline("feature-extraction", this.model, { dtype: "q8" });
+      })();
+      this.pipelinePromise.catch(() => {
+        this.pipelinePromise = null;
+      });
+    }
+    return this.pipelinePromise;
+  }
+  async embed(text, signal) {
+    if (signal?.aborted) throw new Error("Aborted");
+    const pipe = await this.getPipeline();
+    const input = TRANSFORMERS_QUERY_PREFIX + text.replace(/\s+/g, " ").trim();
+    const output = await pipe(truncate(input), { pooling: "mean", normalize: true });
+    return Array.from(output.data);
+  }
+  async embedBatch(texts, signal, _concurrency) {
+    const results = new Array(texts.length).fill(null);
+    if (texts.length === 0) return results;
+    let failed = 0;
+    const errs = /* @__PURE__ */ new Set();
+    try {
+      const pipe = await this.getPipeline();
+      for (let start = 0; start < texts.length; start += TRANSFORMERS_BATCH_SIZE) {
+        if (signal?.aborted) throw new Error("Aborted");
+        const batch = texts.slice(start, start + TRANSFORMERS_BATCH_SIZE).map((t) => TRANSFORMERS_DOC_PREFIX + truncate(t));
+        const output = await pipe(batch, { pooling: "mean", normalize: true });
+        const flattened = output.data;
+        const dim = flattened.length / batch.length;
+        for (let i = 0; i < batch.length; i++) {
+          results[start + i] = Array.from(flattened.slice(i * dim, (i + 1) * dim));
+        }
+      }
+    } catch (err) {
+      failed = results.filter((v) => v === null).length;
+      errs.add(err.message);
+      if (failed > 0) {
+        console.error(
+          `Transformers embedding failed for ${failed}/${texts.length} chunks: ${summarizeErrors(errs)}`
+        );
+      }
+    }
+    return results;
+  }
+};
+
+// src/config.ts
 var DEFAULT_FILE_EXTENSIONS = [
   ".md",
   ".mdx",
@@ -88,19 +180,12 @@ function loadConfig(cwd) {
   if (dirs.length === 0) return null;
   const fileExtensions = (envStr("KNOWLEDGE_SEARCH_EXTENSIONS")?.split(",").map((e) => e.trim().toLowerCase()) ?? file?.fileExtensions?.map((e) => e.toLowerCase()) ?? DEFAULT_FILE_EXTENSIONS).filter(Boolean);
   const excludeDirs = envStr("KNOWLEDGE_SEARCH_EXCLUDE")?.split(",").map((d) => d.trim()) ?? file?.excludeDirs ?? ["node_modules", ".git", ".obsidian", ".trash"];
-  let provider = null;
-  if (file?.provider) {
-    if (file.provider.type !== "transformers") {
-      throw new Error(
-        `Unsupported embedding provider "${file.provider.type}". Only local search is supported: use { "type": "transformers" } (local ONNX embeddings via Transformers.js), or remove the provider block entirely for FTS-only keyword search.`
-      );
-    }
-    provider = {
-      type: "transformers",
-      model: envStr("KNOWLEDGE_SEARCH_TRANSFORMERS_MODEL") ?? file.provider.model ?? "nomic-ai/nomic-embed-text-v1.5"
-    };
+  const legacy = file;
+  if (legacy && (legacy.provider !== void 0 || legacy.dimensions !== void 0)) {
+    console.error(
+      'pi-knowledge-search: ignoring "provider"/"dimensions" config keys \u2014 the embedding engine is always nomic-embed-text-v1.5 (local ONNX).'
+    );
   }
-  const dimensions = envInt("KNOWLEDGE_SEARCH_DIMENSIONS") ?? file?.dimensions ?? (provider ? 768 : 512);
   const indexDir = getIndexDir(cwd);
   const overviewFile = file?.overview ?? {};
   const overview = {
@@ -113,9 +198,8 @@ function loadConfig(cwd) {
     dirs,
     fileExtensions,
     excludeDirs,
-    dimensions,
-    provider,
-    modelSignature: provider ? `${provider.type}:${provider.model ?? ""}:${dimensions}` : null,
+    dimensions: EMBEDDING_DIMENSIONS,
+    modelSignature: `transformers:${EMBEDDING_MODEL}:${EMBEDDING_DIMENSIONS}`,
     indexDir,
     autoInject: envBool("KNOWLEDGE_SEARCH_AUTO_INJECT") ?? file?.autoInject ?? true,
     overview
@@ -142,94 +226,6 @@ function envBool(key) {
   if (["0", "false", "no", "off"].includes(v)) return false;
   return void 0;
 }
-
-// src/embedder.ts
-import { join as join2 } from "node:path";
-import { existsSync as existsSync2 } from "node:fs";
-import { homedir } from "node:os";
-function createEmbedder(config, _dimensions) {
-  return new TransformersEmbedder(config.model);
-}
-function truncate(text, maxChars = 1e4) {
-  return text.length > maxChars ? text.slice(0, maxChars) : text;
-}
-function summarizeErrors(errs, max = 3) {
-  const list = [...errs];
-  const shown = list.slice(0, max).join("; ");
-  return list.length > max ? `${shown} (+${list.length - max} more)` : shown;
-}
-var TRANSFORMERS_QUERY_PREFIX = "search_query: ";
-var TRANSFORMERS_DOC_PREFIX = "search_document: ";
-var TRANSFORMERS_BATCH_SIZE = 16;
-function resolveTransformersCacheDir() {
-  if (process.env.PI_RAG_MODEL_CACHE) return process.env.PI_RAG_MODEL_CACHE;
-  if (process.env.TRANSFORMERS_CACHE) return process.env.TRANSFORMERS_CACHE;
-  if (process.env.HF_HOME) return join2(process.env.HF_HOME, "transformers");
-  return join2(homedir(), ".cache", "huggingface", "transformers");
-}
-function isTransformersModelCached(model) {
-  return existsSync2(join2(resolveTransformersCacheDir(), model, "onnx", "model_quantized.onnx"));
-}
-var TransformersEmbedder = class {
-  model;
-  pipelinePromise = null;
-  constructor(model) {
-    this.model = model;
-  }
-  /**
-   * Lazily load the ONNX feature-extraction pipeline (q8 quantized weights).
-   * The load promise is cached so concurrent first calls share a single
-   * download; a failed load is evicted so the next call retries.
-   */
-  getPipeline() {
-    if (!this.pipelinePromise) {
-      this.pipelinePromise = (async () => {
-        const { pipeline, env } = await import("@huggingface/transformers");
-        env.cacheDir = resolveTransformersCacheDir();
-        return pipeline("feature-extraction", this.model, { dtype: "q8" });
-      })();
-      this.pipelinePromise.catch(() => {
-        this.pipelinePromise = null;
-      });
-    }
-    return this.pipelinePromise;
-  }
-  async embed(text, signal) {
-    if (signal?.aborted) throw new Error("Aborted");
-    const pipe = await this.getPipeline();
-    const input = TRANSFORMERS_QUERY_PREFIX + text.replace(/\s+/g, " ").trim();
-    const output = await pipe(truncate(input), { pooling: "mean", normalize: true });
-    return Array.from(output.data);
-  }
-  async embedBatch(texts, signal, _concurrency) {
-    const results = new Array(texts.length).fill(null);
-    if (texts.length === 0) return results;
-    let failed = 0;
-    const errs = /* @__PURE__ */ new Set();
-    try {
-      const pipe = await this.getPipeline();
-      for (let start = 0; start < texts.length; start += TRANSFORMERS_BATCH_SIZE) {
-        if (signal?.aborted) throw new Error("Aborted");
-        const batch = texts.slice(start, start + TRANSFORMERS_BATCH_SIZE).map((t) => TRANSFORMERS_DOC_PREFIX + truncate(t));
-        const output = await pipe(batch, { pooling: "mean", normalize: true });
-        const flattened = output.data;
-        const dim = flattened.length / batch.length;
-        for (let i = 0; i < batch.length; i++) {
-          results[start + i] = Array.from(flattened.slice(i * dim, (i + 1) * dim));
-        }
-      }
-    } catch (err) {
-      failed = results.filter((v) => v === null).length;
-      errs.add(err.message);
-      if (failed > 0) {
-        console.error(
-          `Transformers embedding failed for ${failed}/${texts.length} chunks: ${summarizeErrors(errs)}`
-        );
-      }
-    }
-    return results;
-  }
-};
 
 // src/index-store.ts
 import * as fs2 from "node:fs";
@@ -2000,21 +1996,10 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
       return;
     }
     if (!currentConfig) return;
-    let indexLoaded = Promise.resolve();
-    if (currentConfig.provider) {
-      const embedder = createEmbedder(currentConfig.provider, currentConfig.dimensions);
-      index = new KnowledgeIndex(currentConfig, embedder);
-      indexLoaded = index.load();
-    } else if (currentConfig.dirs.length > 0) {
-      index = new KnowledgeIndex(currentConfig, null);
-      indexLoaded = index.load();
-    }
-    if (!index) {
-      syncDone = true;
-      return;
-    }
+    index = new KnowledgeIndex(currentConfig, createEmbedder());
+    const indexLoaded = index.load();
     indexLoaded.then(() => {
-      if (event.reason === "startup" && currentConfig?.provider && index && index.chunkCount() > 0 && !currentConfig.autoInject) {
+      if (event.reason === "startup" && currentConfig && index && index.chunkCount() > 0 && !currentConfig.autoInject) {
         const file = readRawConfig();
         file.autoInject = true;
         saveConfig(file, sessionCwd);
@@ -2150,15 +2135,16 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
   }
   async function ensureIndexLoaded() {
     if (index) return;
-    const embedder = currentConfig?.provider ? createEmbedder(currentConfig.provider, currentConfig.dimensions) : null;
-    index = new KnowledgeIndex(currentConfig, embedder);
+    index = new KnowledgeIndex(currentConfig, createEmbedder());
     await index.load();
   }
   function renderStatusWidget(ctx) {
     const theme = ctx.ui.theme;
     const label = (text) => theme.fg("dim", text.padEnd(20));
     const lines = [theme.bold("pi-knowledge-search"), ""];
-    lines.push("  " + label("Embedding engine:") + (currentConfig?.provider ? theme.fg("success", currentConfig.provider.model) + theme.fg("dim", "  (local ONNX via Transformers.js)") : theme.fg("warning", "none") + theme.fg("dim", "  (FTS-only keyword search)")));
+    lines.push(
+      "  " + label("Embedding engine:") + theme.fg("success", EMBEDDING_MODEL) + theme.fg("dim", "  (local ONNX via Transformers.js \u2014 fixed, not configurable)")
+    );
     if (index) {
       lines.push("  " + label("Indexed:") + theme.fg("success", `${index.size()} files \xB7 ${index.chunkCount()} chunks`));
     } else {
@@ -2207,16 +2193,11 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
     }
     const file = readRawConfig();
     const dirs = /* @__PURE__ */ new Set([...file.dirs ?? [], ...resolved]);
-    const before = file.dirs?.length ?? 0;
     file.dirs = [...dirs];
-    if (!file.provider && before === 0) {
-      file.provider = { type: "transformers" };
-    }
     saveConfig(file, sessionCwd);
     const added = resolved.filter((d) => !(currentConfig?.dirs ?? []).includes(d));
     if (currentConfig) {
       currentConfig.dirs = [...dirs];
-      if (!currentConfig.provider && file.provider) currentConfig.provider = { type: "transformers", model: "nomic-ai/nomic-embed-text-v1.5" };
     } else {
       currentConfig = loadConfig(sessionCwd);
     }
@@ -2283,9 +2264,9 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
     };
     try {
       await ensureIndexLoaded();
-      if (currentConfig.provider?.type === "transformers" && !isTransformersModelCached(currentConfig.provider.model)) {
+      if (!isTransformersModelCached(EMBEDDING_MODEL)) {
         ctx.ui.notify(
-          `\u23F3 Loading embedding model: ${currentConfig.provider.model} \u2014 first run downloads it (~111 MB, this can take a few minutes)`,
+          `\u23F3 Loading embedding model: ${EMBEDDING_MODEL} \u2014 first run downloads it (~111 MB, this can take a few minutes)`,
           "info"
         );
       }
@@ -2318,7 +2299,7 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
       });
       syncDone = true;
       clearProgressUI();
-      if (currentConfig?.provider && index.chunkCount() > 0 && !currentConfig.autoInject) {
+      if (currentConfig && index.chunkCount() > 0 && !currentConfig.autoInject) {
         const file = readRawConfig();
         file.autoInject = true;
         saveConfig(file, sessionCwd);

@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { EMBEDDING_DIMENSIONS, EMBEDDING_MODEL } from "./embedder.js";
 
 export interface Config {
   /** Directories to index */
@@ -8,17 +9,16 @@ export interface Config {
   fileExtensions: string[];
   /** Directory names to skip */
   excludeDirs: string[];
-  /** Embedding dimensions */
+  /** Embedding dimensions — always the nomic model's fixed 768 */
   dimensions: number;
-  /** Embedding provider config; null = FTS-only keyword search */
-  provider: ProviderConfig | null;
   /**
-   * Signature of the engine that produces the embeddings (`type:model:dimensions`).
-   * The index persists the signature its vectors were built with; a mismatch
-   * on load removes all existing embeddings and forces a full re-embed.
-   * Null in FTS-only mode.
+   * Signature of the engine that produces the embeddings
+   * (`transformers:nomic-ai/nomic-embed-text-v1.5:768`). The index persists
+   * the signature its vectors were built with; a mismatch on load removes
+   * all existing embeddings and forces a full re-embed. Constant — the
+   * engine is not configurable.
    */
-  modelSignature: string | null;
+  modelSignature: string;
   /** Where to store the index */
   indexDir: string;
   /** Inject a knowledge lookup into the conversation on every user prompt. Default: true. */
@@ -51,22 +51,17 @@ export const DEFAULT_FILE_EXTENSIONS = [
   ".env", ".gitignore", ".dockerfile",
 ];
 
-/** The only embedding engine: local ONNX inference via Transformers.js. */
-export type ProviderConfig = { type: "transformers"; model: string };
-
 /**
- * Raw shape stored in the config file. `provider.type` is kept as a plain
- * string so legacy configs naming a removed provider (openai, bedrock, …)
- * surface a helpful migration error instead of failing silently.
+ * Raw shape stored in the config file. There is no embedding-engine
+ * configuration — nomic is always used — so a legacy `provider` or
+ * `dimensions` key is ignored (with a one-time warning).
  */
 export interface ConfigFile {
   dirs?: string[];
   fileExtensions?: string[];
   excludeDirs?: string[];
-  dimensions?: number;
   autoInject?: boolean;
   overview?: Partial<OverviewConfig>;
-  provider?: { type: string; model?: string };
 }
 
 // Storage is project-local: config lives at {cwd}/.pi/knowledge-search.json and
@@ -200,27 +195,15 @@ export function loadConfig(cwd?: string): Config | null {
     .map((d) => d.trim()) ??
     file?.excludeDirs ?? ["node_modules", ".git", ".obsidian", ".trash"];
 
-  let provider: ProviderConfig | null = null;
-  if (file?.provider) {
-    if (file.provider.type !== "transformers") {
-      throw new Error(
-        `Unsupported embedding provider "${file.provider.type}". Only local search is supported: use { "type": "transformers" } (local ONNX embeddings via Transformers.js), or remove the provider block entirely for FTS-only keyword search.`
-      );
-    }
-    provider = {
-      type: "transformers",
-      model:
-        envStr("KNOWLEDGE_SEARCH_TRANSFORMERS_MODEL") ??
-        file.provider.model ??
-        "nomic-ai/nomic-embed-text-v1.5",
-    };
+  // The embedding engine is not configurable — always nomic. Legacy
+  // `provider` / `dimensions` keys in old configs are ignored with a
+  // one-time notice so their owners aren't left wondering.
+  const legacy = file as Record<string, unknown> | null;
+  if (legacy && (legacy.provider !== undefined || legacy.dimensions !== undefined)) {
+    console.error(
+      "pi-knowledge-search: ignoring \"provider\"/\"dimensions\" config keys — the embedding engine is always nomic-embed-text-v1.5 (local ONNX)."
+    );
   }
-
-  // Dimensions resolve after the provider — the transformers models are
-  // fixed at 768 dims and cannot be truncated.
-  const dimensions = envInt("KNOWLEDGE_SEARCH_DIMENSIONS") ??
-    file?.dimensions ??
-    (provider ? 768 : 512);
 
   const indexDir = getIndexDir(cwd);
 
@@ -244,9 +227,8 @@ export function loadConfig(cwd?: string): Config | null {
     dirs,
     fileExtensions,
     excludeDirs: excludeDirs,
-    dimensions,
-    provider,
-    modelSignature: provider ? `${provider.type}:${provider.model ?? ""}:${dimensions}` : null,
+    dimensions: EMBEDDING_DIMENSIONS,
+    modelSignature: `transformers:${EMBEDDING_MODEL}:${EMBEDDING_DIMENSIONS}`,
     indexDir,
     autoInject: envBool("KNOWLEDGE_SEARCH_AUTO_INJECT") ?? file?.autoInject ?? true,
     overview,

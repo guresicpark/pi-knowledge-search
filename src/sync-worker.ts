@@ -19,9 +19,7 @@ if (!config || config.dirs.length === 0) {
   process.exit(0);
 }
 
-const embedder = config.provider
-  ? createEmbedder(config.provider, config.dimensions)
-  : null;
+const embedder = createEmbedder();
 const index = new KnowledgeIndex(config, embedder);
 await index.load();
 

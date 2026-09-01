@@ -18,8 +18,7 @@ function makeConfig(dir: string, dimensions = 4): Config {
     fileExtensions: [".md"],
     excludeDirs: [],
     dimensions,
-    provider: null,
-    modelSignature: null,
+    modelSignature: "transformers:nomic-ai/nomic-embed-text-v1.5:768",
     indexDir: dir,
     autoInject: false,
     overview: { inject: false, maxDepth: 2, maxFoldersPerDir: 20, maxKeywordsPerFolder: 5 },
@@ -274,11 +273,13 @@ describe("KnowledgeIndex hybrid search", () => {
     const embedder = new TableEmbedder({});
     const idx = new KnowledgeIndex(makeConfig(tmpDir), embedder);
 
-    // Save an index.json directly so load() has something to read
+    // Save an index.json directly so load() has something to read. The
+    // signature must match the fixed always-nomic engine for the entries
+    // to be accepted.
     const data = {
       version: 3,
       dimensions: 4,
-      embeddingModel: null,
+      embeddingModel: "transformers:nomic-ai/nomic-embed-text-v1.5:768",
       entries: {
         "/v/a.md#0": {
           relPath: "a.md",
@@ -446,8 +447,7 @@ describe("KnowledgeIndex FTS-only mode (no embedder)", () => {
       fileExtensions: [".md"],
       excludeDirs: [],
       dimensions: 512,
-      provider: null,
-      modelSignature: null,
+        modelSignature: "transformers:nomic-ai/nomic-embed-text-v1.5:768",
       indexDir,
       autoInject: false,
     overview: { inject: false, maxDepth: 2, maxFoldersPerDir: 20, maxKeywordsPerFolder: 5 },
@@ -564,8 +564,7 @@ describe("KnowledgeIndex FTS-only mode (no embedder)", () => {
         fileExtensions: DEFAULT_FILE_EXTENSIONS,
         excludeDirs: [],
         dimensions: 512,
-        provider: null,
-        modelSignature: null,
+            modelSignature: "transformers:nomic-ai/nomic-embed-text-v1.5:768",
         indexDir,
         autoInject: false,
         overview: { inject: false, maxDepth: 2, maxFoldersPerDir: 20, maxKeywordsPerFolder: 5 },

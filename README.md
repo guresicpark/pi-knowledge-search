@@ -1,6 +1,6 @@
 # pi-knowledge-search
 
-Hybrid **local** search over local files for [pi](https://github.com/badlogic/pi). Indexes directories of text/markdown files using local ONNX vector embeddings **and** SQLite FTS5 keyword search, exposes `knowledge_search` + `kb_read` tools the LLM can call, and auto-injects a knowledge lookup on every prompt (like pi-local-rag's RAG lookup). Everything runs on your machine — no embedding APIs, no cloud services. Indexing runs on session startup; mid-session file changes are picked up with `/knowledge-search index`.
+Hybrid **local** search over local files for [pi](https://github.com/badlogic/pi). Indexes directories of text/markdown files using local ONNX vector embeddings (always `nomic-ai/nomic-embed-text-v1.5` — the engine is fixed, not configurable) **and** SQLite FTS5 keyword search, exposes `knowledge_search` + `kb_read` tools the LLM can call, and auto-injects a knowledge lookup on every prompt (like pi-local-rag's RAG lookup). Everything runs on your machine — no embedding APIs, no cloud services. Indexing runs on session startup; mid-session file changes are picked up with `/knowledge-search index`.
 
 On session start, injects a folder+keyword overview of the indexed vault as a custom message so the model knows what’s worth searching for before it asks.
 
@@ -17,7 +17,7 @@ Every query runs against two backends in parallel and fuses the results via Reci
 - **Vector cosine similarity** — good for conceptual/fuzzy queries ("how did we handle X")
 - **BM25 full-text** via SQLite FTS5 — good for exact matches, proper nouns, error strings, file paths, code identifiers
 
-Docs that both backends agree on get boosted; either backend alone still surfaces relevant hits. If the embedder fails transiently, search falls back to pure BM25; if the FTS side-car is empty, it falls back to pure vector. Existing vector indexes upgrade with a one-time full re-embed (the index now records which engine built its vectors — see [Embedding-engine changes](#embedding-engine-changes-remove-existing-embeddings)); FTS-only installs upgrade seamlessly with no re-embedding.
+Docs that both backends agree on get boosted; either backend alone still surfaces relevant hits. If the embedder fails transiently, search falls back to pure BM25; if the FTS side-car is empty, it falls back to pure vector. Indexes predating the fixed engine are re-embedded once on upgrade (see [Engine-signature invalidation](#engine-signature-invalidation)).
 
 ## Tools
 
@@ -83,7 +83,7 @@ Everything is driven by the `/knowledge-search` command (mirroring pi-local-rag'
 /knowledge-search help            # list all subcommands
 ```
 
-The first `add` on a fresh config defaults the embedding engine to local Transformers.js. Config is saved to `{cwd}/.pi/knowledge-search.json` — project-local, relative to the directory pi was started in. Directories added mid-session are picked up by `/knowledge-search index` without a reload.
+The first `add` writes the config to `{cwd}/.pi/knowledge-search.json` — project-local, relative to the directory pi was started in. Directories added mid-session are picked up by `/knowledge-search index` without a reload.
 
 ### Config file
 
@@ -93,17 +93,13 @@ You can also edit the config file directly:
 {
   "dirs": ["~/notes", "~/docs"],
   "excludeDirs": ["node_modules", ".git", ".obsidian", ".trash"],
-  "autoInject": true,
-  "provider": {
-    "type": "transformers",
-    "model": "nomic-ai/nomic-embed-text-v1.5"
-  }
+  "autoInject": true
 }
 ```
 
 All fields except `dirs` are optional — the example shows the defaults for `excludeDirs` and `autoInject`. Omit `fileExtensions` to get the full default list below, or set it explicitly to narrow down (e.g. `[".md", ".txt"]` for a notes-only vault).
 
-The `model` field is optional — omit it for the nomic default. `autoInject` (default `true`) controls the per-turn knowledge lookup; it is re-enabled automatically at startup while the index holds vectors. Omit the whole `provider` block for **FTS-only mode**: zero-config pure BM25 keyword search, no model download.
+`autoInject` (default `true`) controls the per-turn knowledge lookup; it is re-enabled automatically at startup while the index holds vectors.
 
 Default `fileExtensions` mirror the extensions pi-local-rag's nomic model indexes:
 
@@ -113,17 +109,15 @@ Default `fileExtensions` mirror the extensions pi-local-rag's nomic model indexe
 
 (.pdf/.docx also go to nomic in pi-local-rag but need extraction libraries and are not indexed here.) Extension matching is case-insensitive; code extensions (`.ts`, `.py`, …) are not in nomic's group — set `fileExtensions` explicitly if you want them.
 
-> **Migrating from remote providers:** OpenAI, OpenAI-compatible, Bedrock, and Ollama embedding providers were removed — this extension is local-only now. A config naming a removed provider throws a migration error at startup; switch to `"transformers"` (or remove the `provider` block). Switching engines removes all existing embeddings and re-embeds once on the next sync.
+> **Migrating from older configs:** legacy `provider` and `dimensions` keys are ignored — the embedding engine is always nomic and not configurable. Vectors previously built by any other engine are removed on the first load after upgrading, and the next sync re-embeds everything with nomic.
 
-### Transformers.js engine (local ONNX)
+### Embedding engine (always nomic)
 
-The default (and only) embedding engine runs fully locally via [Transformers.js](https://huggingface.co/docs/transformers.js) ONNX inference — no API key, no server. Defaults to `nomic-ai/nomic-embed-text-v1.5` (768-dim, q8 quantized) with the model's `search_query:` / `search_document:` task prefixes, mirroring pi-local-rag's text pipeline. Model weights are downloaded once (~111 MB) into a shared HuggingFace cache (`~/.cache/huggingface/transformers` by default, or `PI_RAG_MODEL_CACHE` / `TRANSFORMERS_CACHE` / `HF_HOME`), so pi-knowledge-search and pi-local-rag reuse the same download.
+The embedding engine is fixed: `nomic-ai/nomic-embed-text-v1.5` (768-dim, q8 quantized) via [Transformers.js](https://huggingface.co/docs/transformers.js) local ONNX inference — no API key, no server, no configuration. It uses the model's `search_query:` / `search_document:` task prefixes, mirroring pi-local-rag's text pipeline. Model weights are downloaded once (~111 MB) into a shared HuggingFace cache (`~/.cache/huggingface/transformers` by default, or `PI_RAG_MODEL_CACHE` / `TRANSFORMERS_CACHE` / `HF_HOME`), so pi-knowledge-search and pi-local-rag reuse the same download. `/knowledge-search index` shows a notice before the first download.
 
-Any Transformers.js-compatible feature-extraction model id works, but the `search_query:`/`search_document:` prefixes are nomic-specific; other models simply ignore-tolerate them.
+### Engine-signature invalidation
 
-### Embedding-engine changes remove existing embeddings
-
-Vectors from different engines, models, or dimensionalities are not comparable. The index records the signature of the engine that built it (`type:model:dimensions`); on load, a mismatch removes all existing embeddings and the next sync re-embeds everything with the new engine. Changing the `model` in your config therefore costs one full re-embed, after which incremental sync resumes. FTS-only installs are unaffected — keyword search doesn't depend on the embedder.
+Vectors from different engines, models, or dimensionalities are not comparable. The index records the signature of the engine that built it — now the constant `transformers:nomic-ai/nomic-embed-text-v1.5:768`. On load, a mismatch (any index predating the fixed engine, or built by a removed remote provider) removes all existing embeddings and the next sync re-embeds everything with nomic.
 
 ### Environment variable overrides
 

@@ -1,7 +1,16 @@
 import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import type { ProviderConfig } from "./config.js";
+
+/**
+ * The embedding engine — always nomic-embed-text-v1.5 via local ONNX
+ * (Transformers.js), mirroring pi-local-rag's text pipeline. There is no
+ * engine configuration: every index embeds with this model.
+ */
+export const EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5";
+
+/** nomic's fixed embedding dimensionality (no matryoshka truncation). */
+export const EMBEDDING_DIMENSIONS = 768;
 
 /**
  * Unified embedding interface. The only implementation is the local
@@ -21,8 +30,8 @@ export interface Embedder {
 // Factory
 // ---------------------------------------------------------------------------
 
-export function createEmbedder(config: ProviderConfig, _dimensions: number): Embedder {
-  return new TransformersEmbedder(config.model);
+export function createEmbedder(): Embedder {
+  return new TransformersEmbedder(EMBEDDING_MODEL);
 }
 
 // ---------------------------------------------------------------------------

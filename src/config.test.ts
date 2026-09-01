@@ -17,8 +17,6 @@ const envKeys = [
   "KNOWLEDGE_SEARCH_DIRS",
   "KNOWLEDGE_SEARCH_EXTENSIONS",
   "KNOWLEDGE_SEARCH_EXCLUDE",
-  "KNOWLEDGE_SEARCH_DIMENSIONS",
-  "KNOWLEDGE_SEARCH_TRANSFORMERS_MODEL",
   "KNOWLEDGE_SEARCH_AUTO_INJECT",
   "KNOWLEDGE_SEARCH_INDEX_DIR",
 ];
@@ -92,24 +90,14 @@ describe("config", () => {
         dirs: ["/tmp/test-docs"],
         fileExtensions: [".md"],
         excludeDirs: ["node_modules"],
-        dimensions: 256,
-        provider: {
-          type: "transformers",
-          model: "Xenova/all-MiniLM-L6-v2",
-        },
       })
     );
 
     const config = loadConfig();
     assert.ok(config);
-    assert.ok(config.provider);
     assert.deepStrictEqual(config.dirs, ["/tmp/test-docs"]);
     assert.deepStrictEqual(config.fileExtensions, [".md"]);
-    assert.equal(config.dimensions, 256);
-    assert.equal(config.provider.type, "transformers");
-    if (config.provider.type === "transformers") {
-      assert.equal(config.provider.model, "Xenova/all-MiniLM-L6-v2");
-    }
+    assert.equal(config.dimensions, 768);
   });
 
   it("returns null for corrupt JSON config file", () => {
@@ -118,12 +106,11 @@ describe("config", () => {
     assert.equal(config, null);
   });
 
-  it("uses env var KNOWLEDGE_SEARCH_DIRS as fallback (FTS-only)", () => {
+  it("uses env var KNOWLEDGE_SEARCH_DIRS as fallback", () => {
     process.env.KNOWLEDGE_SEARCH_DIRS = "/tmp/dir-a, /tmp/dir-b";
 
     const config = loadConfig();
     assert.ok(config);
-    assert.equal(config.provider, null);
     assert.deepStrictEqual(config.dirs, ["/tmp/dir-a", "/tmp/dir-b"]);
   });
 
@@ -132,7 +119,6 @@ describe("config", () => {
       configFile,
       JSON.stringify({
         dirs: ["/tmp/docs"],
-        provider: { type: "transformers" },
       })
     );
 
@@ -174,7 +160,6 @@ describe("config", () => {
       configFile,
       JSON.stringify({
         dirs: ["~/Documents/notes"],
-        provider: { type: "transformers" },
       })
     );
 
@@ -187,72 +172,34 @@ describe("config", () => {
     }
   });
 
-  it("configures transformers provider with nomic defaults and 768 dims", () => {
+  it("the engine is always nomic — constant signature and dimensions", () => {
     fs.writeFileSync(
       configFile,
-      JSON.stringify({
-        dirs: ["/tmp/docs"],
-        provider: { type: "transformers" },
-      })
+      JSON.stringify({ dirs: ["/tmp/docs"] })
     );
 
     const config = loadConfig();
     assert.ok(config);
-    assert.ok(config.provider);
-    assert.equal(config.provider.type, "transformers");
-    if (config.provider.type === "transformers") {
-      assert.equal(config.provider.model, "nomic-ai/nomic-embed-text-v1.5");
-    }
     assert.equal(config.dimensions, 768);
     assert.equal(config.modelSignature, "transformers:nomic-ai/nomic-embed-text-v1.5:768");
   });
 
-  it("transformers provider honors custom model from file and env", () => {
-    fs.writeFileSync(
-      configFile,
-      JSON.stringify({
-        dirs: ["/tmp/docs"],
-        provider: { type: "transformers", model: "Xenova/all-MiniLM-L6-v2" },
-      })
-    );
-    process.env.KNOWLEDGE_SEARCH_TRANSFORMERS_MODEL = "Xenova/bge-small-en-v1.5";
-
-    const config = loadConfig();
-    assert.ok(config);
-    assert.ok(config.provider);
-    if (config.provider.type === "transformers") {
-      assert.equal(config.provider.model, "Xenova/bge-small-en-v1.5");
-    }
-    assert.equal(config.modelSignature, "transformers:Xenova/bge-small-en-v1.5:768");
-  });
-
-  it("modelSignature is null in FTS-only mode", () => {
-    fs.writeFileSync(
-      configFile,
-      JSON.stringify({
-        dirs: ["/tmp/docs"],
-      })
-    );
-
-    const config = loadConfig();
-    assert.ok(config);
-    assert.equal(config.provider, null);
-    assert.equal(config.modelSignature, null);
-  });
-
-  it("modelSignature includes provider type, model, and dimensions", () => {
+  it("ignores legacy provider/dimensions keys instead of throwing", () => {
     fs.writeFileSync(
       configFile,
       JSON.stringify({
         dirs: ["/tmp/docs"],
         dimensions: 256,
-        provider: { type: "transformers", model: "Xenova/all-MiniLM-L6-v2" },
+        provider: { type: "openai", apiKey: "sk-x", model: "text-embedding-3-small" },
       })
     );
 
+    // The engine is fixed; legacy keys are ignored (with a warning to
+    // stderr) and the nomic signature/dimensions still apply.
     const config = loadConfig();
     assert.ok(config);
-    assert.equal(config.modelSignature, "transformers:Xenova/all-MiniLM-L6-v2:256");
+    assert.equal(config.dimensions, 768);
+    assert.equal(config.modelSignature, "transformers:nomic-ai/nomic-embed-text-v1.5:768");
   });
 
   it("autoInject defaults to true and can be overridden by file and env", () => {
@@ -260,7 +207,6 @@ describe("config", () => {
       configFile,
       JSON.stringify({
         dirs: ["/tmp/docs"],
-        provider: { type: "transformers" },
       })
     );
     assert.equal(loadConfig()?.autoInject, true);
@@ -278,82 +224,30 @@ describe("config", () => {
     assert.equal(loadConfig()?.autoInject, true);
   });
 
-  it("throws a helpful migration error for removed provider types", () => {
-    for (const removed of ["openai", "openai-compatible", "bedrock", "ollama"]) {
-      fs.writeFileSync(
-        configFile,
-        JSON.stringify({
-          dirs: ["/tmp/docs"],
-          provider: { type: removed },
-        })
-      );
-
-      assert.throws(
-        () => loadConfig(),
-        (err: unknown) => {
-          assert.ok(err instanceof Error);
-          assert.match(err.message, /Unsupported embedding provider/);
-          assert.match(err.message, new RegExp(`"${removed}"`));
-          assert.match(err.message, /transformers/);
-          assert.match(err.message, /FTS-only/);
-          return true;
-        },
-        `expected loadConfig() to throw for provider "${removed}"`
-      );
-    }
-  });
-
-  it("throws for unknown provider type", () => {
-    fs.writeFileSync(
-      configFile,
-      JSON.stringify({
-        dirs: ["/tmp/docs"],
-        provider: { type: "unknown-provider" },
-      })
-    );
-
-    assert.throws(() => loadConfig(), /Unsupported embedding provider/);
-  });
-
   it("env vars override config file values", () => {
     fs.writeFileSync(
       configFile,
       JSON.stringify({
         dirs: ["/tmp/file-dirs"],
-        dimensions: 256,
-        provider: { type: "transformers" },
       })
     );
     process.env.KNOWLEDGE_SEARCH_DIRS = "/tmp/env-dirs";
-    process.env.KNOWLEDGE_SEARCH_DIMENSIONS = "1024";
 
     const config = loadConfig();
     assert.ok(config);
     assert.deepStrictEqual(config.dirs, ["/tmp/env-dirs"]);
-    assert.equal(config.dimensions, 1024);
   });
 
   it("saveConfig writes valid JSON to config path", () => {
-    const configData = {
-      dirs: ["/tmp/saved"],
-      provider: { type: "transformers" as const, model: "nomic-ai/nomic-embed-text-v1.5" },
-    };
-    saveConfig(configData);
+    saveConfig({ dirs: ["/tmp/saved"] });
 
     const raw = fs.readFileSync(configFile, "utf-8");
     const parsed = JSON.parse(raw);
     assert.deepStrictEqual(parsed.dirs, ["/tmp/saved"]);
-    assert.equal(parsed.provider.type, "transformers");
   });
 
   it("returns null when dirs resolve to empty", () => {
-    fs.writeFileSync(
-      configFile,
-      JSON.stringify({
-        dirs: [],
-        provider: { type: "transformers" },
-      })
-    );
+    fs.writeFileSync(configFile, JSON.stringify({ dirs: [] }));
 
     const config = loadConfig();
     assert.equal(config, null);
