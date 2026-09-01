@@ -344,6 +344,64 @@ describe("KnowledgeIndex hybrid search", () => {
     await idx.close();
   });
 
+  it("omits unrelated hits — returns only related ones, even if just one", async () => {
+    const queryVec = [1, 0, 0, 0];
+    const embedder = new TableEmbedder({ "kubernetes ingress config": queryVec });
+    const idx = new KnowledgeIndex(makeConfig(tmpDir), embedder);
+    await idx.load();
+
+    seed(idx, [
+      {
+        absPath: "/v/related.md",
+        vector: [0.9, 0.1, 0, 0], // strong cosine (~0.99)
+        excerpt: "kubernetes ingress controller setup",
+      },
+      {
+        absPath: "/v/weak-noise.md",
+        vector: [0.05, 0.1, 0.1, 0], // low cosine (~0.24) → blended score below the floor
+        excerpt: "gardening tips for spring",
+      },
+      {
+        absPath: "/v/orthogonal.md",
+        vector: [0, 0, 0, 1], // zero cosine
+        excerpt: "completely unrelated note about pottery",
+      },
+    ]);
+    (idx as unknown as { rebuildFtsFromEntries: () => void }).rebuildFtsFromEntries();
+
+    const results = await idx.hybridSearch("kubernetes ingress config", 5);
+    // The weak-noise file only shares a negligible vector component and no
+    // keyword overlap — below the 0.1 hybrid floor it must not pad the list.
+    assert.equal(results.length, 1);
+    assert.equal(results[0].path, "/v/related.md");
+    await idx.close();
+  });
+
+  it("returns no results when nothing clears the score floor", async () => {
+    const queryVec = [1, 0, 0, 0];
+    const embedder = new TableEmbedder({ "quantum flux capacitor": queryVec });
+    const idx = new KnowledgeIndex(makeConfig(tmpDir), embedder);
+    await idx.load();
+
+    seed(idx, [
+      {
+        absPath: "/v/noise-a.md",
+        vector: [0.01, 0.3, 0.3, 0], // tiny cosine, no keyword overlap
+        excerpt: "whimsical tales of faraway lands",
+      },
+      {
+        absPath: "/v/noise-b.md",
+        vector: [0, 0, 0.4, 0.4], // zero cosine
+        excerpt: "more unrelated content entirely",
+      },
+    ]);
+    (idx as unknown as { rebuildFtsFromEntries: () => void }).rebuildFtsFromEntries();
+
+    const results = await idx.hybridSearch("quantum flux capacitor", 5);
+    assert.equal(results.length, 0);
+    await idx.close();
+  });
+
   it("falls back to pure BM25 when embedder fails", async () => {
     const embedder = new TableEmbedder({}); // empty table → embed() throws
     const idx = new KnowledgeIndex(makeConfig(tmpDir), embedder);

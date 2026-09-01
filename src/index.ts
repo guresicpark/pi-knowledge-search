@@ -141,7 +141,6 @@ export default function (pi: ExtensionAPI) {
    * hits near the question.
    */
   const LOOKUP_TOP_K = 5;
-  const LOOKUP_MIN_SCORE = 0.1;
   const LOOKUP_PREVIEW_CHARS = 600;
 
   pi.on("before_agent_start", async (event) => {
@@ -151,9 +150,9 @@ export default function (pi: ExtensionAPI) {
 
     let results;
     try {
-      results = (await index.search(event.prompt, LOOKUP_TOP_K)).filter(
-        (r) => r.score >= LOOKUP_MIN_SCORE
-      );
+      // hybridSearch enforces the 0.1 minimum-score floor itself — weak,
+      // unrelated hits never come back here.
+      results = await index.search(event.prompt, LOOKUP_TOP_K);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       return {

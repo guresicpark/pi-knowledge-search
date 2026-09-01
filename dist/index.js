@@ -1278,6 +1278,7 @@ ${chunkText}`;
    */
   async hybridSearch(query, limit, signal) {
     const ALPHA = 0.4;
+    const MIN_HYBRID_SCORE = 0.1;
     const ftsCandidateLimit = Math.max(limit * 20, 200);
     const vectorCandidateLimit = Math.max(limit * 10, 100);
     let ftsCandidates;
@@ -1336,7 +1337,7 @@ ${chunkText}`;
       }
       const vectorSimilarity = vectorSimilarityByKey.get(key) ?? 0;
       const hybridScore = hasAnyVectors ? ALPHA * bm25Normalized + (1 - ALPHA) * vectorSimilarity : bm25Normalized;
-      if (hybridScore > 0) scored.push({ key, score: hybridScore });
+      if (hybridScore >= MIN_HYBRID_SCORE) scored.push({ key, score: hybridScore });
     }
     scored.sort((a, b) => b.score - a.score);
     const matchesByFile = /* @__PURE__ */ new Map();
@@ -2052,7 +2053,6 @@ function index_default(pi) {
     return absPath.replace(process.env.HOME || "", "~");
   }
   const LOOKUP_TOP_K = 5;
-  const LOOKUP_MIN_SCORE = 0.1;
   const LOOKUP_PREVIEW_CHARS = 600;
   pi.on("before_agent_start", async (event) => {
     if (!currentConfig?.autoInject) return;
@@ -2060,9 +2060,7 @@ function index_default(pi) {
     if (!event.prompt.trim()) return;
     let results;
     try {
-      results = (await index.search(event.prompt, LOOKUP_TOP_K)).filter(
-        (r) => r.score >= LOOKUP_MIN_SCORE
-      );
+      results = await index.search(event.prompt, LOOKUP_TOP_K);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return {

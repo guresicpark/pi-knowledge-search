@@ -761,6 +761,11 @@ export class KnowledgeIndex {
     signal?: AbortSignal,
   ): Promise<SearchResult[]> {
     const ALPHA = 0.4;
+    // Floor on the blended score: anything below is treated as unrelated and
+    // omitted entirely — a query with only one related file returns just that
+    // file instead of padding the result list with noise. Same value as
+    // pi-local-rag's ragScoreThreshold and the auto-lookup filter it replaces.
+    const MIN_HYBRID_SCORE = 0.1;
     const ftsCandidateLimit = Math.max(limit * 20, 200);
     const vectorCandidateLimit = Math.max(limit * 10, 100);
 
@@ -840,7 +845,7 @@ export class KnowledgeIndex {
       const hybridScore = hasAnyVectors
         ? ALPHA * bm25Normalized + (1 - ALPHA) * vectorSimilarity
         : bm25Normalized;
-      if (hybridScore > 0) scored.push({ key, score: hybridScore });
+      if (hybridScore >= MIN_HYBRID_SCORE) scored.push({ key, score: hybridScore });
     }
     scored.sort((a, b) => b.score - a.score);
 

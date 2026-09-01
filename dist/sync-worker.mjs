@@ -1263,6 +1263,7 @@ ${chunkText}`;
    */
   async hybridSearch(query, limit, signal) {
     const ALPHA = 0.4;
+    const MIN_HYBRID_SCORE = 0.1;
     const ftsCandidateLimit = Math.max(limit * 20, 200);
     const vectorCandidateLimit = Math.max(limit * 10, 100);
     let ftsCandidates;
@@ -1321,7 +1322,7 @@ ${chunkText}`;
       }
       const vectorSimilarity = vectorSimilarityByKey.get(key) ?? 0;
       const hybridScore = hasAnyVectors ? ALPHA * bm25Normalized + (1 - ALPHA) * vectorSimilarity : bm25Normalized;
-      if (hybridScore > 0) scored.push({ key, score: hybridScore });
+      if (hybridScore >= MIN_HYBRID_SCORE) scored.push({ key, score: hybridScore });
     }
     scored.sort((a, b) => b.score - a.score);
     const matchesByFile = /* @__PURE__ */ new Map();
