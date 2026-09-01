@@ -43,12 +43,12 @@ class TableEmbedder implements Embedder {
 
 describe("toFtsQuery", () => {
   it("strips FTS syntax characters", () => {
-    assert.equal(toFtsQuery('hello *world*'), '"hello" OR "world"');
-    assert.equal(toFtsQuery('"quoted" (paren)'), '"quoted" OR "paren"');
+    assert.equal(toFtsQuery('hello *world*'), '"hello" "world"');
+    assert.equal(toFtsQuery('"quoted" (paren)'), '"quoted" "paren"');
   });
 
-  it("joins terms with OR so BM25 can rank partial matches", () => {
-    assert.equal(toFtsQuery("auth flow login"), '"auth" OR "flow" OR "login"');
+  it("joins terms with AND (space) so chunks missing a term are excluded, like pi-local-rag", () => {
+    assert.equal(toFtsQuery("auth flow login"), '"auth" "flow" "login"');
   });
 
   it("returns empty string for empty/whitespace query", () => {
@@ -57,7 +57,7 @@ describe("toFtsQuery", () => {
   });
 
   it("preserves unicode words", () => {
-    assert.equal(toFtsQuery("café journal"), '"café" OR "journal"');
+    assert.equal(toFtsQuery("café journal"), '"café" "journal"');
   });
 });
 
@@ -306,7 +306,7 @@ describe("KnowledgeIndex hybrid search", () => {
     await idx.close();
   });
 
-  it("RRF fuses vector + BM25 so keyword-only matches still surface", async () => {
+  it("fuses vector + BM25 via alpha blend so keyword-only matches still surface", async () => {
     // doc A: strong vector match to the query, weak keyword match
     // doc B: weak vector match, exact keyword hit
     // Both should appear in the top results.

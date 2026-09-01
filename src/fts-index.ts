@@ -239,6 +239,31 @@ export class FtsChunkIndex {
     return out;
   }
 
+  /**
+   * Raw BM25 scores for FTS candidates, for min-max normalization in hybrid
+   * search (mirrors pi-local-rag). FTS5's bm25() is lower-is-better (more
+   * negative = better), so the returned score is negated → bigger-is-better.
+   */
+  searchScores(query: string, limit = 200): { key: string; absPath: string; score: number }[] {
+    const fts = toFtsQuery(query);
+    if (!fts) return [];
+    const db = this.requireDb();
+    const rows = db
+      .prepare(
+        `SELECT key, absPath, bm25(chunks) AS score
+           FROM chunks
+          WHERE chunks MATCH ?
+          ORDER BY score
+          LIMIT ?`,
+      )
+      .all(fts, limit) as Array<{ key: string; absPath: string; score: number }>;
+    return rows.map((r) => ({
+      key: String(r.key),
+      absPath: String(r.absPath),
+      score: -Number(r.score),
+    }));
+  }
+
   close(): void {
     if (!this.db) return;
     this.db.close();
@@ -250,12 +275,14 @@ export class FtsChunkIndex {
 
 /**
  * Turn a user query into a safe FTS5 MATCH expression.
- * Strips FTS syntax characters, quotes each term, and joins with implicit AND.
+ * Strips FTS syntax characters, quotes each term, and joins with implicit AND
+ * (space-separated quoted phrases) — exactly pi-local-rag's hybrid search.
  *
  * AND is more precise than OR — BM25 ranks multi-term matches highest, and
  * chunks missing a term are excluded rather than diluting the result set.
  *
- * Ported verbatim from pi-session-search/src/fts-index.ts.
+ * Ported verbatim from pi-session-search/src/fts-index.ts (join aligned with
+ * pi-local-rag's search.ts).
  */
 export function toFtsQuery(q: string): string {
   const terms = q
@@ -264,5 +291,5 @@ export function toFtsQuery(q: string): string {
     .map((t) => t.trim())
     .filter((t) => t.length > 0)
     .map((t) => `"${t}"`);
-  return terms.join(" OR ");
+  return terms.join(" ");
 }

@@ -726,6 +726,28 @@ var FtsChunkIndex = class {
     }
     return out;
   }
+  /**
+   * Raw BM25 scores for FTS candidates, for min-max normalization in hybrid
+   * search (mirrors pi-local-rag). FTS5's bm25() is lower-is-better (more
+   * negative = better), so the returned score is negated → bigger-is-better.
+   */
+  searchScores(query, limit = 200) {
+    const fts = toFtsQuery(query);
+    if (!fts) return [];
+    const db = this.requireDb();
+    const rows = db.prepare(
+      `SELECT key, absPath, bm25(chunks) AS score
+           FROM chunks
+          WHERE chunks MATCH ?
+          ORDER BY score
+          LIMIT ?`
+    ).all(fts, limit);
+    return rows.map((r) => ({
+      key: String(r.key),
+      absPath: String(r.absPath),
+      score: -Number(r.score)
+    }));
+  }
   close() {
     if (!this.db) return;
     this.db.close();
@@ -734,7 +756,7 @@ var FtsChunkIndex = class {
 };
 function toFtsQuery(q) {
   const terms = q.replace(/["^*():{}[\]]/g, " ").split(/\s+/).map((t) => t.trim()).filter((t) => t.length > 0).map((t) => `"${t}"`);
-  return terms.join(" OR ");
+  return terms.join(" ");
 }
 
 // src/index-store.ts
@@ -1228,50 +1250,98 @@ ${chunkText}`;
   }
   /**
    * Default search path used by the `knowledge_search` tool. Delegates to
-   * hybrid (vector + BM25 fused via Reciprocal Rank Fusion).
+   * hybrid (vector + BM25 blended like pi-local-rag's hybridSearch).
    */
   async search(query, limit, signal) {
     return this.hybridSearch(query, limit, signal);
   }
   /**
-   * Hybrid search: cosine embeddings + FTS5 BM25, fused via Reciprocal Rank
-   * Fusion (k=60). Falls back gracefully:
+   * Hybrid search — mirrors pi-local-rag's `hybridSearch` for the nomic
+   * (prose-only) store: FTS5 BM25 + cosine embeddings blended as
+   * `alpha * bm25 + (1 - alpha) * vector` with alpha = 0.4, instead of RRF.
+   *
+   *  - BM25 raw scores are min-max normalized across the FTS candidate set
+   *    (range 0 → all candidates score 1, so ties stay rankable)
+   *  - vector similarity is the raw cosine on unit-normalized embeddings,
+   *    clamped at 0 (no per-space min-max, which would pin the top chunk at
+   *    1.0 and create structural ties)
+   *  - BM25 gets a 1.5× filename boost (capped at 1) when the first
+   *    meaningful query term appears in the file path
+   *  - a chunk found only by one backend keeps its raw other-side score of 0
+   *
+   * Falls back gracefully:
+   *   - embedding call fails or the store has no vectors → pure BM25
    *   - no FTS hits or empty side-car → pure vector
-   *   - embedding call fails (network blip, rate limit) → pure BM25
    *   - both fail → empty
    *
    * Deduplicates so only the best chunk per file is returned.
    */
   async hybridSearch(query, limit, signal) {
-    const K = 60;
-    const poolSize = Math.max(limit * 5, 50);
-    const vecPromise = this.runVectorRanks(query, poolSize, signal).catch((err) => {
-      if (process.env.KNOWLEDGE_SEARCH_DEBUG) {
-        console.error(`knowledge-search: vector search failed: ${err.message}`);
-      }
-      return /* @__PURE__ */ new Map();
-    });
-    let ftsRanks;
+    const ALPHA = 0.4;
+    const ftsCandidateLimit = Math.max(limit * 20, 200);
+    const vectorCandidateLimit = Math.max(limit * 10, 100);
+    let ftsCandidates;
     try {
-      ftsRanks = this.fts.searchRanks(query, poolSize);
+      ftsCandidates = this.fts.searchScores(query, ftsCandidateLimit);
     } catch {
-      ftsRanks = /* @__PURE__ */ new Map();
+      ftsCandidates = [];
     }
-    const vecRanks = await vecPromise;
-    if (vecRanks.size === 0 && ftsRanks.size === 0) return [];
-    const activeBackends = (vecRanks.size > 0 ? 1 : 0) + (ftsRanks.size > 0 ? 1 : 0);
-    const fused = /* @__PURE__ */ new Map();
-    for (const [key, r] of vecRanks) {
-      fused.set(key, (fused.get(key) ?? 0) + 1 / (K + r));
+    let vectorSimilarityByKey = /* @__PURE__ */ new Map();
+    if (this.embedder) {
+      try {
+        const queryVector = await this.embedder.embed(query, signal);
+        const scored2 = [];
+        for (const [key, entry] of Object.entries(this.data.entries)) {
+          if (!entry.vector) continue;
+          scored2.push({ key, sim: Math.max(0, dotProduct(queryVector, entry.vector)) });
+        }
+        scored2.sort((a, b) => b.sim - a.sim);
+        vectorSimilarityByKey = new Map(
+          scored2.slice(0, vectorCandidateLimit).map((s) => [s.key, s.sim])
+        );
+      } catch (err) {
+        if (process.env.KNOWLEDGE_SEARCH_DEBUG) {
+          console.error(`knowledge-search: vector search failed: ${err.message}`);
+        }
+        vectorSimilarityByKey = /* @__PURE__ */ new Map();
+      }
     }
-    for (const [key, r] of ftsRanks) {
-      fused.set(key, (fused.get(key) ?? 0) + 1 / (K + r));
+    const candidateKeys = /* @__PURE__ */ new Set([
+      ...ftsCandidates.map((c) => c.key),
+      ...vectorSimilarityByKey.keys()
+    ]);
+    if (candidateKeys.size === 0) return [];
+    const bm25ByKey = /* @__PURE__ */ new Map();
+    if (ftsCandidates.length > 0) {
+      let bm25Max = -Infinity;
+      let bm25Min = Infinity;
+      for (const c of ftsCandidates) {
+        if (c.score > bm25Max) bm25Max = c.score;
+        if (c.score < bm25Min) bm25Min = c.score;
+      }
+      const bm25Range = bm25Max - bm25Min;
+      for (const c of ftsCandidates) {
+        bm25ByKey.set(c.key, bm25Range === 0 ? 1 : (c.score - bm25Min) / bm25Range);
+      }
     }
-    const displayScale = (K + 1) / Math.max(activeBackends, 1);
-    const sorted = [...fused.entries()].sort((a, b) => b[1] - a[1]);
+    const hasAnyVectors = vectorSimilarityByKey.size > 0;
+    const meaningfulQueryTerms = query.toLowerCase().split(/\s+/).filter((t) => t.length > 1);
+    const firstQueryTerm = meaningfulQueryTerms[0];
+    const scored = [];
+    for (const key of candidateKeys) {
+      let bm25Normalized = bm25ByKey.get(key) ?? 0;
+      const path5 = this.absPathFromKey(key);
+      if (firstQueryTerm && path5.toLowerCase().includes(firstQueryTerm)) {
+        bm25Normalized = Math.min(1, bm25Normalized * 1.5);
+      }
+      const vectorSimilarity = vectorSimilarityByKey.get(key) ?? 0;
+      const hybridScore = hasAnyVectors ? ALPHA * bm25Normalized + (1 - ALPHA) * vectorSimilarity : bm25Normalized;
+      if (hybridScore > 0) scored.push({ key, score: hybridScore });
+    }
+    scored.sort((a, b) => b.score - a.score);
     const matchesByFile = /* @__PURE__ */ new Map();
     const rangesByFile = /* @__PURE__ */ new Map();
-    for (const [key] of sorted) {
+    for (const { key } of scored) {
       const absPath = this.absPathFromKey(key);
       matchesByFile.set(absPath, (matchesByFile.get(absPath) ?? 0) + 1);
       const entry = this.data.entries[key];
@@ -1283,16 +1353,16 @@ ${chunkText}`;
     }
     const seen = /* @__PURE__ */ new Set();
     const out = [];
-    for (const [key, score] of sorted) {
+    for (const { key, score } of scored) {
       const entry = this.data.entries[key];
       const absPath = this.absPathFromKey(key);
       if (seen.has(absPath)) continue;
       seen.add(absPath);
-      const scaledScore = Math.min(score * displayScale, 1);
+      const finalScore = Math.min(score, 1);
       if (entry) {
         out.push({
           path: absPath,
-          score: scaledScore,
+          score: finalScore,
           excerpt: entry.excerpt,
           heading: entry.heading,
           matches: matchesByFile.get(absPath) ?? 1,
@@ -1301,7 +1371,7 @@ ${chunkText}`;
       } else {
         out.push({
           path: absPath,
-          score: scaledScore,
+          score: finalScore,
           excerpt: "",
           heading: "",
           matches: matchesByFile.get(absPath) ?? 1,
@@ -1310,27 +1380,6 @@ ${chunkText}`;
       }
       if (out.length >= limit) break;
     }
-    return out;
-  }
-  /**
-   * Run the vector side of hybrid search and return ranked keys as a
-   * Map<key, rank> (1-based). Kept internal — `vectorSearch()` is the
-   * public escape hatch.
-   */
-  async runVectorRanks(query, poolSize, signal) {
-    if (!this.embedder) return /* @__PURE__ */ new Map();
-    const queryVector = await this.embedder.embed(query, signal);
-    const scored = [];
-    for (const [key, entry] of Object.entries(this.data.entries)) {
-      if (!entry.vector) continue;
-      const score = dotProduct(queryVector, entry.vector);
-      if (score <= 0.15) continue;
-      scored.push({ key, score });
-    }
-    scored.sort((a, b) => b.score - a.score);
-    const out = /* @__PURE__ */ new Map();
-    const n = Math.min(scored.length, poolSize);
-    for (let i = 0; i < n; i++) out.set(scored[i].key, i + 1);
     return out;
   }
   /**

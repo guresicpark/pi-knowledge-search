@@ -12,12 +12,12 @@ Injection is automatically enabled whenever the index holds vectors — at sessi
 
 ## How search works
 
-Every query runs against two backends in parallel and fuses the results via Reciprocal Rank Fusion (k=60):
+Every query runs against two backends and blends the results exactly like pi-local-rag's hybrid search — `0.4 × BM25 + 0.6 × vector`:
 
-- **Vector cosine similarity** — good for conceptual/fuzzy queries ("how did we handle X")
-- **BM25 full-text** via SQLite FTS5 — good for exact matches, proper nouns, error strings, file paths, code identifiers
+- **Vector cosine similarity** — good for conceptual/fuzzy queries ("how did we handle X"). Raw cosine on the unit-normalized nomic embeddings, clamped at 0.
+- **BM25 full-text** via SQLite FTS5 — good for exact matches, proper nouns, error strings, file paths, code identifiers. Raw BM25 scores are min-max normalized across the candidate set and get a 1.5× boost (capped at 1) when the first meaningful query term appears in the file path.
 
-Docs that both backends agree on get boosted; either backend alone still surfaces relevant hits. If the embedder fails transiently, search falls back to pure BM25; if the FTS side-car is empty, it falls back to pure vector. Indexes predating the fixed engine are re-embedded once on upgrade (see [Engine-signature invalidation](#engine-signature-invalidation)).
+Multi-term queries use implicit AND (space-separated quoted phrases), matching pi-local-rag, so chunks missing a term are excluded rather than diluting the result set. Either backend alone still surfaces relevant hits: if the embedder fails transiently, search falls back to pure BM25; if the FTS side-car is empty, it falls back to pure vector. Indexes predating the fixed engine are re-embedded once on upgrade (see [Engine-signature invalidation](#engine-signature-invalidation)).
 
 ## Tools
 
@@ -25,7 +25,7 @@ The extension registers two LLM-facing tools:
 
 | Tool | What it does |
 |------|--------------|
-| `knowledge_search` | Hybrid vector + BM25 search over indexed files. Returns passage-level excerpts ranked by Reciprocal Rank Fusion. |
+| `knowledge_search` | Hybrid vector + BM25 search over indexed files (pi-local-rag's alpha blend: 0.4 × BM25 + 0.6 × vector). Returns passage-level excerpts. |
 | `knowledge_kb_read` | Resolve a note reference — `[[wikilink]]`, basename, or relative path — to an indexed file and return its full content. Use when the model knows a note's name but not its full path, instead of running find/grep first. |
 
 `knowledge_kb_read` handles `[[Foo]]`, `[[Foo|alias]]`, `[[Foo#Heading]]`, bare names with or without extension (`Foo`, `Foo.md`), and relative paths (`evergreen/foo`). Multi-match references get a disambiguation prompt instead of guessing.
