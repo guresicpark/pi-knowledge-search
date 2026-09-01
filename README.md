@@ -117,6 +117,8 @@ Files larger than **500 KB** are skipped during scanning (mirroring pi-local-rag
 
 The embedding engine is fixed: `nomic-ai/nomic-embed-text-v1.5` (768-dim, q8 quantized) via [Transformers.js](https://huggingface.co/docs/transformers.js) local ONNX inference — no API key, no server, no configuration. It uses the model's `search_query:` / `search_document:` task prefixes, mirroring pi-local-rag's text pipeline. Model weights are downloaded once (~111 MB) into a shared HuggingFace cache (`~/.cache/huggingface/transformers` by default, or `PI_RAG_MODEL_CACHE` / `TRANSFORMERS_CACHE` / `HF_HOME`), so pi-knowledge-search and pi-local-rag reuse the same download. `/knowledge-search index` shows a notice before the first download.
 
+Transformers.js pulls in `sharp` (for vision preprocessing); since pi loads pi-local-rag alongside this extension in the same process, `sharp` is pinned to exactly the same version pi-local-rag resolves (0.35.3 → libvips 8.18.3) via npm `overrides`. Loading two different libvips dylibs into one process makes macOS objc emit a duplicate-class warning (`GNotificationCenterDelegate implemented in both …`) that can cause spurious casting failures and mysterious crashes.
+
 ### Engine-signature invalidation
 
 Vectors from different engines, models, or dimensionalities are not comparable. The index records the signature of the engine that built it — now the constant `transformers:nomic-ai/nomic-embed-text-v1.5:768`. On load, a mismatch (any index predating the fixed engine, or built by a removed remote provider) removes all existing embeddings and the next sync re-embeds everything with nomic.
