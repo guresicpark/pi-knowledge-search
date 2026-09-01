@@ -1831,6 +1831,7 @@ function index_default(pi) {
   let sessionCwd;
   let syncDone = false;
   let workerExitExpected = false;
+  let activeWorker = null;
   function injectOverview(ctx, force) {
     if (!index || !currentConfig) return { status: "skipped", reason: "not configured" };
     if (!force && !currentConfig.overview.inject) {
@@ -1913,6 +1914,7 @@ function index_default(pi) {
         // settings.json (pi-knowledge-search.localPath).
         env: { ...process.env, KNOWLEDGE_SEARCH_CWD: sessionCwd ?? process.env.KNOWLEDGE_SEARCH_CWD ?? "" }
       });
+      activeWorker = worker;
       let stdout = "";
       let stderrBuf = "";
       const report = (msg, level = "error") => {
@@ -1933,6 +1935,7 @@ function index_default(pi) {
       });
       worker.on("exit", async (code, signal) => {
         syncDone = true;
+        if (activeWorker === worker) activeWorker = null;
         if (code === 0 && stdout) {
           try {
             const result = JSON.parse(stdout);
@@ -1988,6 +1991,7 @@ function index_default(pi) {
     { value: "add", label: "add", description: "Add directories to the index" },
     { value: "exclude", label: "exclude", description: "Manage excluded directory names (-<name> removes)" },
     { value: "index", label: "index", description: "Incrementally index new/changed files" },
+    { value: "clear", label: "clear", description: "Clear the index and reset config to defaults" },
     { value: "help", label: "help", description: "Show all /knowledge-search commands" }
   ];
   function getSubcommandCompletions(prefix) {
@@ -2149,6 +2153,71 @@ function index_default(pi) {
       ctx.ui.notify(`Index failed: ${err.message}`, "error");
     }
   }
+  async function handleClear(ctx) {
+    const confirmed = await ctx.ui.confirm(
+      "Clear knowledge search?",
+      "Deletes all project data (vector index + keyword side-car + config) and resets project settings to defaults, including any localPath override in .pi/settings.json. Re-index afterwards with /knowledge-search add + index. The shared HuggingFace model cache is not touched."
+    );
+    if (!confirmed) {
+      ctx.ui.notify("Clear cancelled.", "info");
+      return;
+    }
+    const indexDir = currentConfig?.indexDir ?? getIndexDir(sessionCwd);
+    const configPath = getConfigPath(sessionCwd);
+    if (activeWorker) {
+      workerExitExpected = true;
+      activeWorker.kill();
+      activeWorker = null;
+    }
+    try {
+      await index?.close();
+    } catch {
+    }
+    index = null;
+    currentConfig = null;
+    syncDone = false;
+    try {
+      if (fs5.existsSync(indexDir)) {
+        for (const entry of fs5.readdirSync(indexDir)) {
+          fs5.rmSync(join6(indexDir, entry), { recursive: true, force: true });
+        }
+      }
+    } catch (err) {
+      ctx.ui.notify(`Clear failed while deleting ${indexDir}: ${err.message}`, "error");
+      return;
+    }
+    try {
+      fs5.rmSync(configPath, { force: true });
+    } catch (err) {
+      ctx.ui.notify(`Clear failed while deleting ${configPath}: ${err.message}`, "error");
+      return;
+    }
+    const settingsFile = join6(sessionCwd ?? process.cwd(), ".pi", "settings.json");
+    try {
+      if (fs5.existsSync(settingsFile)) {
+        const settings = JSON.parse(fs5.readFileSync(settingsFile, "utf-8"));
+        if (settings && typeof settings === "object" && "pi-knowledge-search" in settings) {
+          delete settings["pi-knowledge-search"];
+          fs5.writeFileSync(settingsFile, JSON.stringify(settings, null, 2) + "\n");
+        }
+      }
+    } catch {
+    }
+    saveConfig(
+      {
+        dirs: [],
+        fileExtensions: [".md", ".txt"],
+        excludeDirs: ["node_modules", ".git", ".obsidian", ".trash"]
+      },
+      sessionCwd
+    );
+    statusWidgetVisible = false;
+    ctx.ui.setWidget("knowledge-search-status", void 0);
+    ctx.ui.notify(
+      `\u2705 Cleared all project data (${indexDir}) and reset settings to defaults`,
+      "info"
+    );
+  }
   function handleHelp(ctx) {
     const theme = ctx.ui.theme;
     const lines = [theme.bold("/knowledge-search commands"), ""];
@@ -2160,7 +2229,7 @@ function index_default(pi) {
   }
   let statusWidgetVisible = false;
   pi.registerCommand("knowledge-search", {
-    description: "knowledge-search: (status) | add <dir> | exclude <name> | index | help",
+    description: "knowledge-search: (status) | add <dir> | exclude <name> | index | clear | help",
     getArgumentCompletions: (prefix) => getSubcommandCompletions(prefix),
     handler: async (args, ctx) => {
       const parts = (args || "").trim().split(/\s+/);
@@ -2175,6 +2244,10 @@ function index_default(pi) {
       }
       if (subcommand === "index") {
         await handleIndex(ctx);
+        return;
+      }
+      if (subcommand === "clear") {
+        await handleClear(ctx);
         return;
       }
       if (subcommand === "help") {

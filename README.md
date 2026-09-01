@@ -72,6 +72,7 @@ Everything is driven by the `/knowledge-search` command (mirroring pi-local-rag'
 /knowledge-search add ~/notes     # add directories to index (space- or comma-separated)
 /knowledge-search exclude build   # add an excluded directory name (-<name> removes, bare lists)
 /knowledge-search index           # incrementally index new/changed files
+/knowledge-search clear           # clear ALL project data + reset settings to defaults (confirm first)
 /knowledge-search help            # list all subcommands
 ```
 
@@ -129,6 +130,7 @@ The index is stored at `{cwd}/.pi/knowledge-search/index.json` (project-local; s
 | `/knowledge-search add <dir>`        | Add directories to the index                         |
 | `/knowledge-search exclude <name>`   | Manage excluded directory names (`-<name>` removes)  |
 | `/knowledge-search index`            | Incrementally index new/changed files                |
+| `/knowledge-search clear`            | Clear all project data; reset settings to defaults  |
 | `/knowledge-search help`             | List all subcommands                                 |
 | `/knowledge-overview`                | Force-rebuild and re-inject the vault overview       |
 
@@ -164,6 +166,8 @@ To relocate them elsewhere within a project, add the following to `{project}/.pi
 3. Project default: `{cwd}/.pi/knowledge-search.json` + `{cwd}/.pi/knowledge-search/`
 
 **Migration from the global config:** versions prior to this change stored config at `~/.pi/knowledge-search.json` and the index at `~/.pi/knowledge-search/`. That location is no longer read — move the files into your project's `.pi/` directory to migrate, or re-run `/knowledge-search add <dir>` in the project.
+
+**What `/knowledge-search clear` resets:** both databases (`index.json` vector index + `kb-fts.db` keyword side-car), the config file, and any `pi-knowledge-search.localPath` override in `{project}/.pi/settings.json` — leaving the project in a fresh-install state. The HuggingFace model cache (`~/.cache/huggingface/transformers`) is machine-wide and shared with pi-local-rag, so it is intentionally not touched.
 
 ## License
 

@@ -4,10 +4,11 @@ import type {
   SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import type { ChildProcess } from "node:child_process";
 import { fork } from "node:child_process";
 import * as fs from "node:fs";
 import { join, resolve } from "node:path";
-import { loadConfig, saveConfig, getConfigPath, type Config, type ConfigFile } from "./config.js";
+import { loadConfig, saveConfig, getConfigPath, getIndexDir, type Config, type ConfigFile } from "./config.js";
 import { createEmbedder } from "./embedder.js";
 import { KnowledgeIndex } from "./index-store.js";
 import { buildOverview, formatOverview } from "./overview.js";
@@ -19,6 +20,8 @@ export default function (pi: ExtensionAPI) {
   let sessionCwd: string | undefined;
   let syncDone = false;
   let workerExitExpected = false;
+  /** In-flight sync worker, so `/knowledge-search clear` can kill it before wiping storage. */
+  let activeWorker: ChildProcess | null = null;
 
   /**
    * Build and inject the folder+keyword overview as a custom message.
@@ -153,6 +156,7 @@ export default function (pi: ExtensionAPI) {
         // settings.json (pi-knowledge-search.localPath).
         env: { ...process.env, KNOWLEDGE_SEARCH_CWD: sessionCwd ?? process.env.KNOWLEDGE_SEARCH_CWD ?? "" },
       });
+      activeWorker = worker;
 
       let stdout = "";
       let stderrBuf = "";
@@ -182,6 +186,7 @@ export default function (pi: ExtensionAPI) {
 
       worker.on("exit", async (code, signal) => {
         syncDone = true;
+        if (activeWorker === worker) activeWorker = null;
         if (code === 0 && stdout) {
           try {
             const result = JSON.parse(stdout);
@@ -247,7 +252,7 @@ export default function (pi: ExtensionAPI) {
 
   // ------------------------------------------------------------------
   // /knowledge-search command: status (bare, toggling), add, exclude,
-  // index (incremental), and help.
+  // index (incremental), clear, and help.
   // ------------------------------------------------------------------
 
   /** Subcommand table for autocomplete and /knowledge-search help. */
@@ -255,6 +260,7 @@ export default function (pi: ExtensionAPI) {
     { value: "add", label: "add", description: "Add directories to the index" },
     { value: "exclude", label: "exclude", description: "Manage excluded directory names (-<name> removes)" },
     { value: "index", label: "index", description: "Incrementally index new/changed files" },
+    { value: "clear", label: "clear", description: "Clear the index and reset config to defaults" },
     { value: "help", label: "help", description: "Show all /knowledge-search commands" },
   ];
 
@@ -472,6 +478,109 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  /**
+   * /knowledge-search clear — empty the index (vectors + FTS side-car) and
+   * reset the config to fresh defaults, mirroring pi-local-rag's /rag clear.
+   */
+  async function handleClear(ctx: ExtensionCommandContext): Promise<void> {
+    const confirmed = await ctx.ui.confirm(
+      "Clear knowledge search?",
+      "Deletes all project data (vector index + keyword side-car + config) and resets project settings to defaults, including any localPath override in .pi/settings.json. Re-index afterwards with /knowledge-search add + index. The shared HuggingFace model cache is not touched."
+    );
+    if (!confirmed) {
+      ctx.ui.notify("Clear cancelled.", "info");
+      return;
+    }
+
+    // Resolve storage before resetting state — from the live config when
+    // present, otherwise from the same path-resolution defaults. The config
+    // path is captured BEFORE the settings.json override is stripped below,
+    // so a localPath-relocated config file gets deleted too.
+    const indexDir = currentConfig?.indexDir ?? getIndexDir(sessionCwd);
+    const configPath = getConfigPath(sessionCwd);
+
+    // Kill an in-flight sync worker first so it can't re-write the index
+    // files we're about to delete. workerExitExpected suppresses the crash
+    // retry loop and the post-exit index reload.
+    if (activeWorker) {
+      workerExitExpected = true;
+      activeWorker.kill();
+      activeWorker = null;
+    }
+
+    // Close the in-memory index (flushes the FTS handle) before deleting.
+    try {
+      await index?.close();
+    } catch {
+      // best-effort — files are deleted next regardless
+    }
+    index = null;
+    currentConfig = null;
+    syncDone = false;
+
+    // Wipe everything inside the index directory (index.json, kb-fts.db,
+    // .tmp leftovers), keeping the directory itself — like /rag clear's
+    // resetStore().
+    try {
+      if (fs.existsSync(indexDir)) {
+        for (const entry of fs.readdirSync(indexDir)) {
+          fs.rmSync(join(indexDir, entry), { recursive: true, force: true });
+        }
+      }
+    } catch (err: any) {
+      ctx.ui.notify(`Clear failed while deleting ${indexDir}: ${err.message}`, "error");
+      return;
+    }
+
+    // Delete the config file (it is recreated at the default location
+    // below — deleting first also removes a localPath-relocated file that
+    // would otherwise be orphaned by the settings reset).
+    try {
+      fs.rmSync(configPath, { force: true });
+    } catch (err: any) {
+      ctx.ui.notify(`Clear failed while deleting ${configPath}: ${err.message}`, "error");
+      return;
+    }
+
+    // Reset the project settings.json too: drop the pi-knowledge-search
+    // block (localPath override) so storage resolution returns to the
+    // default {cwd}/.pi location. Everything else in settings.json is
+    // left untouched.
+    const settingsFile = join(sessionCwd ?? process.cwd(), ".pi", "settings.json");
+    try {
+      if (fs.existsSync(settingsFile)) {
+        const settings = JSON.parse(fs.readFileSync(settingsFile, "utf-8"));
+        if (settings && typeof settings === "object" && "pi-knowledge-search" in settings) {
+          delete settings["pi-knowledge-search"];
+          fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2) + "\n");
+        }
+      }
+    } catch {
+      // Unreadable/malformed settings — leave as-is; the default-location
+      // config written next still applies.
+    }
+
+    // Reset the config to fresh install defaults at the default location
+    // (no provider — the next `add` re-defaults the engine to local
+    // Transformers.js). The HuggingFace model cache is machine-wide and
+    // shared with pi-local-rag, so it is intentionally NOT touched.
+    saveConfig(
+      {
+        dirs: [],
+        fileExtensions: [".md", ".txt"],
+        excludeDirs: ["node_modules", ".git", ".obsidian", ".trash"],
+      },
+      sessionCwd
+    );
+
+    statusWidgetVisible = false;
+    ctx.ui.setWidget("knowledge-search-status", undefined);
+    ctx.ui.notify(
+      `✅ Cleared all project data (${indexDir}) and reset settings to defaults`,
+      "info"
+    );
+  }
+
   /** /knowledge-search help — subcommand list widget. */
   function handleHelp(ctx: ExtensionCommandContext): void {
     const theme = ctx.ui.theme;
@@ -486,7 +595,7 @@ export default function (pi: ExtensionAPI) {
   let statusWidgetVisible = false;
 
   pi.registerCommand("knowledge-search", {
-    description: "knowledge-search: (status) | add <dir> | exclude <name> | index | help",
+    description: "knowledge-search: (status) | add <dir> | exclude <name> | index | clear | help",
     getArgumentCompletions: (prefix: string) => getSubcommandCompletions(prefix),
     handler: async (args, ctx) => {
       const parts = (args || "").trim().split(/\s+/);
@@ -502,6 +611,10 @@ export default function (pi: ExtensionAPI) {
       }
       if (subcommand === "index") {
         await handleIndex(ctx);
+        return;
+      }
+      if (subcommand === "clear") {
+        await handleClear(ctx);
         return;
       }
       if (subcommand === "help") {
