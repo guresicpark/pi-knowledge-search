@@ -18,7 +18,6 @@ function warnUnknownKeys(block, blockName, knownKeys) {
   );
 }
 var PI_KNOWLEDGE_SEARCH_SETTINGS_KEYS = ["localPath"];
-var PI_TOTAL_RECALL_KNOWN_KEYS = ["localPath"];
 function resolveLocalBase(cwd) {
   if (!cwd) return null;
   try {
@@ -28,11 +27,6 @@ function resolveLocalBase(cwd) {
     warnUnknownKeys(ks, "pi-knowledge-search", PI_KNOWLEDGE_SEARCH_SETTINGS_KEYS);
     if (ks && typeof ks === "object" && typeof ks.localPath === "string" && ks.localPath) {
       return ks.localPath;
-    }
-    const tr = settings["pi-total-recall"];
-    warnUnknownKeys(tr, "pi-total-recall", PI_TOTAL_RECALL_KNOWN_KEYS);
-    if (tr && typeof tr === "object" && typeof tr.localPath === "string" && tr.localPath) {
-      return path.join(tr.localPath, "knowledge-search");
     }
   } catch {
   }

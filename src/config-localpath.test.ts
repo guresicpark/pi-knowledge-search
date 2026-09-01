@@ -1,12 +1,10 @@
 /**
- * Tests for project-local storage via pi-knowledge-search.localPath
- * and pi-total-recall.localPath cascade.
+ * Tests for project-local storage via pi-knowledge-search.localPath.
  *
  * Resolution order (highest priority first):
  *   1. Env var (KNOWLEDGE_SEARCH_CONFIG / KNOWLEDGE_SEARCH_INDEX_DIR)
  *   2. {cwd}/.pi/settings.json → "pi-knowledge-search".localPath
- *   3. {cwd}/.pi/settings.json → "pi-total-recall".localPath → {base}/knowledge-search
- *   4. Project default under {cwd}/.pi/ (process.cwd() when no cwd is passed)
+ *   3. Project default under {cwd}/.pi/ (process.cwd() when no cwd is passed)
  */
 import { describe, it, before, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
@@ -27,7 +25,6 @@ const originalEnv: Record<string, string | undefined> = {};
 let tmpHome: string;
 let tmpProject: string;
 let tmpLocal: string;
-let tmpCascade: string;
 
 // Dynamic imports so module-level env reads stay current.
 let resolveLocalBase: (typeof import("./config.js"))["resolveLocalBase"];
@@ -50,7 +47,6 @@ describe("config.localPath resolution", () => {
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "ks-home-"));
     tmpProject = fs.mkdtempSync(path.join(os.tmpdir(), "ks-proj-"));
     tmpLocal = fs.mkdtempSync(path.join(os.tmpdir(), "ks-local-"));
-    tmpCascade = fs.mkdtempSync(path.join(os.tmpdir(), "ks-cascade-"));
 
     process.env.HOME = tmpHome;
     delete process.env.KNOWLEDGE_SEARCH_CONFIG;
@@ -82,9 +78,6 @@ describe("config.localPath resolution", () => {
     try {
       fs.rmSync(path.join(tmpLocal, "config.json"), { force: true });
     } catch {}
-    try {
-      fs.rmSync(path.join(tmpCascade, "knowledge-search", "config.json"), { force: true });
-    } catch {}
   });
 
   after(() => {
@@ -95,7 +88,6 @@ describe("config.localPath resolution", () => {
     fs.rmSync(tmpHome, { recursive: true, force: true });
     fs.rmSync(tmpProject, { recursive: true, force: true });
     fs.rmSync(tmpLocal, { recursive: true, force: true });
-    fs.rmSync(tmpCascade, { recursive: true, force: true });
   });
 
   // ─── resolveLocalBase ──────────────────────────────────────────────
@@ -139,19 +131,6 @@ describe("config.localPath resolution", () => {
     assert.equal(resolveLocalBase(tmpProject), tmpLocal);
   });
 
-  it("resolveLocalBase cascades from pi-total-recall.localPath", () => {
-    writeProjectSettings({ "pi-total-recall": { localPath: tmpCascade } });
-    assert.equal(resolveLocalBase(tmpProject), path.join(tmpCascade, "knowledge-search"));
-  });
-
-  it("resolveLocalBase: package-specific wins over cascade", () => {
-    writeProjectSettings({
-      "pi-knowledge-search": { localPath: tmpLocal },
-      "pi-total-recall": { localPath: tmpCascade },
-    });
-    assert.equal(resolveLocalBase(tmpProject), tmpLocal);
-  });
-
   // ─── getConfigPath ─────────────────────────────────────────────────
 
   it("getConfigPath: project default under process.cwd() when no cwd and no env", () => {
@@ -167,14 +146,6 @@ describe("config.localPath resolution", () => {
   it("getConfigPath: package localPath resolves to {base}/config.json", () => {
     writeProjectSettings({ "pi-knowledge-search": { localPath: tmpLocal } });
     assert.equal(getConfigPath(tmpProject), path.join(tmpLocal, "config.json"));
-  });
-
-  it("getConfigPath: pi-total-recall cascade resolves to {base}/knowledge-search/config.json", () => {
-    writeProjectSettings({ "pi-total-recall": { localPath: tmpCascade } });
-    assert.equal(
-      getConfigPath(tmpProject),
-      path.join(tmpCascade, "knowledge-search", "config.json")
-    );
   });
 
   it("getConfigPath: falls back to project default when cwd has no settings", () => {
@@ -201,14 +172,6 @@ describe("config.localPath resolution", () => {
     assert.equal(getIndexDir(tmpProject), path.join(tmpLocal, "index"));
   });
 
-  it("getIndexDir: pi-total-recall cascade resolves to {base}/knowledge-search/index", () => {
-    writeProjectSettings({ "pi-total-recall": { localPath: tmpCascade } });
-    assert.equal(
-      getIndexDir(tmpProject),
-      path.join(tmpCascade, "knowledge-search", "index")
-    );
-  });
-
   // ─── loadConfig integration ────────────────────────────────────────
 
   it("loadConfig: reads config from package-local path when localPath set", () => {
@@ -226,24 +189,6 @@ describe("config.localPath resolution", () => {
     assert.ok(config);
     assert.deepStrictEqual(config.dirs, ["/tmp/project-docs"]);
     assert.equal(config.indexDir, path.join(tmpLocal, "index"));
-  });
-
-  it("loadConfig: reads config from cascade sub-path when pi-total-recall.localPath set", () => {
-    writeProjectSettings({ "pi-total-recall": { localPath: tmpCascade } });
-    fs.mkdirSync(path.join(tmpCascade, "knowledge-search"), { recursive: true });
-    fs.writeFileSync(
-      path.join(tmpCascade, "knowledge-search", "config.json"),
-      JSON.stringify({
-        dirs: ["/tmp/cascade-docs"],
-        provider: { type: "transformers" },
-      }),
-      "utf-8"
-    );
-
-    const config = loadConfig(tmpProject);
-    assert.ok(config);
-    assert.deepStrictEqual(config.dirs, ["/tmp/cascade-docs"]);
-    assert.equal(config.indexDir, path.join(tmpCascade, "knowledge-search", "index"));
   });
 
   it("loadConfig: returns null when localPath set but {localPath}/config.json missing", () => {
@@ -290,29 +235,12 @@ describe("config.localPath resolution", () => {
     assert.deepStrictEqual(parsed.dirs, ["/tmp/save-test"]);
   });
 
-  it("saveConfig: writes to cascade sub-path when pi-total-recall.localPath set", () => {
-    writeProjectSettings({ "pi-total-recall": { localPath: tmpCascade } });
-
-    saveConfig(
-      {
-        dirs: ["/tmp/cascade-save"],
-        provider: { type: "transformers" },
-      },
-      tmpProject
-    );
-
-    const written = path.join(tmpCascade, "knowledge-search", "config.json");
-    assert.ok(fs.existsSync(written));
-    const parsed = JSON.parse(fs.readFileSync(written, "utf-8"));
-    assert.deepStrictEqual(parsed.dirs, ["/tmp/cascade-save"]);
-  });
-
   it("saveConfig: creates parent directory automatically", () => {
     const freshBase = fs.mkdtempSync(path.join(os.tmpdir(), "ks-fresh-"));
     try {
       // Parent base exists but sub-dirs won't until we call.
       writeProjectSettings({
-        "pi-total-recall": { localPath: path.join(freshBase, "nested", "deep") },
+        "pi-knowledge-search": { localPath: path.join(freshBase, "nested", "deep") },
       });
       saveConfig(
         {
@@ -321,9 +249,7 @@ describe("config.localPath resolution", () => {
         },
         tmpProject
       );
-      assert.ok(
-        fs.existsSync(path.join(freshBase, "nested", "deep", "knowledge-search", "config.json"))
-      );
+      assert.ok(fs.existsSync(path.join(freshBase, "nested", "deep", "config.json")));
     } finally {
       fs.rmSync(freshBase, { recursive: true, force: true });
     }

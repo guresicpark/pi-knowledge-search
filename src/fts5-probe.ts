@@ -7,7 +7,7 @@ import { DatabaseSync } from "node:sqlite";
  * Without this check, `CREATE VIRTUAL TABLE ... USING fts5(...)` throws
  * deep inside `FtsChunkIndex.load()`, leaves a DB file with no tables,
  * and every subsequent query surfaces the cryptic "no such table: chunks"
- * instead of the real cause. See samfoy/pi-total-recall#4.
+ * instead of the real cause.
  *
  * Throws an Error with an actionable message when FTS5 is unavailable.
  * The probe runs at most once per process.

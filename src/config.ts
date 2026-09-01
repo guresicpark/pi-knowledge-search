@@ -68,11 +68,10 @@ function defaultIndexDir(cwd?: string): string {
  *
  * Resolution order (highest priority first):
  *   1. {cwd}/.pi/settings.json → "pi-knowledge-search".localPath
- *   2. {cwd}/.pi/settings.json → "pi-total-recall".localPath → {localPath}/knowledge-search
  *
  * When set, config is stored at {base}/config.json and index at {base}/index.
  * Environment variables (KNOWLEDGE_SEARCH_CONFIG / KNOWLEDGE_SEARCH_INDEX_DIR)
- * take precedence over both.
+ * take precedence.
  *
  * Returns null when no project-local override is configured.
  */
@@ -95,7 +94,6 @@ function warnUnknownKeys(block: unknown, blockName: string, knownKeys: readonly 
 // in a separate config.json (see getConfigPath) — only localPath comes from
 // the settings.json block directly.
 const PI_KNOWLEDGE_SEARCH_SETTINGS_KEYS = ["localPath"] as const;
-const PI_TOTAL_RECALL_KNOWN_KEYS = ["localPath"] as const;
 
 export function resolveLocalBase(cwd?: string): string | null {
   if (!cwd) return null;
@@ -103,21 +101,14 @@ export function resolveLocalBase(cwd?: string): string | null {
     const raw = fs.readFileSync(path.join(cwd, ".pi", "settings.json"), "utf-8");
     const settings = JSON.parse(raw) ?? {};
 
-    // Package-specific override wins.
+    // Package-specific override.
     const ks = settings["pi-knowledge-search"];
     warnUnknownKeys(ks, "pi-knowledge-search", PI_KNOWLEDGE_SEARCH_SETTINGS_KEYS);
     if (ks && typeof ks === "object" && typeof ks.localPath === "string" && ks.localPath) {
       return ks.localPath;
     }
-
-    // pi-total-recall cascade.
-    const tr = settings["pi-total-recall"];
-    warnUnknownKeys(tr, "pi-total-recall", PI_TOTAL_RECALL_KNOWN_KEYS);
-    if (tr && typeof tr === "object" && typeof tr.localPath === "string" && tr.localPath) {
-      return path.join(tr.localPath, "knowledge-search");
-    }
   } catch {
-    // No settings file, unreadable, or malformed — fall through to global.
+    // No settings file, unreadable, or malformed — fall through to the default.
   }
   return null;
 }

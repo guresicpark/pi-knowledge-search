@@ -145,7 +145,7 @@ export default function (pi: ExtensionAPI) {
         // enough for our read/write usage and the warning pollutes pi startup.
         execArgv: ["--no-warnings=ExperimentalWarning"],
         // Forward sessionCwd so the worker resolves the same project-local
-        // settings.json (pi-knowledge-search.localPath / pi-total-recall cascade).
+        // settings.json (pi-knowledge-search.localPath).
         env: { ...process.env, KNOWLEDGE_SEARCH_CWD: sessionCwd ?? process.env.KNOWLEDGE_SEARCH_CWD ?? "" },
       });
 

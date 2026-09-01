@@ -21,7 +21,6 @@ function warnUnknownKeys(block, blockName, knownKeys) {
   );
 }
 var PI_KNOWLEDGE_SEARCH_SETTINGS_KEYS = ["localPath"];
-var PI_TOTAL_RECALL_KNOWN_KEYS = ["localPath"];
 function resolveLocalBase(cwd) {
   if (!cwd) return null;
   try {
@@ -31,11 +30,6 @@ function resolveLocalBase(cwd) {
     warnUnknownKeys(ks, "pi-knowledge-search", PI_KNOWLEDGE_SEARCH_SETTINGS_KEYS);
     if (ks && typeof ks === "object" && typeof ks.localPath === "string" && ks.localPath) {
       return ks.localPath;
-    }
-    const tr = settings["pi-total-recall"];
-    warnUnknownKeys(tr, "pi-total-recall", PI_TOTAL_RECALL_KNOWN_KEYS);
-    if (tr && typeof tr === "object" && typeof tr.localPath === "string" && tr.localPath) {
-      return path.join(tr.localPath, "knowledge-search");
     }
   } catch {
   }
@@ -1915,7 +1909,7 @@ function index_default(pi) {
         // enough for our read/write usage and the warning pollutes pi startup.
         execArgv: ["--no-warnings=ExperimentalWarning"],
         // Forward sessionCwd so the worker resolves the same project-local
-        // settings.json (pi-knowledge-search.localPath / pi-total-recall cascade).
+        // settings.json (pi-knowledge-search.localPath).
         env: { ...process.env, KNOWLEDGE_SEARCH_CWD: sessionCwd ?? process.env.KNOWLEDGE_SEARCH_CWD ?? "" }
       });
       let stdout = "";
