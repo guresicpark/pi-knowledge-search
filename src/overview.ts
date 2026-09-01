@@ -1,13 +1,13 @@
 /**
- * Folder + keyword overview of indexed knowledge directories.
+ * Compact overview of indexed knowledge directories.
  *
- * Inspired by napkin's `napkin overview` — gives the agent a one-shot map
- * of the knowledge base at session start, so it knows what's worth searching
- * for before it asks.
+ * Injected at session start so the agent knows which vault dirs exist and
+ * how many notes each holds — a one-shot map without dumping folder trees,
+ * keywords, or README bodies into context.
  *
- * Keyword extraction is corpus-local TF-IDF over a lightweight feature set
- * (relative path segments + section headings). No embeddings, no LLM calls —
- * this runs on whatever the index already has loaded.
+ * buildOverview still computes the per-folder detail (buckets + TF-IDF
+ * keywords) for note counting and potential future consumers; only the
+ * source-dir list is rendered by formatOverview.
  */
 
 import * as fs from "node:fs";
@@ -43,6 +43,8 @@ export interface OverviewSource {
   dir: string;
   /** Short display name (basename of `dir`, with `~` substitution done upstream). */
   displayName: string;
+  /** Total unique note count in this source dir (over all folders, untrimmed). */
+  noteCount: number;
   /**
    * Root-level context note if present (`NAPKIN.md`, `README.md`, or `_about.md`).
    * First ~400 chars, trimmed.
@@ -270,6 +272,7 @@ export function buildOverview(
     sources.push({
       dir: sourceDir,
       displayName: path.basename(sourceDir) || sourceDir,
+      noteCount: sourceTotal,
       contextNote: findContextNote(sourceDir),
       folders: trimmedFolders,
     });
@@ -292,30 +295,7 @@ export function formatOverview(overview: Overview): string {
   const home = process.env.HOME || "";
   for (const src of overview.sources) {
     const dirDisplay = home && src.dir.startsWith(home) ? src.dir.replace(home, "~") : src.dir;
-    lines.push(`### ${dirDisplay}`);
-    if (src.contextNote) {
-      lines.push("");
-      lines.push(src.contextNote);
-    }
-    lines.push("");
-    if (src.folders.length === 0) {
-      lines.push("_(no indexed files)_");
-      lines.push("");
-      continue;
-    }
-    for (const folder of src.folders) {
-      const label = folder.path || "(root)";
-      lines.push(`- **${label}/** — ${folder.noteCount} note${folder.noteCount === 1 ? "" : "s"}`);
-      if (folder.keywords.length > 0) {
-        lines.push(`  - keywords: ${folder.keywords.join(", ")}`);
-      }
-      if (folder.aboutText) {
-        // Compact the about text to one line for the list form.
-        const oneLine = folder.aboutText.replace(/\s+/g, " ").slice(0, 180);
-        lines.push(`  - ${oneLine}`);
-      }
-    }
-    lines.push("");
+    lines.push(`- **${dirDisplay}** — ${src.noteCount} note${src.noteCount === 1 ? "" : "s"}`);
   }
   return lines.join("\n").trimEnd();
 }

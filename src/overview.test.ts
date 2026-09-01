@@ -40,6 +40,7 @@ describe("buildOverview", () => {
     const o = buildOverview(files, ["/v"], { maxDepth: 2, maxKeywordsPerFolder: 0 });
     assert.equal(o.sources.length, 1);
     assert.equal(o.totalNotes, 3);
+    assert.equal(o.sources[0].noteCount, 3);
     const byPath = new Map(o.sources[0].folders.map((f) => [f.path, f.noteCount]));
     assert.equal(byPath.get("evergreen"), 2);
     assert.equal(byPath.get("taskei"), 1);
@@ -144,13 +145,14 @@ describe("formatOverview", () => {
     assert.equal(text, "");
   });
 
-  it("renders markdown sections for each source dir", () => {
+  it("renders one bullet per source dir with its note count", () => {
     const out = formatOverview({
       totalNotes: 3,
       sources: [
         {
           dir: "/v",
           displayName: "v",
+          noteCount: 3,
           contextNote: "Hello",
           folders: [
             { path: "evergreen", noteCount: 2, keywords: ["retrieval", "hybrid"] },
@@ -160,30 +162,46 @@ describe("formatOverview", () => {
       ],
     });
     assert.match(out, /Knowledge-search vault overview/);
-    assert.match(out, /\/v/);
-    assert.match(out, /evergreen\/\*\*.*2 notes/s);
-    assert.match(out, /retrieval, hybrid/);
-    assert.match(out, /taskei\/\*\*.*1 note/s);
+    assert.match(out, /- \*\*\/v\*\* — 3 notes/);
   });
 
-  it("includes a folder's aboutText in the rendered output", () => {
+  it("uses the singular form for a single note", () => {
     const out = formatOverview({
       totalNotes: 1,
       sources: [
         {
           dir: "/v",
           displayName: "v",
+          noteCount: 1,
+          folders: [{ path: "notes", noteCount: 1, keywords: [] }],
+        },
+      ],
+    });
+    assert.match(out, /- \*\*\/v\*\* — 1 note\b/);
+  });
+
+  it("omits folders, keywords, and context notes from the output", () => {
+    const out = formatOverview({
+      totalNotes: 2,
+      sources: [
+        {
+          dir: "/v",
+          displayName: "v",
+          noteCount: 2,
+          contextNote: "LONG README BODY THAT MUST NOT APPEAR",
           folders: [
             {
               path: "notes",
-              noteCount: 1,
-              keywords: ["foo"],
+              noteCount: 2,
+              keywords: ["kw-one", "kw-two"],
               aboutText: "This folder holds the daily log entries.",
             },
           ],
         },
       ],
     });
-    assert.match(out, /This folder holds the daily log entries\./);
+    assert.doesNotMatch(out, /LONG README BODY/);
+    assert.doesNotMatch(out, /kw-one/);
+    assert.doesNotMatch(out, /daily log entries/);
   });
 });

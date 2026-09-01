@@ -17,9 +17,6 @@ The embedding engine is fixed — `nomic-ai/nomic-embed-text-v1.5` via local ONN
 
 | Variable                                  | Default | Description                                                     |
 | ----------------------------------------- | ------- | --------------------------------------------------------------- |
-| `KNOWLEDGE_SEARCH_OVERVIEW_INJECT`        | `true`  | Inject a folder+keyword overview as a custom message on start.  |
-| `KNOWLEDGE_SEARCH_OVERVIEW_MAX_DEPTH`     | `2`     | Folder depth used to group files in the overview.               |
-| `KNOWLEDGE_SEARCH_OVERVIEW_MAX_FOLDERS`   | `20`    | Max folders surfaced per source dir (ranked by note count).     |
-| `KNOWLEDGE_SEARCH_OVERVIEW_MAX_KEYWORDS`  | `5`     | Max TF-IDF keywords shown per folder.                           |
+| `KNOWLEDGE_SEARCH_OVERVIEW_INJECT`        | `true`  | Inject a vault overview (source dirs + note counts) on start.   |
 
 Boolean values accept `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` (case-insensitive).

@@ -32,13 +32,14 @@ The extension registers two LLM-facing tools:
 
 ## Overview injection
 
-On session start, pi-knowledge-search injects a one-shot folder+keyword summary of the indexed vault as a custom message. This gives the model a prior on what's in the knowledge base without having to discover the structure through trial-and-error searches.
+On session start, pi-knowledge-search injects a one-shot summary of the indexed vault as a custom message. This gives the model a prior on what's in the knowledge base without having to discover the structure through trial-and-error searches.
 
-The overview is built from whatever the index has loaded from disk — no extra scan — and includes:
+The overview is a compact list — one line per configured source dir with its note count:
 
-- Folders grouped at configurable depth, sorted by note count
-- Top keywords per folder (TF-IDF over filenames and headings)
-- Optional `NAPKIN.md` / `README.md` / `_about.md` body as folder context
+```markdown
+- **~/dir/docs1** — 42 notes
+- **~/dir/docs2** — 7 notes
+```
 
 Override settings in the config file:
 

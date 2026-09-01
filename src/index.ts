@@ -39,7 +39,8 @@ export default function (pi: ExtensionAPI) {
   let activeWorker: ChildProcess | null = null;
 
   /**
-   * Build and inject the folder+keyword overview as a custom message.
+   * Build and inject the compact vault overview (source dirs + note counts)
+   * as a custom message.
    * @param force When true, inject even if one is already present.
    *              Used by /knowledge-overview after config changes or vault growth.
    * @returns Information about what happened for user-facing feedback.
@@ -221,8 +222,9 @@ export default function (pi: ExtensionAPI) {
     const indexLoaded: Promise<void> = index.load();
 
     // ----------------------------------------------------------------
-    // Inject a folder+keyword overview of the vault as a custom message,
-    // unless one is already in the session or the user disabled it.
+    // Inject a compact overview of the vault (one line per source dir
+    // with its note count) as a custom message, unless one is already
+    // in the session or the user disabled it.
     // Runs off whatever the index has loaded from disk — the worker's
     // incremental sync below will update the store for future sessions.
     //

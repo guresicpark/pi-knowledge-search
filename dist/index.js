@@ -1811,6 +1811,7 @@ function buildOverview(files, sourceDirs, opts = {}) {
     sources.push({
       dir: sourceDir,
       displayName: path3.basename(sourceDir) || sourceDir,
+      noteCount: sourceTotal,
       contextNote: findContextNote(sourceDir),
       folders: trimmedFolders
     });
@@ -1828,29 +1829,7 @@ function formatOverview(overview) {
   const home = process.env.HOME || "";
   for (const src of overview.sources) {
     const dirDisplay = home && src.dir.startsWith(home) ? src.dir.replace(home, "~") : src.dir;
-    lines.push(`### ${dirDisplay}`);
-    if (src.contextNote) {
-      lines.push("");
-      lines.push(src.contextNote);
-    }
-    lines.push("");
-    if (src.folders.length === 0) {
-      lines.push("_(no indexed files)_");
-      lines.push("");
-      continue;
-    }
-    for (const folder of src.folders) {
-      const label = folder.path || "(root)";
-      lines.push(`- **${label}/** \u2014 ${folder.noteCount} note${folder.noteCount === 1 ? "" : "s"}`);
-      if (folder.keywords.length > 0) {
-        lines.push(`  - keywords: ${folder.keywords.join(", ")}`);
-      }
-      if (folder.aboutText) {
-        const oneLine = folder.aboutText.replace(/\s+/g, " ").slice(0, 180);
-        lines.push(`  - ${oneLine}`);
-      }
-    }
-    lines.push("");
+    lines.push(`- **${dirDisplay}** \u2014 ${src.noteCount} note${src.noteCount === 1 ? "" : "s"}`);
   }
   return lines.join("\n").trimEnd();
 }
