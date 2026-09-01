@@ -62,12 +62,14 @@ export interface ConfigFile {
     | { type: "transformers"; model?: string };
 }
 
-// Lazy so HOME changes at runtime (tests, sandboxes) are honored.
-function globalConfigFile(): string {
-  return path.join(process.env.HOME || "/tmp", ".pi", "knowledge-search.json");
+// Storage is project-local: config lives at {cwd}/.pi/knowledge-search.json and
+// the index at {cwd}/.pi/knowledge-search/. Evaluated lazily per call so cwd
+// changes at runtime (tests, sandboxes) are honored.
+function defaultConfigFile(cwd?: string): string {
+  return path.join(cwd || process.cwd(), ".pi", "knowledge-search.json");
 }
-function globalIndexDir(): string {
-  return path.join(process.env.HOME || "/tmp", ".pi", "knowledge-search");
+function defaultIndexDir(cwd?: string): string {
+  return path.join(cwd || process.cwd(), ".pi", "knowledge-search");
 }
 
 /**
@@ -133,13 +135,13 @@ export function resolveLocalBase(cwd?: string): string | null {
  * Resolve the config file path. Priority:
  *   1. KNOWLEDGE_SEARCH_CONFIG env var (explicit override)
  *   2. Project-local base ({base}/config.json)
- *   3. Global default (~/.pi/knowledge-search.json)
+ *   3. Project default ({cwd}/.pi/knowledge-search.json; process.cwd() when no cwd)
  */
 export function getConfigPath(cwd?: string): string {
   if (process.env.KNOWLEDGE_SEARCH_CONFIG) return process.env.KNOWLEDGE_SEARCH_CONFIG;
   const base = resolveLocalBase(cwd);
   if (base) return path.join(base, "config.json");
-  return globalConfigFile();
+  return defaultConfigFile(cwd);
 }
 
 /**
@@ -149,7 +151,7 @@ export function getIndexDir(cwd?: string): string {
   if (process.env.KNOWLEDGE_SEARCH_INDEX_DIR) return process.env.KNOWLEDGE_SEARCH_INDEX_DIR;
   const base = resolveLocalBase(cwd);
   if (base) return path.join(base, "index");
-  return globalIndexDir();
+  return defaultIndexDir(cwd);
 }
 
 /**

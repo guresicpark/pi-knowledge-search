@@ -3,11 +3,11 @@
 // src/config.ts
 import * as fs from "node:fs";
 import * as path from "node:path";
-function globalConfigFile() {
-  return path.join(process.env.HOME || "/tmp", ".pi", "knowledge-search.json");
+function defaultConfigFile(cwd) {
+  return path.join(cwd || process.cwd(), ".pi", "knowledge-search.json");
 }
-function globalIndexDir() {
-  return path.join(process.env.HOME || "/tmp", ".pi", "knowledge-search");
+function defaultIndexDir(cwd) {
+  return path.join(cwd || process.cwd(), ".pi", "knowledge-search");
 }
 function warnUnknownKeys(block, blockName, knownKeys) {
   if (!block || typeof block !== "object") return;
@@ -42,13 +42,13 @@ function getConfigPath(cwd) {
   if (process.env.KNOWLEDGE_SEARCH_CONFIG) return process.env.KNOWLEDGE_SEARCH_CONFIG;
   const base = resolveLocalBase(cwd);
   if (base) return path.join(base, "config.json");
-  return globalConfigFile();
+  return defaultConfigFile(cwd);
 }
 function getIndexDir(cwd) {
   if (process.env.KNOWLEDGE_SEARCH_INDEX_DIR) return process.env.KNOWLEDGE_SEARCH_INDEX_DIR;
   const base = resolveLocalBase(cwd);
   if (base) return path.join(base, "index");
-  return globalIndexDir();
+  return defaultIndexDir(cwd);
 }
 function loadConfig(cwd) {
   const configPath = getConfigPath(cwd);

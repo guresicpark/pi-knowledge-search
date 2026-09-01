@@ -6,7 +6,7 @@
  *   1. Env var (KNOWLEDGE_SEARCH_CONFIG / KNOWLEDGE_SEARCH_INDEX_DIR)
  *   2. {cwd}/.pi/settings.json → "pi-knowledge-search".localPath
  *   3. {cwd}/.pi/settings.json → "pi-total-recall".localPath → {base}/knowledge-search
- *   4. Global default under ~/.pi/
+ *   4. Project default under {cwd}/.pi/ (process.cwd() when no cwd is passed)
  */
 import { describe, it, before, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
@@ -157,8 +157,8 @@ describe("config.localPath resolution", () => {
 
   // ─── getConfigPath ─────────────────────────────────────────────────
 
-  it("getConfigPath: global default when no cwd and no env", () => {
-    assert.equal(getConfigPath(), path.join(tmpHome, ".pi", "knowledge-search.json"));
+  it("getConfigPath: project default under process.cwd() when no cwd and no env", () => {
+    assert.equal(getConfigPath(), path.join(process.cwd(), ".pi", "knowledge-search.json"));
   });
 
   it("getConfigPath: env var wins over everything", () => {
@@ -180,17 +180,17 @@ describe("config.localPath resolution", () => {
     );
   });
 
-  it("getConfigPath: falls back to global when cwd has no settings", () => {
+  it("getConfigPath: falls back to project default when cwd has no settings", () => {
     assert.equal(
       getConfigPath(tmpProject),
-      path.join(tmpHome, ".pi", "knowledge-search.json")
+      path.join(tmpProject, ".pi", "knowledge-search.json")
     );
   });
 
   // ─── getIndexDir ───────────────────────────────────────────────────
 
-  it("getIndexDir: global default when no cwd and no env", () => {
-    assert.equal(getIndexDir(), path.join(tmpHome, ".pi", "knowledge-search"));
+  it("getIndexDir: project default under process.cwd() when no cwd and no env", () => {
+    assert.equal(getIndexDir(), path.join(process.cwd(), ".pi", "knowledge-search"));
   });
 
   it("getIndexDir: env var wins over everything", () => {
@@ -249,29 +249,29 @@ describe("config.localPath resolution", () => {
     assert.equal(config.indexDir, path.join(tmpCascade, "knowledge-search", "index"));
   });
 
-  it("loadConfig: falls through to global when localPath set but {localPath}/config.json missing", () => {
-    // localPath configured, but no config file yet → behaves like "not configured"
+  it("loadConfig: returns null when localPath set but {localPath}/config.json missing", () => {
+    // localPath configured, but no config file there and no {cwd}/.pi default
+    // either → behaves like "not configured".
     writeProjectSettings({ "pi-knowledge-search": { localPath: tmpLocal } });
     assert.equal(loadConfig(tmpProject), null);
   });
 
-  it("loadConfig: without cwd, still works against global defaults (back-compat)", () => {
-    // Write a global config under tmpHome
-    const globalDir = path.join(tmpHome, ".pi");
-    fs.mkdirSync(globalDir, { recursive: true });
+  it("loadConfig: reads config from the {cwd}/.pi project default", () => {
+    // No settings.json — the default config lives at {cwd}/.pi/knowledge-search.json
+    fs.mkdirSync(path.join(tmpProject, ".pi"), { recursive: true });
     fs.writeFileSync(
-      path.join(globalDir, "knowledge-search.json"),
+      path.join(tmpProject, ".pi", "knowledge-search.json"),
       JSON.stringify({
-        dirs: ["/tmp/global-docs"],
-        provider: { type: "openai", apiKey: "sk-global" },
+        dirs: ["/tmp/project-docs"],
+        provider: { type: "openai", apiKey: "sk-project" },
       }),
       "utf-8"
     );
 
-    const config = loadConfig();
+    const config = loadConfig(tmpProject);
     assert.ok(config);
-    assert.deepStrictEqual(config.dirs, ["/tmp/global-docs"]);
-    assert.equal(config.indexDir, path.join(tmpHome, ".pi", "knowledge-search"));
+    assert.deepStrictEqual(config.dirs, ["/tmp/project-docs"]);
+    assert.equal(config.indexDir, path.join(tmpProject, ".pi", "knowledge-search"));
   });
 
   // ─── saveConfig integration ────────────────────────────────────────
@@ -334,10 +334,10 @@ describe("config.localPath resolution", () => {
 
   // ─── Back-compat smoke ─────────────────────────────────────────────
 
-  it("back-compat: calls with no cwd behave identically to pre-localPath code", () => {
-    // No settings file, no env overrides, no cwd → global default.
-    assert.equal(getConfigPath(), path.join(tmpHome, ".pi", "knowledge-search.json"));
-    assert.equal(getIndexDir(), path.join(tmpHome, ".pi", "knowledge-search"));
+  it("back-compat: calls with no cwd use the process.cwd() project default", () => {
+    // No settings file, no env overrides, no cwd → {process.cwd()}/.pi default.
+    assert.equal(getConfigPath(), path.join(process.cwd(), ".pi", "knowledge-search.json"));
+    assert.equal(getIndexDir(), path.join(process.cwd(), ".pi", "knowledge-search"));
   });
 
   it("back-compat: undefined cwd with package-scoped settings in an unrelated project is ignored", () => {
@@ -345,7 +345,7 @@ describe("config.localPath resolution", () => {
     writeProjectSettings({ "pi-knowledge-search": { localPath: tmpLocal } });
     const otherProject = fs.mkdtempSync(path.join(os.tmpdir(), "ks-other-"));
     try {
-      assert.equal(getConfigPath(otherProject), path.join(tmpHome, ".pi", "knowledge-search.json"));
+      assert.equal(getConfigPath(otherProject), path.join(otherProject, ".pi", "knowledge-search.json"));
     } finally {
       fs.rmSync(otherProject, { recursive: true, force: true });
     }

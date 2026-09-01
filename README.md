@@ -86,7 +86,7 @@ This walks you through:
 3. **Directories to exclude** (default: `node_modules, .git, .obsidian, .trash`)
 4. **Embedding provider** — OpenAI, OpenAI-compatible (local/self-hosted), AWS Bedrock, Ollama, or local Transformers.js (ONNX)
 
-Config is saved to `~/.pi/knowledge-search.json`. Run `/reload` to activate.
+Config is saved to `{cwd}/.pi/knowledge-search.json` — project-local, relative to the directory pi was started in. Run `/reload` to activate.
 
 ### Config file
 
@@ -262,7 +262,7 @@ Every config field can be overridden via environment variables. This is useful f
 
 Sync runs on session startup only. Files changed mid-session won't be searchable until the next session start or a manual `/knowledge-reindex`.
 
-The index is stored at `~/.pi/knowledge-search/index.json`.
+The index is stored at `{cwd}/.pi/knowledge-search/index.json` (project-local; see [Project-local storage](#project-local-storage)).
 
 ## Commands
 
@@ -286,7 +286,9 @@ Typical numbers for ~500 markdown files (~20MB):
 
 ## Project-local storage
 
-By default, config lives at `~/.pi/knowledge-search.json` and the index at `~/.pi/knowledge-search/`. To relocate per-project, add one of the following to `{project}/.pi/settings.json`:
+Config and index are **project-local by default**: config lives at `{cwd}/.pi/knowledge-search.json` and the index at `{cwd}/.pi/knowledge-search/`, where `{cwd}` is the directory pi was started in. Each project gets its own config and index — no cross-project bleed.
+
+To relocate them elsewhere within a project, add one of the following to `{project}/.pi/settings.json`:
 
 ```jsonc
 {
@@ -312,9 +314,9 @@ Or via the [`pi-total-recall`](https://github.com/samfoy/pi-total-recall) cascad
 1. `KNOWLEDGE_SEARCH_CONFIG` / `KNOWLEDGE_SEARCH_INDEX_DIR` env vars
 2. `pi-knowledge-search.localPath` in `{cwd}/.pi/settings.json`
 3. `pi-total-recall.localPath` cascade → `{localPath}/knowledge-search/`
-4. Global default: `~/.pi/knowledge-search.json` + `~/.pi/knowledge-search/`
+4. Project default: `{cwd}/.pi/knowledge-search.json` + `{cwd}/.pi/knowledge-search/`
 
-Per-project indexes are particularly useful for vault- or doc-tree-scoped embeddings where you don't want cross-project bleed.
+**Migration from the global config:** versions prior to this change stored config at `~/.pi/knowledge-search.json` and the index at `~/.pi/knowledge-search/`. That location is no longer read — move the files into your project's `.pi/` directory to migrate, or re-run `/knowledge-search-setup` in the project.
 
 ## License
 
