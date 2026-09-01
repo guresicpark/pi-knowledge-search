@@ -763,9 +763,12 @@ export class KnowledgeIndex {
     const ALPHA = 0.4;
     // Floor on the blended score: anything below is treated as unrelated and
     // omitted entirely — a query with only one related file returns just that
-    // file instead of padding the result list with noise. Same value as
-    // pi-local-rag's ragScoreThreshold and the auto-lookup filter it replaces.
-    const MIN_HYBRID_SCORE = 0.1;
+    // file instead of padding the result list with noise. Calibrated on a
+    // real nomic index (8782 chunks): unrelated queries top out at ~0.31-0.38
+    // (anisotropic baseline, cos ~0.52 × (1 - ALPHA)), while related hits
+    // start at ~0.8. 0.4 is also exactly the ceiling for a pure keyword-only
+    // match (ALPHA × bm25=1 + (1-ALPHA) × cos~0), so those always survive.
+    const MIN_HYBRID_SCORE = 0.4;
     const ftsCandidateLimit = Math.max(limit * 20, 200);
     const vectorCandidateLimit = Math.max(limit * 10, 100);
 

@@ -1278,7 +1278,7 @@ ${chunkText}`;
    */
   async hybridSearch(query, limit, signal) {
     const ALPHA = 0.4;
-    const MIN_HYBRID_SCORE = 0.1;
+    const MIN_HYBRID_SCORE = 0.4;
     const ftsCandidateLimit = Math.max(limit * 20, 200);
     const vectorCandidateLimit = Math.max(limit * 10, 100);
     let ftsCandidates;
