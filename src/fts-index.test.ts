@@ -495,6 +495,119 @@ describe("KnowledgeIndex hybrid search", () => {
     );
     await idx.close();
   });
+
+  it("searchWithBm25 reports the raw BM25 file hits alongside the fused results", async () => {
+    const queryVec = [1, 0, 0, 0];
+    const embedder = new TableEmbedder({ "deploy rollout": queryVec });
+    const idx = new KnowledgeIndex(makeConfig(tmpDir), embedder);
+    await idx.load();
+
+    seed(idx, [
+      {
+        absPath: "/v/keyword-hit.md",
+        vector: [0.2, 0.2, 0.9, 0],
+        excerpt: "deploy rollout playbook for weekly releases",
+        startLine: 21,
+        endLine: 49,
+      },
+      {
+        absPath: "/v/noise.md",
+        vector: [0, 0, 0, 1],
+        excerpt: "completely unrelated content about cooking",
+        startLine: 0,
+        endLine: 3,
+      },
+    ]);
+    (idx as unknown as { rebuildFtsFromEntries: () => void }).rebuildFtsFromEntries();
+
+    const { results, bm25Files } = await idx.searchWithBm25("deploy rollout", 5);
+    assert.ok(results.some((r) => r.path === "/v/keyword-hit.md"), "fused results still surface the keyword hit");
+    assert.equal(bm25Files.length, 1, "only the keyword-matching file is a BM25 hit");
+    assert.equal(bm25Files[0].path, "/v/keyword-hit.md");
+    assert.deepEqual(bm25Files[0].lineRanges, [[22, 50]], "BM25 hits carry 1-indexed line ranges");
+    // Attribution: the keyword term dominates this hit (bm25=1 → 0.4 vs
+    // vector cos 0.2 → 0.6×0.2 = 0.12), so it is a bm25 hit, not nomic.
+    const kwResult = results.find((r) => r.path === "/v/keyword-hit.md");
+    assert.equal(kwResult?.source, "bm25", "keyword-dominated hit must be attributed to bm25");
+    await idx.close();
+  });
+
+  it("searchWithBm25 attributes each hit to the dominating backend (mix scenario)", async () => {
+    const queryVec = [1, 0, 0, 0];
+    const embedder = new TableEmbedder({ "deploy rollout": queryVec });
+    const idx = new KnowledgeIndex(makeConfig(tmpDir), embedder);
+    await idx.load();
+
+    seed(idx, [
+      {
+        // Strong vector match, no keyword overlap → nomic-driven.
+        absPath: "/v/semantic.md",
+        vector: [0.95, 0.1, 0, 0],
+        excerpt: "shipping the release candidate gradually",
+        startLine: 0,
+        endLine: 8,
+      },
+      {
+        // Keyword-only: orthogonal vector, exact term match → bm25-driven.
+        absPath: "/v/keyword.md",
+        vector: [0, 0, 1, 0],
+        excerpt: "deploy rollout checklist for the ops team",
+        startLine: 21,
+        endLine: 30,
+      },
+    ]);
+    (idx as unknown as { rebuildFtsFromEntries: () => void }).rebuildFtsFromEntries();
+
+    const { results } = await idx.searchWithBm25("deploy rollout", 5);
+    const byPath = new Map(results.map((r) => [r.path, r]));
+    assert.equal(byPath.get("/v/semantic.md")?.source, "vector", "vector-driven hit must be nomic");
+    assert.equal(byPath.get("/v/keyword.md")?.source, "bm25", "keyword-only hit must be bm25");
+    await idx.close();
+  });
+
+  it("pure-BM25 fallback attributes every hit to bm25 (no vectors)", async () => {
+    const embedder = new TableEmbedder({}); // empty table → embed() throws
+    const idx = new KnowledgeIndex(makeConfig(tmpDir), embedder);
+    await idx.load();
+
+    seed(idx, [
+      {
+        absPath: "/v/hit.md",
+        vector: [1, 0, 0, 0],
+        excerpt: "quarterly planning retrospective notes",
+        startLine: 4,
+        endLine: 9,
+      },
+    ]);
+    (idx as unknown as { rebuildFtsFromEntries: () => void }).rebuildFtsFromEntries();
+
+    const { results } = await idx.searchWithBm25("quarterly planning", 5);
+    assert.equal(results.length, 1);
+    assert.equal(results[0].source, "bm25", "with no vectors every hit is bm25-driven");
+    await idx.close();
+  });
+
+  it("searchWithBm25 returns no BM25 hits when the FTS side-car is empty", async () => {
+    const queryVec = [1, 0, 0, 0];
+    const embedder = new TableEmbedder({ cats: queryVec });
+    const idx = new KnowledgeIndex(makeConfig(tmpDir), embedder);
+    await idx.load();
+
+    seed(idx, [
+      {
+        absPath: "/v/cats.md",
+        vector: [0.95, 0.1, 0, 0],
+        excerpt: "feline antics",
+      },
+    ]);
+    // Intentionally DO NOT backfill FTS — pure-vector fallback.
+
+    const { results, bm25Files } = await idx.searchWithBm25("cats", 5);
+    assert.equal(results.length, 1);
+    assert.equal(results[0].source, "vector", "pure-vector hit is nomic-driven");
+    assert.equal(bm25Files.length, 0, "pure-vector fallback has no BM25 hits");
+    await idx.close();
+  });
 });
 
 describe("KnowledgeIndex FTS-only mode (no embedder)", () => {

@@ -1277,6 +1277,15 @@ ${chunkText}`;
    * Deduplicates so only the best chunk per file is returned.
    */
   async hybridSearch(query, limit, signal) {
+    return (await this.searchWithBm25(query, limit, signal)).results;
+  }
+  /**
+   * Hybrid search (see `hybridSearch`) that additionally returns the raw
+   * BM25 (FTS5 side-car) file hits harvested from the candidate set before
+   * fusion — the keyword-side view of the same query, so callers can show
+   * what pure keyword matching found alongside the blended ranking.
+   */
+  async searchWithBm25(query, limit, signal) {
     const ALPHA = 0.4;
     const MIN_HYBRID_SCORE = 0.4;
     const ftsCandidateLimit = Math.max(limit * 20, 200);
@@ -1311,7 +1320,19 @@ ${chunkText}`;
       ...ftsCandidates.map((c) => c.key),
       ...vectorSimilarityByKey.keys()
     ]);
-    if (candidateKeys.size === 0) return [];
+    const bm25RangesByFile = /* @__PURE__ */ new Map();
+    for (const c of ftsCandidates) {
+      const entry = this.data.entries[c.key];
+      if (!entry || typeof entry.startLine !== "number") continue;
+      const ranges = bm25RangesByFile.get(c.absPath) ?? [];
+      ranges.push([entry.startLine + 1, (entry.endLine ?? entry.startLine) + 1]);
+      bm25RangesByFile.set(c.absPath, ranges);
+    }
+    const bm25Files = [...bm25RangesByFile.entries()].map(([bm25Path, ranges]) => ({
+      path: bm25Path,
+      lineRanges: ranges.sort((a, b) => a[0] - b[0])
+    }));
+    if (candidateKeys.size === 0) return { results: [], bm25Files };
     const bm25ByKey = /* @__PURE__ */ new Map();
     if (ftsCandidates.length > 0) {
       let bm25Max = -Infinity;
@@ -1360,6 +1381,9 @@ ${chunkText}`;
       if (seen.has(absPath)) continue;
       seen.add(absPath);
       const finalScore = Math.min(score, 1);
+      const bm25Norm = bm25ByKey.get(key) ?? 0;
+      const sim = vectorSimilarityByKey.get(key) ?? 0;
+      const source = hasAnyVectors && (1 - ALPHA) * sim >= ALPHA * bm25Norm ? "vector" : "bm25";
       if (entry) {
         out.push({
           path: absPath,
@@ -1367,7 +1391,8 @@ ${chunkText}`;
           excerpt: entry.excerpt,
           heading: entry.heading,
           matches: matchesByFile.get(absPath) ?? 1,
-          lineRanges: (rangesByFile.get(absPath) ?? []).sort((a, b) => a[0] - b[0])
+          lineRanges: (rangesByFile.get(absPath) ?? []).sort((a, b) => a[0] - b[0]),
+          source
         });
       } else {
         out.push({
@@ -1376,12 +1401,13 @@ ${chunkText}`;
           excerpt: "",
           heading: "",
           matches: matchesByFile.get(absPath) ?? 1,
-          lineRanges: []
+          lineRanges: [],
+          source
         });
       }
       if (out.length >= limit) break;
     }
-    return out;
+    return { results: out, bm25Files };
   }
   /**
    * Update a single file in the index (called by watcher).
@@ -1984,6 +2010,34 @@ function readNote(absPath, opts = {}) {
   };
 }
 
+// src/lookup-summary.ts
+var LOOKUP_TOP_K = 5;
+var MAX_RANGES_PER_FILE = 3;
+function formatFileHit(absPath, lineRanges, displayPath, matches) {
+  const display = displayPath(absPath);
+  if (lineRanges.length > 0) {
+    const shown = lineRanges.slice(0, MAX_RANGES_PER_FILE).map(([s, e]) => s === e ? `${s}` : `${s}-${e}`).join(",");
+    const fmt = lineRanges.length > MAX_RANGES_PER_FILE ? `${shown},\u2026` : shown;
+    return `${display}:${fmt}`;
+  }
+  return matches === void 0 ? display : `${display} (${matches})`;
+}
+function formatLookupSummary(results, bm25Files, displayPath) {
+  const nomicSummaries = results.filter((r) => r.source !== "bm25").map((r) => formatFileHit(r.path, r.lineRanges ?? [], displayPath, r.matches ?? 1));
+  const resultPaths = new Set(results.map((r) => r.path));
+  const bm25Summaries = [
+    ...results.filter((r) => r.source === "bm25").map((r) => formatFileHit(r.path, r.lineRanges ?? [], displayPath)),
+    // Raw keyword hits that never surfaced in the fused results — the files
+    // only the FTS5 side-car found.
+    ...bm25Files.filter((f) => !resultPaths.has(f.path)).slice(0, LOOKUP_TOP_K).map((f) => formatFileHit(f.path, f.lineRanges, displayPath))
+  ];
+  const parts = [];
+  if (nomicSummaries.length > 0) parts.push(`nomic (${nomicSummaries.join(",")})`);
+  if (bm25Summaries.length > 0) parts.push(`bm25 (${bm25Summaries.join(",")})`);
+  if (parts.length === 0) return "Knowledge lookup";
+  return `Knowledge lookup \u2014 ${parts.join(" \u2014 ")}`;
+}
+
 // src/index.ts
 function renderProgressBar(current, total, width = 24) {
   const filled = total > 0 ? Math.round(current / total * width) : width;
@@ -2052,15 +2106,15 @@ function index_default(pi) {
     }
     return absPath.replace(process.env.HOME || "", "~");
   }
-  const LOOKUP_TOP_K = 5;
   const LOOKUP_PREVIEW_CHARS = 600;
   pi.on("before_agent_start", async (event) => {
     if (!currentConfig?.autoInject) return;
     if (!index || index.size() === 0) return;
     if (!event.prompt.trim()) return;
     let results;
+    let bm25Files;
     try {
-      results = await index.search(event.prompt, LOOKUP_TOP_K);
+      ({ results, bm25Files } = await index.searchWithBm25(event.prompt, LOOKUP_TOP_K));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return {
@@ -2079,16 +2133,7 @@ function index_default(pi) {
 
 ${r.excerpt.slice(0, LOOKUP_PREVIEW_CHARS)}`;
     }).join("\n\n");
-    const fileSummaries = results.map((r) => {
-      const display = lookupDisplayPath(r.path);
-      const ranges = r.lineRanges ?? [];
-      if (ranges.length > 0) {
-        const fmt = ranges.map(([s, e]) => s === e ? `${s}` : `${s}-${e}`).join(",");
-        return `${display}:${fmt}`;
-      }
-      return `${display} (${r.matches ?? 1})`;
-    });
-    const summary = `Knowledge lookup \u2014 ${fileSummaries.join(", ")}`;
+    const summary = formatLookupSummary(results, bm25Files, lookupDisplayPath);
     return {
       message: {
         customType: "knowledge-lookup",

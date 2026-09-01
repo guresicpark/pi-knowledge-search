@@ -19,9 +19,15 @@ import {
   type ConfigFile,
 } from "./config.js";
 import { createEmbedder, EMBEDDING_MODEL, isTransformersModelCached } from "./embedder.js";
-import { KnowledgeIndex, type SyncProgress } from "./index-store.js";
+import {
+  KnowledgeIndex,
+  type Bm25FileHit,
+  type SearchResult,
+  type SyncProgress,
+} from "./index-store.js";
 import { buildOverview, formatOverview } from "./overview.js";
 import { resolveNote, readNote } from "./kb-reader.js";
+import { formatLookupSummary, LOOKUP_TOP_K } from "./lookup-summary.js";
 
 /** Render a 24-cell block progress bar (cyan filled / dim empty), like /rag's. */
 function renderProgressBar(current: number, total: number, width = 24): string {
@@ -140,7 +146,6 @@ export default function (pi: ExtensionAPI) {
    * into the system prompt — to keep the provider's KV cache valid and the
    * hits near the question.
    */
-  const LOOKUP_TOP_K = 5;
   const LOOKUP_PREVIEW_CHARS = 600;
 
   pi.on("before_agent_start", async (event) => {
@@ -148,11 +153,13 @@ export default function (pi: ExtensionAPI) {
     if (!index || index.size() === 0) return;
     if (!event.prompt.trim()) return;
 
-    let results;
+    let results: SearchResult[];
+    let bm25Files: Bm25FileHit[];
     try {
       // hybridSearch enforces the 0.1 minimum-score floor itself — weak,
-      // unrelated hits never come back here.
-      results = await index.search(event.prompt, LOOKUP_TOP_K);
+      // unrelated hits never come back here. `bm25Files` carries the raw
+      // FTS5 side-car hits (pre-fusion) for the summary's bm25 segment.
+      ({ results, bm25Files } = await index.searchWithBm25(event.prompt, LOOKUP_TOP_K));
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       return {
@@ -173,21 +180,9 @@ export default function (pi: ExtensionAPI) {
       })
       .join("\n\n");
 
-    // One-line summary for the TUI box: file (line ranges of every hit), e.g.
-    // "Knowledge lookup — event_dispatcher.rst:1-8,9-37,44-72, notes/a.md:12-25,60-72".
-    // Results are deduped to the best chunk per file, so each carries its
-    // file's full matching line ranges via `lineRanges`; fall back to the hit
-    // count when the stored entry predates line-range indexing.
-    const fileSummaries = results.map((r) => {
-      const display = lookupDisplayPath(r.path);
-      const ranges = r.lineRanges ?? [];
-      if (ranges.length > 0) {
-        const fmt = ranges.map(([s, e]) => (s === e ? `${s}` : `${s}-${e}`)).join(",");
-        return `${display}:${fmt}`;
-      }
-      return `${display} (${r.matches ?? 1})`;
-    });
-    const summary = `Knowledge lookup — ${fileSummaries.join(", ")}`;
+    // One-line summary for the TUI box, grouped per backend — see
+    // formatLookupSummary in lookup-summary.ts.
+    const summary = formatLookupSummary(results, bm25Files, lookupDisplayPath);
 
     return {
       message: {

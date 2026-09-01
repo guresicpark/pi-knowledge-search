@@ -1262,6 +1262,15 @@ ${chunkText}`;
    * Deduplicates so only the best chunk per file is returned.
    */
   async hybridSearch(query, limit, signal) {
+    return (await this.searchWithBm25(query, limit, signal)).results;
+  }
+  /**
+   * Hybrid search (see `hybridSearch`) that additionally returns the raw
+   * BM25 (FTS5 side-car) file hits harvested from the candidate set before
+   * fusion — the keyword-side view of the same query, so callers can show
+   * what pure keyword matching found alongside the blended ranking.
+   */
+  async searchWithBm25(query, limit, signal) {
     const ALPHA = 0.4;
     const MIN_HYBRID_SCORE = 0.4;
     const ftsCandidateLimit = Math.max(limit * 20, 200);
@@ -1296,7 +1305,19 @@ ${chunkText}`;
       ...ftsCandidates.map((c) => c.key),
       ...vectorSimilarityByKey.keys()
     ]);
-    if (candidateKeys.size === 0) return [];
+    const bm25RangesByFile = /* @__PURE__ */ new Map();
+    for (const c of ftsCandidates) {
+      const entry = this.data.entries[c.key];
+      if (!entry || typeof entry.startLine !== "number") continue;
+      const ranges = bm25RangesByFile.get(c.absPath) ?? [];
+      ranges.push([entry.startLine + 1, (entry.endLine ?? entry.startLine) + 1]);
+      bm25RangesByFile.set(c.absPath, ranges);
+    }
+    const bm25Files = [...bm25RangesByFile.entries()].map(([bm25Path, ranges]) => ({
+      path: bm25Path,
+      lineRanges: ranges.sort((a, b) => a[0] - b[0])
+    }));
+    if (candidateKeys.size === 0) return { results: [], bm25Files };
     const bm25ByKey = /* @__PURE__ */ new Map();
     if (ftsCandidates.length > 0) {
       let bm25Max = -Infinity;
@@ -1345,6 +1366,9 @@ ${chunkText}`;
       if (seen.has(absPath)) continue;
       seen.add(absPath);
       const finalScore = Math.min(score, 1);
+      const bm25Norm = bm25ByKey.get(key) ?? 0;
+      const sim = vectorSimilarityByKey.get(key) ?? 0;
+      const source = hasAnyVectors && (1 - ALPHA) * sim >= ALPHA * bm25Norm ? "vector" : "bm25";
       if (entry) {
         out.push({
           path: absPath,
@@ -1352,7 +1376,8 @@ ${chunkText}`;
           excerpt: entry.excerpt,
           heading: entry.heading,
           matches: matchesByFile.get(absPath) ?? 1,
-          lineRanges: (rangesByFile.get(absPath) ?? []).sort((a, b) => a[0] - b[0])
+          lineRanges: (rangesByFile.get(absPath) ?? []).sort((a, b) => a[0] - b[0]),
+          source
         });
       } else {
         out.push({
@@ -1361,12 +1386,13 @@ ${chunkText}`;
           excerpt: "",
           heading: "",
           matches: matchesByFile.get(absPath) ?? 1,
-          lineRanges: []
+          lineRanges: [],
+          source
         });
       }
       if (out.length >= limit) break;
     }
-    return out;
+    return { results: out, bm25Files };
   }
   /**
    * Update a single file in the index (called by watcher).

@@ -6,7 +6,13 @@ On session start, injects a folder+keyword overview of the indexed vault as a cu
 
 ## Knowledge lookup
 
-Like pi-local-rag's RAG lookup, every user prompt triggers an automatic **knowledge lookup**: the prompt runs through hybrid search (top 5 chunks, min score 0.1) and the hits are injected as a message right after the prompt — full excerpts for the model, and a green `Knowledge lookup — event_dispatcher.rst:1-8,9-37,44-72, …` summary box for you (red on failure). Each `file:start-end,…` entry lists the exact line ranges in that file where the hits live; a bare number is a single-line hit. Line ranges only appear on entries indexed by the current format (index version 4) — entries from an older-but-compatible index are kept as-is on load (no re-embedding) and fall back to a `file (n)` hit count until the file is next re-indexed.
+Like pi-local-rag's RAG lookup, every user prompt triggers an automatic **knowledge lookup**: the prompt runs through hybrid search (top 5 chunks, min score 0.1) and the hits are injected as a message right after the prompt — full excerpts for the model, and a green summary box for you (red on failure):
+
+```
+Knowledge lookup — nomic (event_dispatcher.rst:1-8,9-37,notes/a.md:12-25) — bm25 (dir/file1:2-10,dir2/file:22-50)
+```
+
+Each group lists `file:start-end,…` entries with the exact line ranges where the hits live; a bare number is a single-line hit. The **nomic** group holds the fused hits the vector side drove into the ranking; the **bm25** group holds the keyword side's view — hits the BM25 term dominated (e.g. exact error-code matches the embeddings treat as noise) plus files only the FTS5 side-car found. A group is omitted when empty, so a pure-keyword fallback renders as `Knowledge lookup — bm25 (…)`. Line ranges only appear on entries indexed by the current format (index version 4) — entries from an older-but-compatible index are kept as-is on load (no re-embedding) and fall back to a `file (n)` hit count until the file is next re-indexed.
 
 Injection is automatically enabled whenever the index holds vectors — at session start and after `/knowledge-search index` — so `/knowledge-search off` acts as a per-session kill-switch that the next startup flips back on (`autoInject` in the config).
 

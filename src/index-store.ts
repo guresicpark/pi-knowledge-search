@@ -63,6 +63,34 @@ export interface SearchResult {
    * entry predates line-range indexing (fall back to `matches`).
    */
   lineRanges: Array<[number, number]>;
+  /**
+   * Which backend drove this hit's ranking in the hybrid blend — `"vector"`
+   * when the cosine term contributed at least as much to the blended score
+   * as the normalized BM25 term, `"bm25"` otherwise. Always `"bm25"` in the
+   * pure-keyword fallback (no vectors). Undefined outside hybrid search
+   * (e.g. plain `vectorSearch()`).
+   */
+  source?: "vector" | "bm25";
+}
+
+/**
+ * A file hit by the FTS5 side-car (BM25 keyword search) before fusion — the
+ * keyword-side counterpart of `SearchResult`, without content. Lets callers
+ * show what pure keyword matching found alongside the fused ranking.
+ */
+export interface Bm25FileHit {
+  /** Absolute file path */
+  path: string;
+  /** 1-indexed inclusive line ranges of the BM25-matched chunks, sorted. */
+  lineRanges: Array<[number, number]>;
+}
+
+/** Result of `searchWithBm25` — fused hybrid hits plus the raw BM25 file hits. */
+export interface HybridSearchWithBm25 {
+  /** Fused (BM25 + vector) results, same as `hybridSearch()` returns. */
+  results: SearchResult[];
+  /** Files matched by the FTS5 side-car, best keyword match first. */
+  bm25Files: Bm25FileHit[];
 }
 
 /**
@@ -760,6 +788,20 @@ export class KnowledgeIndex {
     limit: number,
     signal?: AbortSignal,
   ): Promise<SearchResult[]> {
+    return (await this.searchWithBm25(query, limit, signal)).results;
+  }
+
+  /**
+   * Hybrid search (see `hybridSearch`) that additionally returns the raw
+   * BM25 (FTS5 side-car) file hits harvested from the candidate set before
+   * fusion — the keyword-side view of the same query, so callers can show
+   * what pure keyword matching found alongside the blended ranking.
+   */
+  async searchWithBm25(
+    query: string,
+    limit: number,
+    signal?: AbortSignal,
+  ): Promise<HybridSearchWithBm25> {
     const ALPHA = 0.4;
     // Floor on the blended score: anything below is treated as unrelated and
     // omitted entirely — a query with only one related file returns just that
@@ -810,7 +852,25 @@ export class KnowledgeIndex {
       ...ftsCandidates.map((c) => c.key),
       ...vectorSimilarityByKey.keys(),
     ]);
-    if (candidateKeys.size === 0) return [];
+
+    // Per-file BM25 hits, harvested straight from the ranked FTS candidates
+    // (best keyword match first — Map iteration preserves insertion order).
+    // These are the pre-fusion keyword hits, reported independently of the
+    // blended ranking so callers can show the FTS5 side-car's own view.
+    const bm25RangesByFile = new Map<string, Array<[number, number]>>();
+    for (const c of ftsCandidates) {
+      const entry = this.data.entries[c.key];
+      if (!entry || typeof entry.startLine !== "number") continue;
+      const ranges = bm25RangesByFile.get(c.absPath) ?? [];
+      ranges.push([entry.startLine + 1, (entry.endLine ?? entry.startLine) + 1]);
+      bm25RangesByFile.set(c.absPath, ranges);
+    }
+    const bm25Files: Bm25FileHit[] = [...bm25RangesByFile.entries()].map(([bm25Path, ranges]) => ({
+      path: bm25Path,
+      lineRanges: ranges.sort((a, b) => a[0] - b[0]),
+    }));
+
+    if (candidateKeys.size === 0) return { results: [], bm25Files };
 
     // Min-max normalize BM25 across the FTS candidate set (constant 1 when
     // every candidate ties, so ties stay rankable rather than zeroed).
@@ -879,6 +939,13 @@ export class KnowledgeIndex {
       if (seen.has(absPath)) continue;
       seen.add(absPath);
       const finalScore = Math.min(score, 1);
+      // Attribute the hit to whichever blend term contributed more — the
+      // vector cosine or the normalized BM25. In the pure-keyword fallback
+      // (no vectors at all) everything is BM25-driven by definition.
+      const bm25Norm = bm25ByKey.get(key) ?? 0;
+      const sim = vectorSimilarityByKey.get(key) ?? 0;
+      const source: "vector" | "bm25" =
+        hasAnyVectors && (1 - ALPHA) * sim >= ALPHA * bm25Norm ? "vector" : "bm25";
       if (entry) {
         out.push({
           path: absPath,
@@ -887,6 +954,7 @@ export class KnowledgeIndex {
           heading: entry.heading,
           matches: matchesByFile.get(absPath) ?? 1,
           lineRanges: (rangesByFile.get(absPath) ?? []).sort((a, b) => a[0] - b[0]),
+          source,
         });
       } else {
         // Vector-less — synthesise from whatever FTS has.
@@ -897,11 +965,12 @@ export class KnowledgeIndex {
           heading: "",
           matches: matchesByFile.get(absPath) ?? 1,
           lineRanges: [],
+          source,
         });
       }
       if (out.length >= limit) break;
     }
-    return out;
+    return { results: out, bm25Files };
   }
 
   /**
