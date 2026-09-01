@@ -1,7 +1,8 @@
 // src/index.ts
 import { Type } from "@sinclair/typebox";
 import { fork } from "node:child_process";
-import { join as join6 } from "node:path";
+import * as fs5 from "node:fs";
+import { join as join6, resolve as resolve2 } from "node:path";
 
 // src/config.ts
 import * as fs from "node:fs";
@@ -815,7 +816,7 @@ var KnowledgeIndex = class _KnowledgeIndex {
     if (chunks.length > 0) this.fts.upsertMany(chunks);
   }
   streamLoadJson(file) {
-    return new Promise((resolve2, reject) => {
+    return new Promise((resolve3, reject) => {
       const stream = fs2.createReadStream(file, { highWaterMark: 256 * 1024 });
       const parser = makeParser();
       const assembler = Assembler.connectTo(parser);
@@ -827,10 +828,10 @@ var KnowledgeIndex = class _KnowledgeIndex {
         else ok();
       };
       assembler.on("done", (asm) => {
-        settle(() => resolve2(asm.current));
+        settle(() => resolve3(asm.current));
       });
-      stream.on("error", (e) => settle(() => resolve2(null), () => reject(e)));
-      parser.on("error", (e) => settle(() => resolve2(null), () => reject(e)));
+      stream.on("error", (e) => settle(() => resolve3(null), () => reject(e)));
+      parser.on("error", (e) => settle(() => resolve3(null), () => reject(e)));
       stream.pipe(parser);
     });
   }
@@ -888,15 +889,15 @@ var KnowledgeIndex = class _KnowledgeIndex {
     stream.once("error", (err) => {
       streamError = err;
     });
-    const write = (chunk) => new Promise((resolve2, reject) => {
+    const write = (chunk) => new Promise((resolve3, reject) => {
       if (streamError) {
         reject(streamError);
         return;
       }
       if (stream.write(chunk)) {
-        resolve2();
+        resolve3();
       } else {
-        stream.once("drain", () => streamError ? reject(streamError) : resolve2());
+        stream.once("drain", () => streamError ? reject(streamError) : resolve3());
       }
     });
     try {
@@ -915,8 +916,8 @@ var KnowledgeIndex = class _KnowledgeIndex {
       stream.destroy();
       throw err;
     }
-    await new Promise((resolve2, reject) => {
-      stream.end((err) => err ? reject(err) : resolve2());
+    await new Promise((resolve3, reject) => {
+      stream.end((err) => err ? reject(err) : resolve3());
     });
   }
   scheduleSave() {
@@ -1983,63 +1984,214 @@ function index_default(pi) {
     workerExitExpected = true;
     await index?.close();
   });
-  pi.registerCommand("knowledge-search-setup", {
-    description: "Configure knowledge search directories and embedding provider",
-    handler: async (_args, ctx) => {
-      const dirsInput = await ctx.ui.input(
-        "Directories to index (comma-separated):",
-        "~/notes, ~/docs"
+  const KS_SUBCOMMANDS = [
+    { value: "add", label: "add", description: "Add directories to the index" },
+    { value: "exclude", label: "exclude", description: "Manage excluded directory names (-<name> removes)" },
+    { value: "index", label: "index", description: "Incrementally index new/changed files" },
+    { value: "help", label: "help", description: "Show all /knowledge-search commands" }
+  ];
+  function getSubcommandCompletions(prefix) {
+    const matches = KS_SUBCOMMANDS.filter((s) => s.value.startsWith(prefix)).map((s) => ({
+      value: s.value,
+      label: s.label,
+      description: s.description
+    }));
+    return matches.length > 0 ? matches : null;
+  }
+  function readRawConfig() {
+    try {
+      return JSON.parse(fs5.readFileSync(getConfigPath(sessionCwd), "utf-8"));
+    } catch {
+      return {};
+    }
+  }
+  function resolveUserPath(p) {
+    const home = process.env.HOME || "";
+    const expanded = p.startsWith("~") ? home + p.slice(1) : p;
+    return resolve2(sessionCwd ?? process.cwd(), expanded);
+  }
+  async function ensureIndexLoaded() {
+    if (index) return;
+    const embedder = currentConfig?.provider ? createEmbedder(currentConfig.provider, currentConfig.dimensions) : null;
+    index = new KnowledgeIndex(currentConfig, embedder);
+    await index.load();
+  }
+  function renderStatusWidget(ctx) {
+    const theme = ctx.ui.theme;
+    const label = (text) => theme.fg("dim", text.padEnd(20));
+    const lines = [theme.bold("pi-knowledge-search"), ""];
+    lines.push("  " + label("Embedding engine:") + (currentConfig?.provider ? theme.fg("success", currentConfig.provider.model) + theme.fg("dim", "  (local ONNX via Transformers.js)") : theme.fg("warning", "none") + theme.fg("dim", "  (FTS-only keyword search)")));
+    if (index) {
+      lines.push("  " + label("Indexed:") + theme.fg("success", `${index.size()} files \xB7 ${index.chunkCount()} chunks`));
+    } else {
+      lines.push("  " + label("Indexed:") + theme.fg("dim", "0 files (run /knowledge-search index)"));
+    }
+    lines.push("", "  " + theme.bold("Directories indexed:"));
+    const dirs = currentConfig?.dirs ?? [];
+    if (dirs.length) {
+      for (const dir of dirs) lines.push("    " + theme.fg("muted", dir));
+    } else {
+      lines.push("    " + theme.fg("dim", "(none \u2014 add with /knowledge-search add <dir>)"));
+    }
+    lines.push("", "  " + theme.bold("Excluded directories:"));
+    const excludes = currentConfig?.excludeDirs ?? [];
+    if (excludes.length) {
+      for (const name of excludes) lines.push("    " + theme.fg("muted", name));
+    } else {
+      lines.push("    " + theme.fg("dim", "(none \u2014 add with /knowledge-search exclude <name>)"));
+    }
+    lines.push("", "  " + theme.bold("File extensions:"));
+    const exts = currentConfig?.fileExtensions ?? [];
+    lines.push("    " + theme.fg("muted", exts.join(" ")));
+    lines.push(
+      "",
+      "  " + label("Config:") + theme.fg("dim", getConfigPath(sessionCwd)),
+      "  " + label("Index:") + theme.fg("dim", currentConfig?.indexDir ?? "")
+    );
+    ctx.ui.setWidget("knowledge-search-status", lines);
+  }
+  async function handleAdd(parts, ctx) {
+    const raw = parts.slice(1).join(" ").split(/[\s,]+/).map((p) => p.trim()).filter(Boolean);
+    if (raw.length === 0) {
+      ctx.ui.notify("Usage: /knowledge-search add <dir> [<dir>...]", "warning");
+      return;
+    }
+    const resolved = raw.map(resolveUserPath);
+    for (const dir of resolved) {
+      if (!fs5.existsSync(dir)) {
+        ctx.ui.notify(`Path not found: ${dir}`, "error");
+        return;
+      }
+    }
+    const file = readRawConfig();
+    const dirs = /* @__PURE__ */ new Set([...file.dirs ?? [], ...resolved]);
+    const before = file.dirs?.length ?? 0;
+    file.dirs = [...dirs];
+    if (!file.provider && before === 0) {
+      file.provider = { type: "transformers" };
+    }
+    saveConfig(file, sessionCwd);
+    const added = resolved.filter((d) => !(currentConfig?.dirs ?? []).includes(d));
+    if (currentConfig) {
+      currentConfig.dirs = [...dirs];
+      if (!currentConfig.provider && file.provider) currentConfig.provider = { type: "transformers", model: "nomic-ai/nomic-embed-text-v1.5" };
+    } else {
+      currentConfig = loadConfig(sessionCwd);
+    }
+    const newCount = added.length;
+    ctx.ui.notify(
+      `Added ${newCount} director${newCount === 1 ? "y" : "ies"} \xB7 ${dirs.size} total. Run /knowledge-search index to index them.`,
+      "info"
+    );
+  }
+  function handleExclude(parts, ctx) {
+    const expression = parts.slice(1).join(" ").trim();
+    const file = readRawConfig();
+    if (!expression) {
+      const excludes2 = file.excludeDirs ?? [];
+      if (!excludes2.length) {
+        ctx.ui.notify("No excluded directories. Add one with: /knowledge-search exclude <name>", "info");
+        return;
+      }
+      const theme = ctx.ui.theme;
+      const lines = [theme.bold(`Excluded directories (${excludes2.length})`), ""];
+      for (const name of excludes2) lines.push("  " + theme.fg("muted", name));
+      lines.push("", theme.fg("dim", "Remove with: /knowledge-search exclude -<name>"));
+      ctx.ui.setWidget("knowledge-search-exclude", lines);
+      return;
+    }
+    if (expression.startsWith("-")) {
+      const target = expression.slice(1);
+      const before = (file.excludeDirs ?? []).length;
+      file.excludeDirs = (file.excludeDirs ?? []).filter((n) => n !== target);
+      if ((file.excludeDirs ?? []).length === before) {
+        ctx.ui.notify(`Not excluded: ${target}`, "warning");
+        return;
+      }
+      saveConfig(file, sessionCwd);
+      if (currentConfig) currentConfig.excludeDirs = file.excludeDirs;
+      ctx.ui.notify(
+        `Removed exclude: ${target} \xB7 ${file.excludeDirs.length} remain. Run /knowledge-search index to re-apply.`,
+        "info"
       );
-      if (!dirsInput) {
-        ctx.ui.notify("Setup cancelled.", "info");
-        return;
-      }
-      const dirs = dirsInput.split(",").map((d) => d.trim()).filter(Boolean);
-      if (dirs.length === 0) {
-        ctx.ui.notify("No directories specified.", "warning");
-        return;
-      }
-      const extsInput = await ctx.ui.input("File extensions to index:", ".md, .txt");
-      const fileExtensions = (extsInput || ".md, .txt").split(",").map((e) => e.trim()).filter(Boolean);
-      const excludeInput = await ctx.ui.input(
-        "Directory names to exclude:",
-        "node_modules, .git, .obsidian, .trash"
+      return;
+    }
+    const excludes = file.excludeDirs ?? [];
+    if (excludes.includes(expression)) {
+      ctx.ui.notify(`Already excluded: ${expression}`, "warning");
+      return;
+    }
+    excludes.push(expression);
+    file.excludeDirs = excludes;
+    saveConfig(file, sessionCwd);
+    if (currentConfig) currentConfig.excludeDirs = excludes;
+    ctx.ui.notify(
+      `Added exclude: ${expression} \xB7 ${excludes.length} total. Run /knowledge-search index to re-apply.`,
+      "info"
+    );
+  }
+  async function handleIndex(ctx) {
+    if (!currentConfig || currentConfig.dirs.length === 0) {
+      ctx.ui.notify("No directories configured. Run /knowledge-search add <dir> first.", "warning");
+      return;
+    }
+    try {
+      await ensureIndexLoaded();
+      ctx.ui.notify("Indexing (incremental)...", "info");
+      const { added, updated, removed } = await index.sync();
+      syncDone = true;
+      const changed = added + updated + removed;
+      ctx.ui.notify(
+        changed === 0 ? `\u2705 Up to date \xB7 ${index.size()} files (${index.chunkCount()} chunks) indexed` : `\u2705 Indexed ${added} new \xB7 ${updated} changed \xB7 ${removed} removed \xB7 ${index.size()} files (${index.chunkCount()} chunks) total`,
+        "info"
       );
-      const excludeDirs = (excludeInput || "node_modules, .git, .obsidian, .trash").split(",").map((d) => d.trim()).filter(Boolean);
-      const providerChoice = await ctx.ui.select("Embedding engine:", [
-        "none \u2014 FTS-only keyword search (zero-config, no model download)",
-        "transformers \u2014 Local ONNX via Transformers.js (nomic-embed-text-v1.5, no API key)"
-      ]);
-      if (!providerChoice) {
-        ctx.ui.notify("Setup cancelled.", "info");
+    } catch (err) {
+      ctx.ui.notify(`Index failed: ${err.message}`, "error");
+    }
+  }
+  function handleHelp(ctx) {
+    const theme = ctx.ui.theme;
+    const lines = [theme.bold("/knowledge-search commands"), ""];
+    for (const s of KS_SUBCOMMANDS) {
+      lines.push("  " + theme.fg("accent", s.label.padEnd(10)) + theme.fg("dim", s.description));
+    }
+    lines.push("", theme.fg("dim", "Bare /knowledge-search shows the current status."));
+    ctx.ui.setWidget("knowledge-search-help", lines);
+  }
+  let statusWidgetVisible = false;
+  pi.registerCommand("knowledge-search", {
+    description: "knowledge-search: (status) | add <dir> | exclude <name> | index | help",
+    getArgumentCompletions: (prefix) => getSubcommandCompletions(prefix),
+    handler: async (args, ctx) => {
+      const parts = (args || "").trim().split(/\s+/);
+      const subcommand = parts[0] || "";
+      if (subcommand === "add") {
+        await handleAdd(parts, ctx);
         return;
       }
-      const providerType = providerChoice.split(" ")[0];
-      let configFile;
-      switch (providerType) {
-        case "none": {
-          configFile = { dirs, fileExtensions, excludeDirs };
-          break;
-        }
-        case "transformers": {
-          const model = await ctx.ui.input(
-            "Model:",
-            "nomic-ai/nomic-embed-text-v1.5"
-          );
-          configFile = {
-            dirs,
-            fileExtensions,
-            excludeDirs,
-            provider: {
-              type: "transformers",
-              model: model || "nomic-ai/nomic-embed-text-v1.5"
-            }
-          };
-          break;
-        }
+      if (subcommand === "exclude") {
+        handleExclude(parts, ctx);
+        return;
       }
-      saveConfig(configFile, sessionCwd);
-      ctx.ui.notify(`Config saved to ${getConfigPath(sessionCwd)}. Run /reload to activate.`, "info");
+      if (subcommand === "index") {
+        await handleIndex(ctx);
+        return;
+      }
+      if (subcommand === "help") {
+        handleHelp(ctx);
+        return;
+      }
+      if (subcommand) {
+        ctx.ui.notify(`Unknown /knowledge-search command: ${subcommand}. Try /knowledge-search help`, "error");
+        return;
+      }
+      if (statusWidgetVisible) {
+        statusWidgetVisible = false;
+        ctx.ui.setWidget("knowledge-search-status", void 0);
+        return;
+      }
+      renderStatusWidget(ctx);
+      statusWidgetVisible = true;
     }
   });
   pi.registerCommand("knowledge-overview", {
@@ -2061,25 +2213,6 @@ function index_default(pi) {
       }
     }
   });
-  pi.registerCommand("knowledge-reindex", {
-    description: "Force full re-index of all configured knowledge directories",
-    handler: async (_args, ctx) => {
-      if (!index) {
-        ctx.ui.notify("Not configured. Run /knowledge-search-setup first.", "warning");
-        return;
-      }
-      ctx.ui.notify("Re-indexing...", "info");
-      try {
-        await index.rebuild();
-        ctx.ui.notify(
-          `Re-indexed: ${index.size()} files (${index.chunkCount()} chunks)`,
-          "info"
-        );
-      } catch (err) {
-        ctx.ui.notify(`Re-index failed: ${err.message}`, "error");
-      }
-    }
-  });
   const searchParams = Type.Object({
     query: Type.String({ description: "Natural language search query" }),
     limit: Type.Optional(
@@ -2098,7 +2231,7 @@ function index_default(pi) {
     parameters: searchParams,
     async execute(toolCallId, params, signal) {
       if (!index || index.size() === 0) {
-        const msg = !index ? "knowledge-search is not configured. The user can run /knowledge-search-setup to set it up." : !syncDone ? "Index is still syncing in the background. Try again in a moment." : "Index is empty.";
+        const msg = !index ? "knowledge-search is not configured. The user can run /knowledge-search add <dir> to set it up." : !syncDone ? "Index is still syncing in the background. Try again in a moment." : "Index is empty.";
         return { content: [{ type: "text", text: msg }], details: {} };
       }
       const limit = Math.min(params.limit ?? 8, 20);
@@ -2158,7 +2291,7 @@ ${r.excerpt}`;
     parameters: readParams,
     async execute(_toolCallId, params) {
       if (!index || index.size() === 0) {
-        const msg = !index ? "knowledge-search is not configured. Run /knowledge-search-setup to set it up." : !syncDone ? "Index is still syncing in the background. Try again in a moment." : "Index is empty.";
+        const msg = !index ? "knowledge-search is not configured. Run /knowledge-search add <dir> to set it up." : !syncDone ? "Index is still syncing in the background. Try again in a moment." : "Index is empty.";
         return { content: [{ type: "text", text: msg }], details: {} };
       }
       const result = resolveNote(params.name, index.listFiles(), {

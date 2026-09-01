@@ -65,20 +65,17 @@ Requires **Node 24+** — `node:sqlite` must include FTS5, which Node 22's bundl
 
 ## Setup
 
-Run the interactive setup command inside pi:
+Everything is driven by the `/knowledge-search` command (mirroring pi-local-rag's `/rag`):
 
 ```
-/knowledge-search-setup
+/knowledge-search                 # show status: indexed dirs, excludes, extensions, engine
+/knowledge-search add ~/notes     # add directories to index (space- or comma-separated)
+/knowledge-search exclude build   # add an excluded directory name (-<name> removes, bare lists)
+/knowledge-search index           # incrementally index new/changed files
+/knowledge-search help            # list all subcommands
 ```
 
-This walks you through:
-
-1. **Directories** to index (comma-separated paths)
-2. **File extensions** to include (default: `.md, .txt`)
-3. **Directories to exclude** (default: `node_modules, .git, .obsidian, .trash`)
-4. **Embedding engine** — local Transformers.js (ONNX), or none for pure FTS-only keyword search
-
-Config is saved to `{cwd}/.pi/knowledge-search.json` — project-local, relative to the directory pi was started in. Run `/reload` to activate.
+The first `add` on a fresh config defaults the embedding engine to local Transformers.js. Config is saved to `{cwd}/.pi/knowledge-search.json` — project-local, relative to the directory pi was started in. Directories added mid-session are picked up by `/knowledge-search index` without a reload.
 
 ### Config file
 
@@ -120,17 +117,20 @@ Every config field can be overridden via environment variables. This is useful f
 2. Registers a `knowledge_search` tool the LLM calls with natural language queries
 3. Returns ranked results with file paths, relevance scores, and content excerpts
 
-Sync runs on session startup only. Files changed mid-session won't be searchable until the next session start or a manual `/knowledge-reindex`.
+Sync runs on session startup. Files changed mid-session can be picked up with `/knowledge-search index`.
 
 The index is stored at `{cwd}/.pi/knowledge-search/index.json` (project-local; see [Project-local storage](#project-local-storage)).
 
 ## Commands
 
-| Command                   | Description                                     |
-| ------------------------- | ----------------------------------------------- |
-| `/knowledge-search-setup` | Interactive setup wizard                        |
-| `/knowledge-overview`     | Force-rebuild and re-inject the vault overview  |
-| `/knowledge-reindex`      | Force a full re-index                           |
+| Command                              | Description                                          |
+| ------------------------------------ | ---------------------------------------------------- |
+| `/knowledge-search`                  | Show status: dirs, excludes, extensions, engine      |
+| `/knowledge-search add <dir>`        | Add directories to the index                         |
+| `/knowledge-search exclude <name>`   | Manage excluded directory names (`-<name>` removes)  |
+| `/knowledge-search index`            | Incrementally index new/changed files                |
+| `/knowledge-search help`             | List all subcommands                                 |
+| `/knowledge-overview`                | Force-rebuild and re-inject the vault overview       |
 
 ## Performance
 
@@ -163,7 +163,7 @@ To relocate them elsewhere within a project, add the following to `{project}/.pi
 2. `pi-knowledge-search.localPath` in `{cwd}/.pi/settings.json`
 3. Project default: `{cwd}/.pi/knowledge-search.json` + `{cwd}/.pi/knowledge-search/`
 
-**Migration from the global config:** versions prior to this change stored config at `~/.pi/knowledge-search.json` and the index at `~/.pi/knowledge-search/`. That location is no longer read — move the files into your project's `.pi/` directory to migrate, or re-run `/knowledge-search-setup` in the project.
+**Migration from the global config:** versions prior to this change stored config at `~/.pi/knowledge-search.json` and the index at `~/.pi/knowledge-search/`. That location is no longer read — move the files into your project's `.pi/` directory to migrate, or re-run `/knowledge-search add <dir>` in the project.
 
 ## License
 

@@ -1,7 +1,12 @@
-import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionCommandContext,
+  SessionEntry,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { fork } from "node:child_process";
-import { join } from "node:path";
+import * as fs from "node:fs";
+import { join, resolve } from "node:path";
 import { loadConfig, saveConfig, getConfigPath, type Config, type ConfigFile } from "./config.js";
 import { createEmbedder } from "./embedder.js";
 import { KnowledgeIndex } from "./index-store.js";
@@ -241,96 +246,286 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ------------------------------------------------------------------
-  // Setup command
+  // /knowledge-search command: status (bare, toggling), add, exclude,
+  // index (incremental), and help.
   // ------------------------------------------------------------------
 
-  pi.registerCommand("knowledge-search-setup", {
-    description: "Configure knowledge search directories and embedding provider",
-    handler: async (_args, ctx) => {
-      // Step 1: Directories
-      const dirsInput = await ctx.ui.input(
-        "Directories to index (comma-separated):",
-        "~/notes, ~/docs"
+  /** Subcommand table for autocomplete and /knowledge-search help. */
+  const KS_SUBCOMMANDS: { value: string; label: string; description: string }[] = [
+    { value: "add", label: "add", description: "Add directories to the index" },
+    { value: "exclude", label: "exclude", description: "Manage excluded directory names (-<name> removes)" },
+    { value: "index", label: "index", description: "Incrementally index new/changed files" },
+    { value: "help", label: "help", description: "Show all /knowledge-search commands" },
+  ];
+
+  function getSubcommandCompletions(prefix: string) {
+    const matches = KS_SUBCOMMANDS.filter((s) => s.value.startsWith(prefix)).map((s) => ({
+      value: s.value,
+      label: s.label,
+      description: s.description,
+    }));
+    return matches.length > 0 ? matches : null;
+  }
+
+  /**
+   * Read the raw config file (preserving unknown fields), or an empty
+   * object when missing/corrupt — the base for add/exclude mutations.
+   */
+  function readRawConfig(): ConfigFile & Record<string, unknown> {
+    try {
+      return JSON.parse(fs.readFileSync(getConfigPath(sessionCwd), "utf-8"));
+    } catch {
+      return {};
+    }
+  }
+
+  /** Expand ~ and resolve a user-typed path against the session cwd. */
+  function resolveUserPath(p: string): string {
+    const home = process.env.HOME || "";
+    const expanded = p.startsWith("~") ? home + p.slice(1) : p;
+    return resolve(sessionCwd ?? process.cwd(), expanded);
+  }
+
+  /**
+   * Ensure an in-memory KnowledgeIndex exists for the current config.
+   * Mutating `currentConfig` in place keeps an existing index's config
+   * reference in sync; a fresh index is only built when there was none
+   * (e.g. the session started unconfigured and `add` just created one).
+   */
+  async function ensureIndexLoaded(): Promise<void> {
+    if (index) return;
+    const embedder = currentConfig?.provider
+      ? createEmbedder(currentConfig.provider, currentConfig.dimensions)
+      : null;
+    index = new KnowledgeIndex(currentConfig!, embedder);
+    await index.load();
+  }
+
+  /** Bare-command status widget, mirroring /rag's layout. */
+  function renderStatusWidget(ctx: ExtensionCommandContext): void {
+    const theme = ctx.ui.theme;
+    const label = (text: string) => theme.fg("dim", text.padEnd(20));
+    const lines: string[] = [theme.bold("pi-knowledge-search"), ""];
+
+    lines.push("  " + label("Embedding engine:") + (currentConfig?.provider
+      ? theme.fg("success", currentConfig.provider.model) + theme.fg("dim", "  (local ONNX via Transformers.js)")
+      : theme.fg("warning", "none") + theme.fg("dim", "  (FTS-only keyword search)")));
+
+    if (index) {
+      lines.push("  " + label("Indexed:") + theme.fg("success", `${index.size()} files · ${index.chunkCount()} chunks`));
+    } else {
+      lines.push("  " + label("Indexed:") + theme.fg("dim", "0 files (run /knowledge-search index)"));
+    }
+
+    lines.push("", "  " + theme.bold("Directories indexed:"));
+    const dirs = currentConfig?.dirs ?? [];
+    if (dirs.length) {
+      for (const dir of dirs) lines.push("    " + theme.fg("muted", dir));
+    } else {
+      lines.push("    " + theme.fg("dim", "(none — add with /knowledge-search add <dir>)"));
+    }
+
+    lines.push("", "  " + theme.bold("Excluded directories:"));
+    const excludes = currentConfig?.excludeDirs ?? [];
+    if (excludes.length) {
+      for (const name of excludes) lines.push("    " + theme.fg("muted", name));
+    } else {
+      lines.push("    " + theme.fg("dim", "(none — add with /knowledge-search exclude <name>)"));
+    }
+
+    lines.push("", "  " + theme.bold("File extensions:"));
+    const exts = currentConfig?.fileExtensions ?? [];
+    lines.push("    " + theme.fg("muted", exts.join(" ")));
+
+    lines.push(
+      "",
+      "  " + label("Config:") + theme.fg("dim", getConfigPath(sessionCwd)),
+      "  " + label("Index:") + theme.fg("dim", currentConfig?.indexDir ?? ""),
+    );
+
+    ctx.ui.setWidget("knowledge-search-status", lines);
+  }
+
+  /** /knowledge-search add <dir> [<dir>...] — track directories to index. */
+  async function handleAdd(parts: string[], ctx: ExtensionCommandContext): Promise<void> {
+    const raw = parts
+      .slice(1)
+      .join(" ")
+      .split(/[\s,]+/)
+      .map((p) => p.trim())
+      .filter(Boolean);
+
+    if (raw.length === 0) {
+      ctx.ui.notify("Usage: /knowledge-search add <dir> [<dir>...]", "warning");
+      return;
+    }
+
+    const resolved = raw.map(resolveUserPath);
+    for (const dir of resolved) {
+      if (!fs.existsSync(dir)) {
+        ctx.ui.notify(`Path not found: ${dir}`, "error");
+        return;
+      }
+    }
+
+    const file = readRawConfig();
+    const dirs = new Set([...(file.dirs ?? []), ...resolved]);
+    const before = file.dirs?.length ?? 0;
+    file.dirs = [...dirs];
+
+    // Fresh configs default to the local ONNX engine; an existing provider
+    // block (or its absence, FTS-only) is preserved as-is.
+    if (!file.provider && before === 0) {
+      file.provider = { type: "transformers" };
+    }
+
+    saveConfig(file as ConfigFile, sessionCwd);
+
+    // Keep the in-session config/index in sync so a follow-up `index`
+    // picks the new dirs up without a reload.
+    const added = resolved.filter((d) => !(currentConfig?.dirs ?? []).includes(d));
+    if (currentConfig) {
+      currentConfig.dirs = [...dirs];
+      if (!currentConfig.provider && file.provider) currentConfig.provider = { type: "transformers", model: "nomic-ai/nomic-embed-text-v1.5" };
+    } else {
+      currentConfig = loadConfig(sessionCwd);
+    }
+
+    const newCount = added.length;
+    ctx.ui.notify(
+      `Added ${newCount} director${newCount === 1 ? "y" : "ies"} · ${dirs.size} total. Run /knowledge-search index to index them.`,
+      "info"
+    );
+  }
+
+  /** /knowledge-search exclude [<name>|-<name>] — manage excluded directory names. */
+  function handleExclude(parts: string[], ctx: ExtensionCommandContext): void {
+    const expression = parts.slice(1).join(" ").trim();
+    const file = readRawConfig();
+
+    if (!expression) {
+      const excludes = file.excludeDirs ?? [];
+      if (!excludes.length) {
+        ctx.ui.notify("No excluded directories. Add one with: /knowledge-search exclude <name>", "info");
+        return;
+      }
+      const theme = ctx.ui.theme;
+      const lines: string[] = [theme.bold(`Excluded directories (${excludes.length})`), ""];
+      for (const name of excludes) lines.push("  " + theme.fg("muted", name));
+      lines.push("", theme.fg("dim", "Remove with: /knowledge-search exclude -<name>"));
+      ctx.ui.setWidget("knowledge-search-exclude", lines);
+      return;
+    }
+
+    if (expression.startsWith("-")) {
+      const target = expression.slice(1);
+      const before = (file.excludeDirs ?? []).length;
+      file.excludeDirs = (file.excludeDirs ?? []).filter((n) => n !== target);
+      if ((file.excludeDirs ?? []).length === before) {
+        ctx.ui.notify(`Not excluded: ${target}`, "warning");
+        return;
+      }
+      saveConfig(file as ConfigFile, sessionCwd);
+      if (currentConfig) currentConfig.excludeDirs = file.excludeDirs!;
+      ctx.ui.notify(
+        `Removed exclude: ${target} · ${file.excludeDirs!.length} remain. Run /knowledge-search index to re-apply.`,
+        "info"
       );
-      if (!dirsInput) {
-        ctx.ui.notify("Setup cancelled.", "info");
-        return;
-      }
+      return;
+    }
 
-      const dirs = dirsInput
-        .split(",")
-        .map((d: string) => d.trim())
-        .filter(Boolean);
+    const excludes = file.excludeDirs ?? [];
+    if (excludes.includes(expression)) {
+      ctx.ui.notify(`Already excluded: ${expression}`, "warning");
+      return;
+    }
+    excludes.push(expression);
+    file.excludeDirs = excludes;
+    saveConfig(file as ConfigFile, sessionCwd);
+    if (currentConfig) currentConfig.excludeDirs = excludes;
+    ctx.ui.notify(
+      `Added exclude: ${expression} · ${excludes.length} total. Run /knowledge-search index to re-apply.`,
+      "info"
+    );
+  }
 
-      if (dirs.length === 0) {
-        ctx.ui.notify("No directories specified.", "warning");
-        return;
-      }
-
-      // Step 2: File extensions
-      const extsInput = await ctx.ui.input("File extensions to index:", ".md, .txt");
-      const fileExtensions = (extsInput || ".md, .txt")
-        .split(",")
-        .map((e: string) => e.trim())
-        .filter(Boolean);
-
-      // Step 3: Exclude directories
-      const excludeInput = await ctx.ui.input(
-        "Directory names to exclude:",
-        "node_modules, .git, .obsidian, .trash"
+  /** /knowledge-search index — incremental sync of new/changed files. */
+  async function handleIndex(ctx: ExtensionCommandContext): Promise<void> {
+    if (!currentConfig || currentConfig.dirs.length === 0) {
+      ctx.ui.notify("No directories configured. Run /knowledge-search add <dir> first.", "warning");
+      return;
+    }
+    try {
+      await ensureIndexLoaded();
+      ctx.ui.notify("Indexing (incremental)...", "info");
+      const { added, updated, removed } = await index!.sync();
+      syncDone = true;
+      const changed = added + updated + removed;
+      ctx.ui.notify(
+        changed === 0
+          ? `✅ Up to date · ${index!.size()} files (${index!.chunkCount()} chunks) indexed`
+          : `✅ Indexed ${added} new · ${updated} changed · ${removed} removed · ${index!.size()} files (${index!.chunkCount()} chunks) total`,
+        "info"
       );
-      const excludeDirs = (excludeInput || "node_modules, .git, .obsidian, .trash")
-        .split(",")
-        .map((d: string) => d.trim())
-        .filter(Boolean);
+    } catch (err: any) {
+      ctx.ui.notify(`Index failed: ${err.message}`, "error");
+    }
+  }
 
-      // Step 4: Embedding engine — local ONNX, or none for pure keyword search
-      const providerChoice = await ctx.ui.select("Embedding engine:", [
-        "none — FTS-only keyword search (zero-config, no model download)",
-        "transformers — Local ONNX via Transformers.js (nomic-embed-text-v1.5, no API key)",
-      ]);
+  /** /knowledge-search help — subcommand list widget. */
+  function handleHelp(ctx: ExtensionCommandContext): void {
+    const theme = ctx.ui.theme;
+    const lines: string[] = [theme.bold("/knowledge-search commands"), ""];
+    for (const s of KS_SUBCOMMANDS) {
+      lines.push("  " + theme.fg("accent", s.label.padEnd(10)) + theme.fg("dim", s.description));
+    }
+    lines.push("", theme.fg("dim", "Bare /knowledge-search shows the current status."));
+    ctx.ui.setWidget("knowledge-search-help", lines);
+  }
 
-      if (!providerChoice) {
-        ctx.ui.notify("Setup cancelled.", "info");
+  let statusWidgetVisible = false;
+
+  pi.registerCommand("knowledge-search", {
+    description: "knowledge-search: (status) | add <dir> | exclude <name> | index | help",
+    getArgumentCompletions: (prefix: string) => getSubcommandCompletions(prefix),
+    handler: async (args, ctx) => {
+      const parts = (args || "").trim().split(/\s+/);
+      const subcommand = parts[0] || "";
+
+      if (subcommand === "add") {
+        await handleAdd(parts, ctx);
+        return;
+      }
+      if (subcommand === "exclude") {
+        handleExclude(parts, ctx);
+        return;
+      }
+      if (subcommand === "index") {
+        await handleIndex(ctx);
+        return;
+      }
+      if (subcommand === "help") {
+        handleHelp(ctx);
+        return;
+      }
+      if (subcommand) {
+        ctx.ui.notify(`Unknown /knowledge-search command: ${subcommand}. Try /knowledge-search help`, "error");
         return;
       }
 
-      const providerType = providerChoice.split(" ")[0] as "none" | "transformers";
-
-      let configFile: ConfigFile;
-
-      switch (providerType) {
-        case "none": {
-          // FTS-only: no provider, keyword search via SQLite FTS5.
-          configFile = { dirs, fileExtensions, excludeDirs };
-          break;
-        }
-        case "transformers": {
-          const model = await ctx.ui.input(
-            "Model:",
-            "nomic-ai/nomic-embed-text-v1.5"
-          );
-          configFile = {
-            dirs,
-            fileExtensions,
-            excludeDirs,
-            provider: {
-              type: "transformers",
-              model: model || "nomic-ai/nomic-embed-text-v1.5",
-            },
-          };
-          break;
-        }
+      // Bare /knowledge-search toggles the status widget (like /rag).
+      if (statusWidgetVisible) {
+        statusWidgetVisible = false;
+        ctx.ui.setWidget("knowledge-search-status", undefined);
+        return;
       }
-
-      // Save and confirm
-      saveConfig(configFile!, sessionCwd);
-      ctx.ui.notify(`Config saved to ${getConfigPath(sessionCwd)}. Run /reload to activate.`, "info");
+      renderStatusWidget(ctx);
+      statusWidgetVisible = true;
     },
   });
 
   // ------------------------------------------------------------------
-  // Reindex command
+  // Overview command
   // ------------------------------------------------------------------
 
   pi.registerCommand("knowledge-overview", {
@@ -350,26 +545,6 @@ export default function (pi: ExtensionAPI) {
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         ctx.ui.notify(`Overview injection failed: ${msg}`, "error");
-      }
-    },
-  });
-
-  pi.registerCommand("knowledge-reindex", {
-    description: "Force full re-index of all configured knowledge directories",
-    handler: async (_args, ctx) => {
-      if (!index) {
-        ctx.ui.notify("Not configured. Run /knowledge-search-setup first.", "warning");
-        return;
-      }
-      ctx.ui.notify("Re-indexing...", "info");
-      try {
-        await index.rebuild();
-        ctx.ui.notify(
-          `Re-indexed: ${index.size()} files (${index.chunkCount()} chunks)`,
-          "info"
-        );
-      } catch (err: any) {
-        ctx.ui.notify(`Re-index failed: ${err.message}`, "error");
       }
     },
   });
@@ -401,7 +576,7 @@ export default function (pi: ExtensionAPI) {
       if (!index || index.size() === 0) {
         const msg =
           !index
-            ? "knowledge-search is not configured. The user can run /knowledge-search-setup to set it up."
+            ? "knowledge-search is not configured. The user can run /knowledge-search add <dir> to set it up."
             : !syncDone
               ? "Index is still syncing in the background. Try again in a moment."
               : "Index is empty.";
@@ -480,7 +655,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params) {
       if (!index || index.size() === 0) {
         const msg = !index
-          ? "knowledge-search is not configured. Run /knowledge-search-setup to set it up."
+          ? "knowledge-search is not configured. Run /knowledge-search add <dir> to set it up."
           : !syncDone
             ? "Index is still syncing in the background. Try again in a moment."
             : "Index is empty.";
