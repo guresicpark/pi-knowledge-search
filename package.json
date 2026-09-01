@@ -29,7 +29,7 @@
   },
   "overrides": {
     "adm-zip": "^0.6.0",
-    "sharp": "^0.35.0"
+    "sharp": "0.35.3"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
