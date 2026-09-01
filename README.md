@@ -11,7 +11,7 @@ Every query runs against two backends in parallel and fuses the results via Reci
 - **Vector cosine similarity** — good for conceptual/fuzzy queries ("how did we handle X")
 - **BM25 full-text** via SQLite FTS5 — good for exact matches, proper nouns, error strings, file paths, code identifiers
 
-Docs that both backends agree on get boosted; either backend alone still surfaces relevant hits. If the embedder fails transiently, search falls back to pure BM25; if the FTS side-car is empty, it falls back to pure vector. Existing users upgrade seamlessly — the FTS side-car is backfilled from the vector index on first load with no re-embedding needed.
+Docs that both backends agree on get boosted; either backend alone still surfaces relevant hits. If the embedder fails transiently, search falls back to pure BM25; if the FTS side-car is empty, it falls back to pure vector. Existing vector indexes upgrade with a one-time full re-embed (the index now records which engine built its vectors — see [Embedding-engine changes](#embedding-engine-changes-remove-existing-embeddings)); FTS-only installs upgrade seamlessly with no re-embedding.
 
 ## Tools
 
@@ -84,7 +84,7 @@ This walks you through:
 1. **Directories** to index (comma-separated paths)
 2. **File extensions** to include (default: `.md, .txt`)
 3. **Directories to exclude** (default: `node_modules, .git, .obsidian, .trash`)
-4. **Embedding provider** — OpenAI, OpenAI-compatible (local/self-hosted), AWS Bedrock, or Ollama
+4. **Embedding provider** — OpenAI, OpenAI-compatible (local/self-hosted), AWS Bedrock, Ollama, or local Transformers.js (ONNX)
 
 Config is saved to `~/.pi/knowledge-search.json`. Run `/reload` to activate.
 
@@ -181,6 +181,29 @@ The `apiKey` field is optional; omit it if your runner doesn't require authentic
 
 </details>
 
+<details>
+<summary>Transformers.js config (free, local ONNX — same engine as pi-local-rag)</summary>
+
+Runs embedding models fully locally via [Transformers.js](https://huggingface.co/docs/transformers.js) ONNX inference — no API key, no server. Defaults to `nomic-ai/nomic-embed-text-v1.5` (768-dim, q8 quantized) with the model's `search_query:` / `search_document:` task prefixes, mirroring pi-local-rag's text pipeline. Model weights are downloaded once (~111 MB) into a shared HuggingFace cache (`~/.cache/huggingface/transformers` by default, or `PI_RAG_MODEL_CACHE` / `TRANSFORMERS_CACHE` / `HF_HOME`), so pi-knowledge-search and pi-local-rag reuse the same download.
+
+```json
+{
+  "dirs": ["~/notes"],
+  "provider": {
+    "type": "transformers",
+    "model": "nomic-ai/nomic-embed-text-v1.5"
+  }
+}
+```
+
+The `model` field is optional — omit it for the nomic default. Any Transformers.js-compatible feature-extraction model id works, but the `search_query:`/`search_document:` prefixes are nomic-specific; other models simply ignore-tolerate them.
+
+</details>
+
+### Embedding-engine changes remove existing embeddings
+
+Vectors from different engines, models, or dimensionalities are not comparable. The index records the signature of the engine that built it (`type:model:dimensions`); on load, a mismatch removes all existing embeddings and the next sync re-embeds everything with the new engine. Switching providers (e.g. from OpenAI to local Transformers.js) therefore costs one full re-embed, after which incremental sync resumes. FTS-only installs are unaffected — keyword search doesn't depend on the embedder.
+
 ### Bedrock Knowledge Bases
 
 You can add [Amazon Bedrock Knowledge Bases](https://docs.aws.amazon.com/bedrock/latest/userguide/knowledge-base.html) as additional search sources. These are managed RAG services — Amazon handles chunking, embedding, and vector storage. pi-knowledge-search queries them at search time and merges results with local file results.
@@ -233,7 +256,7 @@ Every config field can be overridden via environment variables. This is useful f
 
 ## How it works
 
-1. On session start, loads the index from disk and incrementally syncs — only re-embeds new or modified files
+1. On session start, loads the index from disk and incrementally syncs — only re-embeds new or modified files (or everything, once, after an embedding-engine change)
 2. Registers a `knowledge_search` tool the LLM calls with natural language queries
 3. Returns ranked results with file paths, relevance scores, and content excerpts
 

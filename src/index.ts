@@ -297,6 +297,7 @@ export default function (pi: ExtensionAPI) {
         "openai — OpenAI API (text-embedding-3-small)",
         "bedrock — AWS Bedrock (Titan Embeddings v2)",
         "ollama — Local Ollama (nomic-embed-text)",
+        "transformers — Local ONNX via Transformers.js (nomic-embed-text-v1.5, no API key)",
       ]);
 
       if (!providerChoice) {
@@ -308,7 +309,8 @@ export default function (pi: ExtensionAPI) {
         | "none"
         | "openai"
         | "bedrock"
-        | "ollama";
+        | "ollama"
+        | "transformers";
 
       let configFile: ConfigFile;
 
@@ -364,6 +366,22 @@ export default function (pi: ExtensionAPI) {
               type: "ollama",
               url: url || "http://localhost:11434",
               model: model || "nomic-embed-text",
+            },
+          };
+          break;
+        }
+        case "transformers": {
+          const model = await ctx.ui.input(
+            "Model:",
+            "nomic-ai/nomic-embed-text-v1.5"
+          );
+          configFile = {
+            dirs,
+            fileExtensions,
+            excludeDirs,
+            provider: {
+              type: "transformers",
+              model: model || "nomic-ai/nomic-embed-text-v1.5",
             },
           };
           break;

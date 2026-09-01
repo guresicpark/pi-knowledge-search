@@ -8,9 +8,9 @@ All settings can be overridden via environment variables. The config file (`~/.p
 | `KNOWLEDGE_SEARCH_DIRS`       | Comma-separated directories to index                              | _(from config file)_                 |
 | `KNOWLEDGE_SEARCH_EXTENSIONS` | Comma-separated file extensions                                   | `.md,.txt`                           |
 | `KNOWLEDGE_SEARCH_EXCLUDE`    | Comma-separated directory names to skip                           | `node_modules,.git,.obsidian,.trash` |
-| `KNOWLEDGE_SEARCH_DIMENSIONS` | Embedding vector dimensions                                       | `512`                                |
+| `KNOWLEDGE_SEARCH_DIMENSIONS` | Embedding vector dimensions                                       | `512` (`768` for `transformers`)     |
 | `KNOWLEDGE_SEARCH_INDEX_DIR`  | Where to store the index                                          | `~/.pi/knowledge-search`             |
-| `KNOWLEDGE_SEARCH_PROVIDER`   | Provider type: `openai`, `openai-compatible`, `bedrock`, `ollama` | `openai`                             |
+| `KNOWLEDGE_SEARCH_PROVIDER`   | Provider type: `openai`, `openai-compatible`, `bedrock`, `ollama`, `transformers` | `openai` |
 
 ### OpenAI
 
@@ -63,6 +63,19 @@ Or via config file (`~/.pi/knowledge-search.json`):
 ```
 
 ### Ollama
+
+| Variable                          | Default                    |
+| --------------------------------- | -------------------------- |
+| `KNOWLEDGE_SEARCH_OLLAMA_URL`     | `http://localhost:11434`   |
+| `KNOWLEDGE_SEARCH_OLLAMA_MODEL`   | `nomic-embed-text`         |
+
+### Transformers.js (local ONNX)
+
+| Variable                                | Default                            |
+| --------------------------------------- | ---------------------------------- |
+| `KNOWLEDGE_SEARCH_TRANSFORMERS_MODEL`   | `nomic-ai/nomic-embed-text-v1.5`   |
+
+Model weights are cached in the shared HuggingFace cache (`PI_RAG_MODEL_CACHE` > `TRANSFORMERS_CACHE` > `HF_HOME/transformers` > `~/.cache/huggingface/transformers`), so pi-local-rag and pi-knowledge-search reuse the same download.
 
 ## Overview injection
 

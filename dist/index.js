@@ -2,7 +2,7 @@
 import { Type } from "@sinclair/typebox";
 import { fork } from "node:child_process";
 import * as fs5 from "node:fs";
-import { join as join5 } from "node:path";
+import { join as join6 } from "node:path";
 
 // src/config.ts
 import * as fs from "node:fs";
@@ -74,10 +74,10 @@ function loadConfig(cwd) {
   if (dirs.length === 0 && !hasKBs) return null;
   const fileExtensions = envStr("KNOWLEDGE_SEARCH_EXTENSIONS")?.split(",").map((e) => e.trim()) ?? file?.fileExtensions ?? [".md", ".txt"];
   const excludeDirs = envStr("KNOWLEDGE_SEARCH_EXCLUDE")?.split(",").map((d) => d.trim()) ?? file?.excludeDirs ?? ["node_modules", ".git", ".obsidian", ".trash"];
-  const dimensions = envInt("KNOWLEDGE_SEARCH_DIMENSIONS") ?? file?.dimensions ?? 512;
   const providerType = envStr("KNOWLEDGE_SEARCH_PROVIDER") ?? file?.provider?.type ?? // Convenience default: if OPENAI_API_KEY is exported and nothing else
   // is configured, assume the user wants the openai provider.
   (process.env.OPENAI_API_KEY ? "openai" : void 0);
+  const dimensions = envInt("KNOWLEDGE_SEARCH_DIMENSIONS") ?? file?.dimensions ?? (providerType === "transformers" ? 768 : 512);
   let provider = null;
   if (providerType) {
     switch (providerType) {
@@ -131,9 +131,15 @@ function loadConfig(cwd) {
           model: envStr("KNOWLEDGE_SEARCH_OLLAMA_MODEL") ?? (file?.provider?.type === "ollama" ? file.provider.model : void 0) ?? "nomic-embed-text"
         };
         break;
+      case "transformers":
+        provider = {
+          type: "transformers",
+          model: envStr("KNOWLEDGE_SEARCH_TRANSFORMERS_MODEL") ?? (file?.provider?.type === "transformers" ? file.provider.model : void 0) ?? "nomic-ai/nomic-embed-text-v1.5"
+        };
+        break;
       default:
         throw new Error(
-          `Unknown provider: "${providerType}". Use "openai", "openai-compatible", "bedrock", or "ollama".`
+          `Unknown provider: "${providerType}". Use "openai", "openai-compatible", "bedrock", "ollama", or "transformers".`
         );
     }
   }
@@ -151,6 +157,7 @@ function loadConfig(cwd) {
     excludeDirs,
     dimensions,
     provider,
+    modelSignature: provider ? `${provider.type}:${provider.model ?? ""}:${dimensions}` : null,
     indexDir,
     knowledgeBases: file?.knowledgeBases ?? [],
     overview
@@ -179,6 +186,8 @@ function envBool(key) {
 }
 
 // src/embedder.ts
+import { join as join2 } from "node:path";
+import { homedir } from "node:os";
 function createEmbedder(config, dimensions) {
   switch (config.type) {
     case "openai":
@@ -189,6 +198,8 @@ function createEmbedder(config, dimensions) {
       return new BedrockEmbedder(config.profile, config.region, config.model, dimensions);
     case "ollama":
       return new OllamaEmbedder(config.url, config.model);
+    case "transformers":
+      return new TransformersEmbedder(config.model);
   }
 }
 function truncate(text, maxChars = 1e4) {
@@ -411,6 +422,75 @@ var OllamaEmbedder = class {
       );
     }
     return out;
+  }
+};
+var TRANSFORMERS_QUERY_PREFIX = "search_query: ";
+var TRANSFORMERS_DOC_PREFIX = "search_document: ";
+var TRANSFORMERS_BATCH_SIZE = 16;
+function resolveTransformersCacheDir() {
+  if (process.env.PI_RAG_MODEL_CACHE) return process.env.PI_RAG_MODEL_CACHE;
+  if (process.env.TRANSFORMERS_CACHE) return process.env.TRANSFORMERS_CACHE;
+  if (process.env.HF_HOME) return join2(process.env.HF_HOME, "transformers");
+  return join2(homedir(), ".cache", "huggingface", "transformers");
+}
+var TransformersEmbedder = class {
+  model;
+  pipelinePromise = null;
+  constructor(model) {
+    this.model = model;
+  }
+  /**
+   * Lazily load the ONNX feature-extraction pipeline (q8 quantized weights).
+   * The load promise is cached so concurrent first calls share a single
+   * download; a failed load is evicted so the next call retries.
+   */
+  getPipeline() {
+    if (!this.pipelinePromise) {
+      this.pipelinePromise = (async () => {
+        const { pipeline, env } = await import("@huggingface/transformers");
+        env.cacheDir = resolveTransformersCacheDir();
+        return pipeline("feature-extraction", this.model, { dtype: "q8" });
+      })();
+      this.pipelinePromise.catch(() => {
+        this.pipelinePromise = null;
+      });
+    }
+    return this.pipelinePromise;
+  }
+  async embed(text, signal) {
+    if (signal?.aborted) throw new Error("Aborted");
+    const pipe = await this.getPipeline();
+    const input = TRANSFORMERS_QUERY_PREFIX + text.replace(/\s+/g, " ").trim();
+    const output = await pipe(truncate(input), { pooling: "mean", normalize: true });
+    return Array.from(output.data);
+  }
+  async embedBatch(texts, signal, _concurrency) {
+    const results = new Array(texts.length).fill(null);
+    if (texts.length === 0) return results;
+    let failed = 0;
+    const errs = /* @__PURE__ */ new Set();
+    try {
+      const pipe = await this.getPipeline();
+      for (let start = 0; start < texts.length; start += TRANSFORMERS_BATCH_SIZE) {
+        if (signal?.aborted) throw new Error("Aborted");
+        const batch = texts.slice(start, start + TRANSFORMERS_BATCH_SIZE).map((t) => TRANSFORMERS_DOC_PREFIX + truncate(t));
+        const output = await pipe(batch, { pooling: "mean", normalize: true });
+        const flattened = output.data;
+        const dim = flattened.length / batch.length;
+        for (let i = 0; i < batch.length; i++) {
+          results[start + i] = Array.from(flattened.slice(i * dim, (i + 1) * dim));
+        }
+      }
+    } catch (err) {
+      failed = results.filter((v) => v === null).length;
+      errs.add(err.message);
+      if (failed > 0) {
+        console.error(
+          `Transformers embedding failed for ${failed}/${texts.length} chunks: ${summarizeErrors(errs)}`
+        );
+      }
+    }
+    return results;
   }
 };
 
@@ -700,7 +780,7 @@ function mergeTiny(chunks, minSize, maxSize) {
 // src/fts-index.ts
 import { DatabaseSync as DatabaseSync2 } from "node:sqlite";
 import { mkdirSync as mkdirSync2 } from "node:fs";
-import { join as join2 } from "node:path";
+import { join as join3 } from "node:path";
 
 // src/fts5-probe.ts
 import { DatabaseSync } from "node:sqlite";
@@ -732,7 +812,7 @@ var FtsChunkIndex = class {
   dbPath;
   constructor(indexDir) {
     mkdirSync2(indexDir, { recursive: true });
-    this.dbPath = join2(indexDir, "kb-fts.db");
+    this.dbPath = join3(indexDir, "kb-fts.db");
   }
   load() {
     if (this.db) return;
@@ -907,6 +987,7 @@ var KnowledgeIndex = class _KnowledgeIndex {
     this.data = {
       version: INDEX_VERSION,
       dimensions: config.dimensions,
+      embeddingModel: config.modelSignature,
       entries: {}
     };
     this.fts = new FtsChunkIndex(config.indexDir);
@@ -990,7 +1071,8 @@ var KnowledgeIndex = class _KnowledgeIndex {
           parsed = JSON.parse(raw);
         }
         const dimsOk = this.isFtsOnly || parsed?.dimensions === this.config.dimensions;
-        if (parsed && parsed.version === INDEX_VERSION && dimsOk) {
+        const sigOk = this.isFtsOnly || parsed?.embeddingModel === this.config.modelSignature;
+        if (parsed && parsed.version === INDEX_VERSION && dimsOk && sigOk) {
           this.data = parsed;
         }
       } catch {
@@ -1109,7 +1191,7 @@ var KnowledgeIndex = class _KnowledgeIndex {
     });
     try {
       await write(
-        `{"version":${JSON.stringify(this.data.version)},"dimensions":${JSON.stringify(this.data.dimensions)},"entries":{`
+        `{"version":${JSON.stringify(this.data.version)},"dimensions":${JSON.stringify(this.data.dimensions)},"embeddingModel":${JSON.stringify(this.data.embeddingModel ?? null)},"entries":{`
       );
       let first = true;
       for (const key of Object.keys(this.data.entries)) {
@@ -2202,7 +2284,7 @@ function index_default(pi) {
     let workerRestartCount = 0;
     let workerRestartWindowStart = Date.now();
     function spawnWorker() {
-      const workerPath = join5(import.meta.dirname, "..", "dist", "sync-worker.mjs");
+      const workerPath = join6(import.meta.dirname, "..", "dist", "sync-worker.mjs");
       const worker = fork(workerPath, [], {
         stdio: ["ignore", "pipe", "pipe", "ipc"],
         // Suppress "node:sqlite is experimental" warning — node:sqlite is stable
@@ -2310,7 +2392,8 @@ function index_default(pi) {
         "none \u2014 FTS-only keyword search (zero-config, no API key needed)",
         "openai \u2014 OpenAI API (text-embedding-3-small)",
         "bedrock \u2014 AWS Bedrock (Titan Embeddings v2)",
-        "ollama \u2014 Local Ollama (nomic-embed-text)"
+        "ollama \u2014 Local Ollama (nomic-embed-text)",
+        "transformers \u2014 Local ONNX via Transformers.js (nomic-embed-text-v1.5, no API key)"
       ]);
       if (!providerChoice) {
         ctx.ui.notify("Setup cancelled.", "info");
@@ -2369,6 +2452,22 @@ function index_default(pi) {
               type: "ollama",
               url: url || "http://localhost:11434",
               model: model || "nomic-embed-text"
+            }
+          };
+          break;
+        }
+        case "transformers": {
+          const model = await ctx.ui.input(
+            "Model:",
+            "nomic-ai/nomic-embed-text-v1.5"
+          );
+          configFile = {
+            dirs,
+            fileExtensions,
+            excludeDirs,
+            provider: {
+              type: "transformers",
+              model: model || "nomic-ai/nomic-embed-text-v1.5"
             }
           };
           break;

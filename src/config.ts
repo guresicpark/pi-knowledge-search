@@ -13,6 +13,13 @@ export interface Config {
   dimensions: number;
   /** Embedding provider config (required for local file indexing) */
   provider: ProviderConfig | null;
+  /**
+   * Signature of the engine that produces the embeddings (`type:model:dimensions`).
+   * The index persists the signature its vectors were built with; a mismatch
+   * on load removes all existing embeddings and forces a full re-embed.
+   * Null in FTS-only mode.
+   */
+  modelSignature: string | null;
   /** Where to store the index */
   indexDir: string;
   /** Optional Bedrock Knowledge Bases to search */
@@ -36,7 +43,8 @@ export type ProviderConfig =
   | { type: "openai"; apiKey: string; model: string }
   | { type: "openai-compatible"; apiKey?: string; model: string; baseUrl: string }
   | { type: "bedrock"; profile: string; region: string; model: string }
-  | { type: "ollama"; url: string; model: string };
+  | { type: "ollama"; url: string; model: string }
+  | { type: "transformers"; model: string };
 
 /** Raw shape stored in the config file. */
 export interface ConfigFile {
@@ -50,7 +58,8 @@ export interface ConfigFile {
     | { type: "openai"; apiKey?: string; model?: string }
     | { type: "openai-compatible"; apiKey?: string; model?: string; baseUrl?: string }
     | { type: "bedrock"; profile?: string; region?: string; model?: string }
-    | { type: "ollama"; url?: string; model?: string };
+    | { type: "ollama"; url?: string; model?: string }
+    | { type: "transformers"; model?: string };
 }
 
 // Lazy so HOME changes at runtime (tests, sandboxes) are honored.
@@ -191,14 +200,18 @@ export function loadConfig(cwd?: string): Config | null {
     .map((d) => d.trim()) ??
     file?.excludeDirs ?? ["node_modules", ".git", ".obsidian", ".trash"];
 
-  const dimensions = envInt("KNOWLEDGE_SEARCH_DIMENSIONS") ?? file?.dimensions ?? 512;
-
   const providerType =
     envStr("KNOWLEDGE_SEARCH_PROVIDER") ??
     file?.provider?.type ??
     // Convenience default: if OPENAI_API_KEY is exported and nothing else
     // is configured, assume the user wants the openai provider.
     (process.env.OPENAI_API_KEY ? "openai" : undefined);
+
+  // Dimensions must be resolved after providerType — the transformers
+  // provider's models are fixed at 768 dims and cannot be truncated.
+  const dimensions = envInt("KNOWLEDGE_SEARCH_DIMENSIONS") ??
+    file?.dimensions ??
+    (providerType === "transformers" ? 768 : 512);
 
   let provider: ProviderConfig | null = null;
   if (providerType) {
@@ -288,9 +301,18 @@ export function loadConfig(cwd?: string): Config | null {
             "nomic-embed-text",
         };
         break;
+      case "transformers":
+        provider = {
+          type: "transformers",
+          model:
+            envStr("KNOWLEDGE_SEARCH_TRANSFORMERS_MODEL") ??
+            (file?.provider?.type === "transformers" ? file.provider.model : undefined) ??
+            "nomic-ai/nomic-embed-text-v1.5",
+        };
+        break;
       default:
         throw new Error(
-          `Unknown provider: "${providerType}". Use "openai", "openai-compatible", "bedrock", or "ollama".`
+          `Unknown provider: "${providerType}". Use "openai", "openai-compatible", "bedrock", "ollama", or "transformers".`
         );
     }
   } // end if (providerType)
@@ -319,6 +341,7 @@ export function loadConfig(cwd?: string): Config | null {
     excludeDirs: excludeDirs,
     dimensions,
     provider,
+    modelSignature: provider ? `${provider.type}:${provider.model ?? ""}:${dimensions}` : null,
     indexDir,
     knowledgeBases: file?.knowledgeBases ?? [],
     overview,

@@ -29,6 +29,7 @@ const envKeys = [
   "KNOWLEDGE_SEARCH_BEDROCK_MODEL",
   "KNOWLEDGE_SEARCH_OLLAMA_URL",
   "KNOWLEDGE_SEARCH_OLLAMA_MODEL",
+  "KNOWLEDGE_SEARCH_TRANSFORMERS_MODEL",
   "KNOWLEDGE_SEARCH_INDEX_DIR",
   "OPENAI_API_KEY",
 ];
@@ -240,6 +241,74 @@ describe("config", () => {
       assert.equal(config.provider.url, "http://localhost:11434");
       assert.equal(config.provider.model, "nomic-embed-text");
     }
+  });
+
+  it("configures transformers provider with nomic defaults and 768 dims", () => {
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({
+        dirs: ["/tmp/docs"],
+        provider: { type: "transformers" },
+      })
+    );
+
+    const config = loadConfig();
+    assert.ok(config);
+    assert.ok(config.provider);
+    assert.equal(config.provider.type, "transformers");
+    if (config.provider.type === "transformers") {
+      assert.equal(config.provider.model, "nomic-ai/nomic-embed-text-v1.5");
+    }
+    assert.equal(config.dimensions, 768);
+    assert.equal(config.modelSignature, "transformers:nomic-ai/nomic-embed-text-v1.5:768");
+  });
+
+  it("transformers provider honors custom model from file and env", () => {
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({
+        dirs: ["/tmp/docs"],
+        provider: { type: "transformers", model: "Xenova/all-MiniLM-L6-v2" },
+      })
+    );
+    process.env.KNOWLEDGE_SEARCH_TRANSFORMERS_MODEL = "Xenova/bge-small-en-v1.5";
+
+    const config = loadConfig();
+    assert.ok(config);
+    assert.ok(config.provider);
+    if (config.provider.type === "transformers") {
+      assert.equal(config.provider.model, "Xenova/bge-small-en-v1.5");
+    }
+    assert.equal(config.modelSignature, "transformers:Xenova/bge-small-en-v1.5:768");
+  });
+
+  it("modelSignature is null in FTS-only mode", () => {
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({
+        dirs: ["/tmp/docs"],
+      })
+    );
+
+    const config = loadConfig();
+    assert.ok(config);
+    assert.equal(config.provider, null);
+    assert.equal(config.modelSignature, null);
+  });
+
+  it("modelSignature includes provider type, model, and dimensions", () => {
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({
+        dirs: ["/tmp/docs"],
+        dimensions: 256,
+        provider: { type: "openai", apiKey: "sk-test", model: "text-embedding-3-small" },
+      })
+    );
+
+    const config = loadConfig();
+    assert.ok(config);
+    assert.equal(config.modelSignature, "openai:text-embedding-3-small:256");
   });
 
   it("throws for unknown provider type", () => {

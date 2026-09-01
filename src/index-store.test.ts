@@ -74,6 +74,7 @@ function makeConfig(dir: string, dimensions = 4): Config {
     excludeDirs: [],
     dimensions,
     provider: null,
+    modelSignature: null,
     indexDir: dir,
     knowledgeBases: [],
     overview: { inject: false, maxDepth: 2, maxFoldersPerDir: 20, maxKeywordsPerFolder: 5 },
@@ -254,5 +255,111 @@ describe("KnowledgeIndex streaming load/save", () => {
     const reader = new KnowledgeIndex(config, new StubEmbedder());
     await reader.load();
     assert.equal(reader.chunkCount(), 30);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Embedding-engine signature invalidation
+//
+// Vectors from different engines/models are not comparable. The index
+// persists the signature of the engine that built it; a mismatch on load
+// removes all existing embeddings so sync() re-embeds everything.
+// ---------------------------------------------------------------------------
+
+describe("KnowledgeIndex embedding signature", () => {
+  let tmpDir: string;
+
+  before(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ks-sig-"));
+  });
+
+  beforeEach(() => {
+    for (const f of fs.readdirSync(tmpDir)) {
+      fs.rmSync(path.join(tmpDir, f), { force: true });
+    }
+  });
+
+  after(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function makeSigConfig(dir: string, signature: string | null, dimensions = 4): Config {
+    return {
+      dirs: ["/tmp/does-not-matter"],
+      fileExtensions: [".md"],
+      excludeDirs: [],
+      dimensions,
+      provider: null,
+      modelSignature: signature,
+      indexDir: dir,
+      knowledgeBases: [],
+      overview: { inject: false, maxDepth: 2, maxFoldersPerDir: 20, maxKeywordsPerFolder: 5 },
+    };
+  }
+
+  function writeIndex(entries: number, embeddingModel: string | null): void {
+    const map: Record<string, unknown> = {};
+    for (let i = 0; i < entries; i++) {
+      map[`/vault/file-${i}.md#0`] = {
+        relPath: `file-${i}.md`,
+        sourceDir: "/vault",
+        mtime: 1_700_000_000_000 + i,
+        vector: [1, 0, 0, 0],
+        excerpt: `Excerpt ${i}`,
+        heading: "intro",
+        chunkIndex: 0,
+      };
+    }
+    fs.writeFileSync(
+      path.join(tmpDir, "index.json"),
+      JSON.stringify({ version: 3, dimensions: 4, embeddingModel, entries: map })
+    );
+  }
+
+  it("keeps entries when the signature matches the current engine", async () => {
+    writeIndex(3, "openai:text-embedding-3-small:4");
+    const idx = new KnowledgeIndex(makeSigConfig(tmpDir, "openai:text-embedding-3-small:4"), new StubEmbedder());
+    await idx.load();
+    assert.equal(idx.chunkCount(), 3);
+    await idx.close();
+  });
+
+  it("removes all existing embeddings when the engine changes", async () => {
+    writeIndex(3, "openai:text-embedding-3-small:4");
+    const idx = new KnowledgeIndex(
+      makeSigConfig(tmpDir, "transformers:nomic-ai/nomic-embed-text-v1.5:4"),
+      new StubEmbedder()
+    );
+    await idx.load();
+    assert.equal(idx.chunkCount(), 0, "vectors from another engine must be dropped");
+    await idx.close();
+  });
+
+  it("removes legacy vectors built before signatures existed", async () => {
+    writeIndex(3, null);
+    const idx = new KnowledgeIndex(makeSigConfig(tmpDir, "openai:text-embedding-3-small:4"), new StubEmbedder());
+    await idx.load();
+    assert.equal(idx.chunkCount(), 0, "signature-less vectors cannot be trusted");
+    await idx.close();
+  });
+
+  it("FTS-only load ignores a signature mismatch (vectors unused)", async () => {
+    writeIndex(3, "openai:text-embedding-3-small:4");
+    const idx = new KnowledgeIndex(makeSigConfig(tmpDir, null), null);
+    await idx.load();
+    assert.equal(idx.chunkCount(), 3);
+    await idx.close();
+  });
+
+  it("persists the current signature on save", async () => {
+    const idx = new KnowledgeIndex(
+      makeSigConfig(tmpDir, "transformers:nomic-ai/nomic-embed-text-v1.5:4"),
+      new StubEmbedder()
+    );
+    const saveMethod = (idx as unknown as { save: () => Promise<void> }).save;
+    await saveMethod.call(idx);
+    const raw = JSON.parse(fs.readFileSync(path.join(tmpDir, "index.json"), "utf-8"));
+    assert.equal(raw.embeddingModel, "transformers:nomic-ai/nomic-embed-text-v1.5:4");
+    await idx.close();
   });
 });

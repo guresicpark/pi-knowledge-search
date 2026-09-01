@@ -27,6 +27,14 @@ interface IndexEntry {
 interface IndexData {
   version: number;
   dimensions: number;
+  /**
+   * Signature of the embedding engine (`type:model:dimensions`) that produced
+   * the stored vectors. Null when unknown (pre-signature indexes, FTS-only
+   * installs). A mismatch on load removes all existing embeddings and forces
+   * a full re-embed — vectors from different engines/models are not
+   * comparable.
+   */
+  embeddingModel: string | null;
   entries: Record<string, IndexEntry>; // keyed by "absPath#chunkIndex"
 }
 
@@ -59,6 +67,7 @@ export class KnowledgeIndex {
     this.data = {
       version: INDEX_VERSION,
       dimensions: config.dimensions,
+      embeddingModel: config.modelSignature,
       entries: {},
     };
     this.fts = new FtsChunkIndex(config.indexDir);
@@ -166,13 +175,19 @@ export class KnowledgeIndex {
         //  - version matches AND
         //  - dimensions match OR we're in FTS-only mode (dimensions are a
         //    vector-only concern; FTS-only installs should never invalidate
-        //    a perfectly good entry map over them).
+        //    a perfectly good entry map over them) AND
+        //  - the embedding-engine signature matches OR we're in FTS-only
+        //    mode. Vectors built by a different engine/model are not
+        //    comparable — drop them and re-embed everything.
         const dimsOk =
           this.isFtsOnly || parsed?.dimensions === this.config.dimensions;
-        if (parsed && parsed.version === INDEX_VERSION && dimsOk) {
+        const sigOk =
+          this.isFtsOnly || parsed?.embeddingModel === this.config.modelSignature;
+        if (parsed && parsed.version === INDEX_VERSION && dimsOk && sigOk) {
           this.data = parsed;
         }
-        // Version or dimension mismatch → keep fresh data, caller will re-index.
+        // Version, dimension, or signature mismatch → keep fresh data, caller
+        // will re-index.
       } catch {
         // Corrupt file / partial write / IO error → fresh index.
       }
@@ -309,6 +324,7 @@ export class KnowledgeIndex {
       await write(
         `{"version":${JSON.stringify(this.data.version)},` +
           `"dimensions":${JSON.stringify(this.data.dimensions)},` +
+          `"embeddingModel":${JSON.stringify(this.data.embeddingModel ?? null)},` +
           `"entries":{`
       );
       let first = true;

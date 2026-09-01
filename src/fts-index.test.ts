@@ -19,6 +19,7 @@ function makeConfig(dir: string, dimensions = 4): Config {
     excludeDirs: [],
     dimensions,
     provider: null,
+    modelSignature: null,
     indexDir: dir,
     knowledgeBases: [],
     overview: { inject: false, maxDepth: 2, maxFoldersPerDir: 20, maxKeywordsPerFolder: 5 },
@@ -277,6 +278,7 @@ describe("KnowledgeIndex hybrid search", () => {
     const data = {
       version: 3,
       dimensions: 4,
+      embeddingModel: null,
       entries: {
         "/v/a.md#0": {
           relPath: "a.md",
@@ -445,6 +447,7 @@ describe("KnowledgeIndex FTS-only mode (no embedder)", () => {
       excludeDirs: [],
       dimensions: 512,
       provider: null,
+      modelSignature: null,
       indexDir,
       knowledgeBases: [],
       overview: { inject: false, maxDepth: 2, maxFoldersPerDir: 20, maxKeywordsPerFolder: 5 },

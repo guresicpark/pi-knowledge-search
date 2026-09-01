@@ -33,6 +33,7 @@
     "@aws-sdk/credential-providers": "3.1123.0"
   },
   "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
     "remark-frontmatter": "^5.0.0",
     "remark-parse": "^11.0.0",
     "stream-json": "^2.1.0",
