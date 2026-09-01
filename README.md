@@ -1,6 +1,6 @@
 # pi-knowledge-search
 
-Hybrid search over local files for [pi](https://github.com/badlogic/pi). Indexes directories of text/markdown files using vector embeddings **and** SQLite FTS5 keyword search, and exposes `knowledge_search` + `kb_read` tools the LLM can call. Indexing runs on session startup (file changes mid-session are picked up on next restart or via `/knowledge-sync`).
+Hybrid **local** search over local files for [pi](https://github.com/badlogic/pi). Indexes directories of text/markdown files using local ONNX vector embeddings **and** SQLite FTS5 keyword search, and exposes `knowledge_search` + `kb_read` tools the LLM can call. Everything runs on your machine — no embedding APIs, no cloud services. Indexing runs on session startup (file changes mid-session are picked up on next restart or via `/knowledge-sync`).
 
 On session start, injects a folder+keyword overview of the indexed vault as a custom message so the model knows what’s worth searching for before it asks.
 
@@ -19,7 +19,7 @@ The extension registers two LLM-facing tools:
 
 | Tool | What it does |
 |------|--------------|
-| `knowledge_search` | Hybrid vector + BM25 search over indexed files (and any Bedrock Knowledge Bases). Returns passage-level excerpts ranked by Reciprocal Rank Fusion. |
+| `knowledge_search` | Hybrid vector + BM25 search over indexed files. Returns passage-level excerpts ranked by Reciprocal Rank Fusion. |
 | `kb_read` | Resolve a note reference — `[[wikilink]]`, basename, or relative path — to an indexed file and return its full content. Use when the model knows a note's name but not its full path, instead of running find/grep first. |
 
 `kb_read` handles `[[Foo]]`, `[[Foo|alias]]`, `[[Foo#Heading]]`, bare names with or without extension (`Foo`, `Foo.md`), and relative paths (`evergreen/foo`). Multi-match references get a disambiguation prompt instead of guessing.
@@ -84,7 +84,7 @@ This walks you through:
 1. **Directories** to index (comma-separated paths)
 2. **File extensions** to include (default: `.md, .txt`)
 3. **Directories to exclude** (default: `node_modules, .git, .obsidian, .trash`)
-4. **Embedding provider** — OpenAI, OpenAI-compatible (local/self-hosted), AWS Bedrock, Ollama, or local Transformers.js (ONNX)
+4. **Embedding engine** — local Transformers.js (ONNX), or none for pure FTS-only keyword search
 
 Config is saved to `{cwd}/.pi/knowledge-search.json` — project-local, relative to the directory pi was started in. Run `/reload` to activate.
 
@@ -98,157 +98,25 @@ You can also edit the config file directly:
   "fileExtensions": [".md", ".txt"],
   "excludeDirs": ["node_modules", ".git", ".obsidian", ".trash"],
   "provider": {
-    "type": "openai",
-    "model": "text-embedding-3-small"
-  }
-}
-```
-
-The API key for OpenAI can be set in the config file (`"apiKey": "sk-..."`) or via the `OPENAI_API_KEY` environment variable.
-
-<details>
-<summary>Bedrock config</summary>
-
-```json
-{
-  "dirs": ["~/vault"],
-  "provider": {
-    "type": "bedrock",
-    "profile": "my-aws-profile",
-    "region": "us-west-2",
-    "model": "amazon.titan-embed-text-v2:0"
-  }
-}
-```
-
-Requires the AWS SDK and valid credentials for the specified profile.
-
-</details>
-
-<details>
-<summary>Ollama config (free, local)</summary>
-
-```json
-{
-  "dirs": ["~/notes"],
-  "provider": {
-    "type": "ollama",
-    "url": "http://localhost:11434",
-    "model": "nomic-embed-text"
-  }
-}
-```
-
-Requires [Ollama](https://ollama.ai) running locally:
-
-```bash
-ollama serve
-ollama pull nomic-embed-text
-```
-
-</details>
-
-<details>
-<summary>OpenAI-compatible config (free, local/self-hosted)</summary>
-
-Any server that exposes an OpenAI-compatible `/v1/embeddings` endpoint works:
-[llama.cpp](https://github.com/ggml-org/llama.cpp), [vLLM](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html),
-[litellm](https://docs.litellm.ai/), [Ollama's OpenAI-compatibility mode](https://ollama.com/blog/openai-compatibility), etc.
-
-```json
-{
-  "dirs": ["~/notes"],
-  "provider": {
-    "type": "openai-compatible",
-    "baseUrl": "http://127.0.0.1:8080",
-    "apiKey": "your-local-key",
-    "model": "qwen3-embeddings"
-  }
-}
-```
-
-The `baseUrl` should be your server root **without** a trailing `/v1` path — the embedder appends `/v1/embeddings` automatically.
-
-For example with llama-cpp-python:
-
-```bash
-python -m llama_cpp.server --model ./models/qwen3-embedding.gguf --port 8080
-```
-
-Then configure knowledge-search to point at `http://127.0.0.1:8080` as shown above.
-
-The `apiKey` field is optional; omit it if your runner doesn't require authentication.
-
-</details>
-
-<details>
-<summary>Transformers.js config (free, local ONNX — same engine as pi-local-rag)</summary>
-
-Runs embedding models fully locally via [Transformers.js](https://huggingface.co/docs/transformers.js) ONNX inference — no API key, no server. Defaults to `nomic-ai/nomic-embed-text-v1.5` (768-dim, q8 quantized) with the model's `search_query:` / `search_document:` task prefixes, mirroring pi-local-rag's text pipeline. Model weights are downloaded once (~111 MB) into a shared HuggingFace cache (`~/.cache/huggingface/transformers` by default, or `PI_RAG_MODEL_CACHE` / `TRANSFORMERS_CACHE` / `HF_HOME`), so pi-knowledge-search and pi-local-rag reuse the same download.
-
-```json
-{
-  "dirs": ["~/notes"],
-  "provider": {
     "type": "transformers",
     "model": "nomic-ai/nomic-embed-text-v1.5"
   }
 }
 ```
 
-The `model` field is optional — omit it for the nomic default. Any Transformers.js-compatible feature-extraction model id works, but the `search_query:`/`search_document:` prefixes are nomic-specific; other models simply ignore-tolerate them.
+The `model` field is optional — omit it for the nomic default. Omit the whole `provider` block for **FTS-only mode**: zero-config pure BM25 keyword search, no model download.
 
-</details>
+> **Migrating from remote providers:** OpenAI, OpenAI-compatible, Bedrock, and Ollama embedding providers were removed — this extension is local-only now. A config naming a removed provider throws a migration error at startup; switch to `"transformers"` (or remove the `provider` block). Switching engines removes all existing embeddings and re-embeds once on the next sync.
+
+### Transformers.js engine (local ONNX)
+
+The default (and only) embedding engine runs fully locally via [Transformers.js](https://huggingface.co/docs/transformers.js) ONNX inference — no API key, no server. Defaults to `nomic-ai/nomic-embed-text-v1.5` (768-dim, q8 quantized) with the model's `search_query:` / `search_document:` task prefixes, mirroring pi-local-rag's text pipeline. Model weights are downloaded once (~111 MB) into a shared HuggingFace cache (`~/.cache/huggingface/transformers` by default, or `PI_RAG_MODEL_CACHE` / `TRANSFORMERS_CACHE` / `HF_HOME`), so pi-knowledge-search and pi-local-rag reuse the same download.
+
+Any Transformers.js-compatible feature-extraction model id works, but the `search_query:`/`search_document:` prefixes are nomic-specific; other models simply ignore-tolerate them.
 
 ### Embedding-engine changes remove existing embeddings
 
-Vectors from different engines, models, or dimensionalities are not comparable. The index records the signature of the engine that built it (`type:model:dimensions`); on load, a mismatch removes all existing embeddings and the next sync re-embeds everything with the new engine. Switching providers (e.g. from OpenAI to local Transformers.js) therefore costs one full re-embed, after which incremental sync resumes. FTS-only installs are unaffected — keyword search doesn't depend on the embedder.
-
-### Bedrock Knowledge Bases
-
-You can add [Amazon Bedrock Knowledge Bases](https://docs.aws.amazon.com/bedrock/latest/userguide/knowledge-base.html) as additional search sources. These are managed RAG services — Amazon handles chunking, embedding, and vector storage. pi-knowledge-search queries them at search time and merges results with local file results.
-
-Add via command:
-
-```
-/knowledge-add-kb
-```
-
-Or add directly to the config file:
-
-```json
-{
-  "dirs": ["~/notes"],
-  "provider": { "type": "openai" },
-  "knowledgeBases": [
-    {
-      "id": "XXXXXXXXXX",
-      "region": "us-east-1",
-      "profile": "default",
-      "label": "Team docs"
-    }
-  ]
-}
-```
-
-You can use Knowledge Bases alongside local file indexing, or on their own (omit `dirs` and `provider` for KB-only mode).
-
-KB-only config:
-
-```json
-{
-  "knowledgeBases": [
-    {
-      "id": "XXXXXXXXXX",
-      "region": "us-east-1",
-      "profile": "my-work-profile",
-      "label": "Engineering wiki"
-    }
-  ]
-}
-```
-
-Requires the AWS SDK and valid credentials with `bedrock:Retrieve` permissions.
+Vectors from different engines, models, or dimensionalities are not comparable. The index records the signature of the engine that built it (`type:model:dimensions`); on load, a mismatch removes all existing embeddings and the next sync re-embeds everything with the new engine. Changing the `model` in your config therefore costs one full re-embed, after which incremental sync resumes. FTS-only installs are unaffected — keyword search doesn't depend on the embedder.
 
 ### Environment variable overrides
 
@@ -269,7 +137,6 @@ The index is stored at `{cwd}/.pi/knowledge-search/index.json` (project-local; s
 | Command                   | Description                                     |
 | ------------------------- | ----------------------------------------------- |
 | `/knowledge-search-setup` | Interactive setup wizard                        |
-| `/knowledge-add-kb`       | Add a Bedrock Knowledge Base as a search source |
 | `/knowledge-overview`     | Force-rebuild and re-inject the vault overview  |
 | `/knowledge-reindex`      | Force a full re-index                           |
 

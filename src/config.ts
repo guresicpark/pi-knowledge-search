@@ -1,6 +1,5 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { KnowledgeBaseConfig } from "./kb-searcher.js";
 
 export interface Config {
   /** Directories to index */
@@ -11,7 +10,7 @@ export interface Config {
   excludeDirs: string[];
   /** Embedding dimensions */
   dimensions: number;
-  /** Embedding provider config (required for local file indexing) */
+  /** Embedding provider config; null = FTS-only keyword search */
   provider: ProviderConfig | null;
   /**
    * Signature of the engine that produces the embeddings (`type:model:dimensions`).
@@ -22,8 +21,6 @@ export interface Config {
   modelSignature: string | null;
   /** Where to store the index */
   indexDir: string;
-  /** Optional Bedrock Knowledge Bases to search */
-  knowledgeBases: KnowledgeBaseConfig[];
   /** Session-start overview injection settings */
   overview: OverviewConfig;
 }
@@ -39,27 +36,21 @@ export interface OverviewConfig {
   maxKeywordsPerFolder: number;
 }
 
-export type ProviderConfig =
-  | { type: "openai"; apiKey: string; model: string }
-  | { type: "openai-compatible"; apiKey?: string; model: string; baseUrl: string }
-  | { type: "bedrock"; profile: string; region: string; model: string }
-  | { type: "ollama"; url: string; model: string }
-  | { type: "transformers"; model: string };
+/** The only embedding engine: local ONNX inference via Transformers.js. */
+export type ProviderConfig = { type: "transformers"; model: string };
 
-/** Raw shape stored in the config file. */
+/**
+ * Raw shape stored in the config file. `provider.type` is kept as a plain
+ * string so legacy configs naming a removed provider (openai, bedrock, …)
+ * surface a helpful migration error instead of failing silently.
+ */
 export interface ConfigFile {
   dirs?: string[];
   fileExtensions?: string[];
   excludeDirs?: string[];
   dimensions?: number;
-  knowledgeBases?: KnowledgeBaseConfig[];
   overview?: Partial<OverviewConfig>;
-  provider?:
-    | { type: "openai"; apiKey?: string; model?: string }
-    | { type: "openai-compatible"; apiKey?: string; model?: string; baseUrl?: string }
-    | { type: "bedrock"; profile?: string; region?: string; model?: string }
-    | { type: "ollama"; url?: string; model?: string }
-    | { type: "transformers"; model?: string };
+  provider?: { type: string; model?: string };
 }
 
 // Storage is project-local: config lives at {cwd}/.pi/knowledge-search.json and
@@ -176,8 +167,6 @@ export function loadConfig(cwd?: string): Config | null {
   // Check env var fallback for dirs
   const envDirs = process.env.KNOWLEDGE_SEARCH_DIRS;
 
-  const hasKBs = (file?.knowledgeBases?.length ?? 0) > 0;
-
   if (!file && !envDirs) {
     return null; // Not configured yet
   }
@@ -190,7 +179,7 @@ export function loadConfig(cwd?: string): Config | null {
     .map(resolvePath)
     .filter(Boolean);
 
-  if (dirs.length === 0 && !hasKBs) return null;
+  if (dirs.length === 0) return null;
 
   const fileExtensions = envStr("KNOWLEDGE_SEARCH_EXTENSIONS")
     ?.split(",")
@@ -202,122 +191,27 @@ export function loadConfig(cwd?: string): Config | null {
     .map((d) => d.trim()) ??
     file?.excludeDirs ?? ["node_modules", ".git", ".obsidian", ".trash"];
 
-  const providerType =
-    envStr("KNOWLEDGE_SEARCH_PROVIDER") ??
-    file?.provider?.type ??
-    // Convenience default: if OPENAI_API_KEY is exported and nothing else
-    // is configured, assume the user wants the openai provider.
-    (process.env.OPENAI_API_KEY ? "openai" : undefined);
+  let provider: ProviderConfig | null = null;
+  if (file?.provider) {
+    if (file.provider.type !== "transformers") {
+      throw new Error(
+        `Unsupported embedding provider "${file.provider.type}". Only local search is supported: use { "type": "transformers" } (local ONNX embeddings via Transformers.js), or remove the provider block entirely for FTS-only keyword search.`
+      );
+    }
+    provider = {
+      type: "transformers",
+      model:
+        envStr("KNOWLEDGE_SEARCH_TRANSFORMERS_MODEL") ??
+        file.provider.model ??
+        "nomic-ai/nomic-embed-text-v1.5",
+    };
+  }
 
-  // Dimensions must be resolved after providerType — the transformers
-  // provider's models are fixed at 768 dims and cannot be truncated.
+  // Dimensions resolve after the provider — the transformers models are
+  // fixed at 768 dims and cannot be truncated.
   const dimensions = envInt("KNOWLEDGE_SEARCH_DIMENSIONS") ??
     file?.dimensions ??
-    (providerType === "transformers" ? 768 : 512);
-
-  let provider: ProviderConfig | null = null;
-  if (providerType) {
-    switch (providerType) {
-      case "openai": {
-        // Helpful migration error: if someone set a custom baseUrl on `openai`,
-        // it used to be silently ignored. Steer them to openai-compatible.
-        if (file?.provider?.type === "openai" && (file.provider as { baseUrl?: unknown }).baseUrl) {
-          throw new Error(
-            'Custom baseUrl is not supported on provider type "openai" (it would be silently ignored and requests would hit api.openai.com). Change "type" to "openai-compatible" to use a custom endpoint.'
-          );
-        }
-        const apiKey =
-          envStr("KNOWLEDGE_SEARCH_OPENAI_API_KEY") ??
-          process.env.OPENAI_API_KEY ??
-          (file?.provider?.type === "openai" ? file.provider.apiKey : undefined);
-        if (!apiKey) {
-          throw new Error(
-            "OpenAI API key required. Run /knowledge-search-setup or set OPENAI_API_KEY."
-          );
-        }
-        provider = {
-          type: "openai",
-          apiKey,
-          model:
-            envStr("KNOWLEDGE_SEARCH_OPENAI_MODEL") ??
-            (file?.provider?.type === "openai" ? file.provider.model : undefined) ??
-            "text-embedding-3-small",
-        };
-        break;
-      }
-      case "openai-compatible": {
-        // Intentionally do NOT fall back to OPENAI_API_KEY here — an openai-
-        // compatible endpoint may be a third-party service, and silently sending
-        // the user's real OpenAI key to a foreign host would be a credential leak.
-        // Users must set KNOWLEDGE_SEARCH_COMPAT_API_KEY explicitly (or leave
-        // unset for runners like llama.cpp that don't require auth).
-        const compatApiKey =
-          envStr("KNOWLEDGE_SEARCH_COMPAT_API_KEY") ??
-          (file?.provider?.type === "openai-compatible" ? file.provider.apiKey : undefined);
-        const compatBaseUrl =
-          envStr("KNOWLEDGE_SEARCH_COMPAT_BASE_URL") ??
-          (file?.provider?.type === "openai-compatible" ? file.provider.baseUrl : undefined);
-        if (!compatBaseUrl) {
-          throw new Error(
-            "OpenAI-compatible requires baseUrl. Set KNOWLEDGE_SEARCH_COMPAT_BASE_URL or provide it in your knowledge-search.json config."
-          );
-        }
-        provider = {
-          type: "openai-compatible",
-          apiKey: compatApiKey,
-          model:
-            envStr("KNOWLEDGE_SEARCH_COMPAT_MODEL") ??
-            (file?.provider?.type === "openai-compatible" ? file.provider.model : undefined) ??
-            "text-embedding-3-small",
-          baseUrl: compatBaseUrl,
-        };
-        break;
-      }
-      case "bedrock":
-        provider = {
-          type: "bedrock",
-          profile:
-            envStr("KNOWLEDGE_SEARCH_BEDROCK_PROFILE") ??
-            (file?.provider?.type === "bedrock" ? file.provider.profile : undefined) ??
-            "default",
-          region:
-            envStr("KNOWLEDGE_SEARCH_BEDROCK_REGION") ??
-            (file?.provider?.type === "bedrock" ? file.provider.region : undefined) ??
-            "us-east-1",
-          model:
-            envStr("KNOWLEDGE_SEARCH_BEDROCK_MODEL") ??
-            (file?.provider?.type === "bedrock" ? file.provider.model : undefined) ??
-            "amazon.titan-embed-text-v2:0",
-        };
-        break;
-      case "ollama":
-        provider = {
-          type: "ollama",
-          url:
-            envStr("KNOWLEDGE_SEARCH_OLLAMA_URL") ??
-            (file?.provider?.type === "ollama" ? file.provider.url : undefined) ??
-            "http://localhost:11434",
-          model:
-            envStr("KNOWLEDGE_SEARCH_OLLAMA_MODEL") ??
-            (file?.provider?.type === "ollama" ? file.provider.model : undefined) ??
-            "nomic-embed-text",
-        };
-        break;
-      case "transformers":
-        provider = {
-          type: "transformers",
-          model:
-            envStr("KNOWLEDGE_SEARCH_TRANSFORMERS_MODEL") ??
-            (file?.provider?.type === "transformers" ? file.provider.model : undefined) ??
-            "nomic-ai/nomic-embed-text-v1.5",
-        };
-        break;
-      default:
-        throw new Error(
-          `Unknown provider: "${providerType}". Use "openai", "openai-compatible", "bedrock", "ollama", or "transformers".`
-        );
-    }
-  } // end if (providerType)
+    (provider ? 768 : 512);
 
   const indexDir = getIndexDir(cwd);
 
@@ -345,7 +239,6 @@ export function loadConfig(cwd?: string): Config | null {
     provider,
     modelSignature: provider ? `${provider.type}:${provider.model ?? ""}:${dimensions}` : null,
     indexDir,
-    knowledgeBases: file?.knowledgeBases ?? [],
     overview,
   };
 }

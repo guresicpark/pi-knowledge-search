@@ -1,18 +1,15 @@
 import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { fork } from "node:child_process";
-import * as fs from "node:fs";
 import { join } from "node:path";
 import { loadConfig, saveConfig, getConfigPath, type Config, type ConfigFile } from "./config.js";
 import { createEmbedder } from "./embedder.js";
 import { KnowledgeIndex } from "./index-store.js";
-import { BedrockKBSearcher } from "./kb-searcher.js";
 import { buildOverview, formatOverview } from "./overview.js";
 import { resolveNote, readNote } from "./kb-reader.js";
 
 export default function (pi: ExtensionAPI) {
   let index: KnowledgeIndex | null = null;
-  let kbSearcher: BedrockKBSearcher | null = null;
   let currentConfig: Config | null = null;
   let sessionCwd: string | undefined;
   let syncDone = false;
@@ -101,13 +98,9 @@ export default function (pi: ExtensionAPI) {
       indexLoaded = index.load();
     }
 
-    if (currentConfig.knowledgeBases.length > 0) {
-      kbSearcher = new BedrockKBSearcher(currentConfig.knowledgeBases);
-    }
-
     if (!index) {
       syncDone = true;
-      return; // KB-only mode — no local index to sync
+      return; // Nothing to sync
     }
 
     // ----------------------------------------------------------------
@@ -291,12 +284,9 @@ export default function (pi: ExtensionAPI) {
         .map((d: string) => d.trim())
         .filter(Boolean);
 
-      // Step 4: Provider
-      const providerChoice = await ctx.ui.select("Embedding provider:", [
-        "none — FTS-only keyword search (zero-config, no API key needed)",
-        "openai — OpenAI API (text-embedding-3-small)",
-        "bedrock — AWS Bedrock (Titan Embeddings v2)",
-        "ollama — Local Ollama (nomic-embed-text)",
+      // Step 4: Embedding engine — local ONNX, or none for pure keyword search
+      const providerChoice = await ctx.ui.select("Embedding engine:", [
+        "none — FTS-only keyword search (zero-config, no model download)",
         "transformers — Local ONNX via Transformers.js (nomic-embed-text-v1.5, no API key)",
       ]);
 
@@ -305,12 +295,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const providerType = providerChoice.split(" ")[0] as
-        | "none"
-        | "openai"
-        | "bedrock"
-        | "ollama"
-        | "transformers";
+      const providerType = providerChoice.split(" ")[0] as "none" | "transformers";
 
       let configFile: ConfigFile;
 
@@ -318,56 +303,6 @@ export default function (pi: ExtensionAPI) {
         case "none": {
           // FTS-only: no provider, keyword search via SQLite FTS5.
           configFile = { dirs, fileExtensions, excludeDirs };
-          break;
-        }
-        case "openai": {
-          const apiKey = await ctx.ui.input(
-            "OpenAI API key (or env var name):",
-            process.env.OPENAI_API_KEY ? "(using OPENAI_API_KEY from env)" : ""
-          );
-          const model = await ctx.ui.input("Model:", "text-embedding-3-small");
-          configFile = {
-            dirs,
-            fileExtensions,
-            excludeDirs,
-            provider: {
-              type: "openai",
-              apiKey: apiKey?.startsWith("(") ? undefined : apiKey || undefined,
-              model: model || "text-embedding-3-small",
-            },
-          };
-          break;
-        }
-        case "bedrock": {
-          const profile = await ctx.ui.input("AWS profile:", "default");
-          const region = await ctx.ui.input("AWS region:", "us-east-1");
-          const model = await ctx.ui.input("Model:", "amazon.titan-embed-text-v2:0");
-          configFile = {
-            dirs,
-            fileExtensions,
-            excludeDirs,
-            provider: {
-              type: "bedrock",
-              profile: profile || "default",
-              region: region || "us-east-1",
-              model: model || "amazon.titan-embed-text-v2:0",
-            },
-          };
-          break;
-        }
-        case "ollama": {
-          const url = await ctx.ui.input("Ollama URL:", "http://localhost:11434");
-          const model = await ctx.ui.input("Model:", "nomic-embed-text");
-          configFile = {
-            dirs,
-            fileExtensions,
-            excludeDirs,
-            provider: {
-              type: "ollama",
-              url: url || "http://localhost:11434",
-              model: model || "nomic-embed-text",
-            },
-          };
           break;
         }
         case "transformers": {
@@ -391,63 +326,6 @@ export default function (pi: ExtensionAPI) {
       // Save and confirm
       saveConfig(configFile!, sessionCwd);
       ctx.ui.notify(`Config saved to ${getConfigPath(sessionCwd)}. Run /reload to activate.`, "info");
-    },
-  });
-
-  // ------------------------------------------------------------------
-  // Add Knowledge Base command
-  // ------------------------------------------------------------------
-
-  pi.registerCommand("knowledge-add-kb", {
-    description: "Add a Bedrock Knowledge Base as a search source",
-    handler: async (_args, ctx) => {
-      const kbId = await ctx.ui.input("Bedrock Knowledge Base ID:", "");
-      if (!kbId) {
-        ctx.ui.notify("Cancelled.", "info");
-        return;
-      }
-
-      const label = await ctx.ui.input("Label (optional, for display):", "");
-
-      const region = await ctx.ui.input("AWS region:", "us-east-1");
-
-      const profile = await ctx.ui.input("AWS profile:", "default");
-
-      // Load existing config or create minimal one
-      let existing: ConfigFile;
-      try {
-        const loaded = loadConfig(sessionCwd);
-        if (loaded) {
-          // Read the raw file to preserve structure
-          const raw = fs.readFileSync(getConfigPath(sessionCwd), "utf-8");
-          existing = JSON.parse(raw);
-        } else {
-          existing = {};
-        }
-      } catch {
-        existing = {};
-      }
-
-      if (!existing.knowledgeBases) existing.knowledgeBases = [];
-
-      // Don't add duplicates
-      if (existing.knowledgeBases.some((kb: any) => kb.id === kbId)) {
-        ctx.ui.notify(`KB ${kbId} already configured.`, "warning");
-        return;
-      }
-
-      existing.knowledgeBases.push({
-        id: kbId,
-        region: region || "us-east-1",
-        profile: profile || "default",
-        ...(label ? { label } : {}),
-      });
-
-      saveConfig(existing as ConfigFile, sessionCwd);
-      ctx.ui.notify(
-        `Added KB ${kbId}${label ? ` (${label})` : ""}. Run /reload to activate.`,
-        "info"
-      );
     },
   });
 
@@ -520,14 +398,11 @@ export default function (pi: ExtensionAPI) {
     ],
     parameters: searchParams,
     async execute(toolCallId, params, signal) {
-      const hasLocalIndex = index && index.size() > 0;
-      const hasKB = !!kbSearcher;
-
-      if (!hasLocalIndex && !hasKB) {
+      if (!index || index.size() === 0) {
         const msg =
-          !index && !kbSearcher
+          !index
             ? "knowledge-search is not configured. The user can run /knowledge-search-setup to set it up."
-            : !syncDone && index
+            : !syncDone
               ? "Index is still syncing in the background. Try again in a moment."
               : "Index is empty.";
         return { content: [{ type: "text", text: msg }], details: {} };
@@ -536,16 +411,7 @@ export default function (pi: ExtensionAPI) {
       const limit = Math.min(params.limit ?? 8, 20);
 
       try {
-        // Search local index and Bedrock KBs in parallel
-        const [localResults, kbResults] = await Promise.all([
-          hasLocalIndex ? index!.search(params.query, limit, signal) : [],
-          hasKB ? kbSearcher!.search(params.query, limit, signal) : [],
-        ]);
-
-        // Merge and sort by score, take top N
-        const results = [...localResults, ...kbResults]
-          .sort((a, b) => b.score - a.score)
-          .slice(0, limit);
+        const results = await index.search(params.query, limit, signal);
 
         if (results.length === 0) {
           return {
@@ -569,11 +435,7 @@ export default function (pi: ExtensionAPI) {
           })
           .join("\n\n---\n\n");
 
-        const indexInfo = hasLocalIndex
-          ? `${index!.size()} files, ${index!.chunkCount()} chunks indexed`
-          : "";
-        const kbInfo = hasKB ? `${currentConfig!.knowledgeBases.length} knowledge base(s)` : "";
-        const sourceInfo = [indexInfo, kbInfo].filter(Boolean).join(" + ");
+        const sourceInfo = `${index.size()} files, ${index.chunkCount()} chunks indexed`;
         const header = `Found ${results.length} results for "${params.query}" (${sourceInfo}):\n\n`;
 
         return {

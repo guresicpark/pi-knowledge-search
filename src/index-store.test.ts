@@ -76,7 +76,6 @@ function makeConfig(dir: string, dimensions = 4): Config {
     provider: null,
     modelSignature: null,
     indexDir: dir,
-    knowledgeBases: [],
     overview: { inject: false, maxDepth: 2, maxFoldersPerDir: 20, maxKeywordsPerFolder: 5 },
   };
 }
@@ -292,7 +291,6 @@ describe("KnowledgeIndex embedding signature", () => {
       provider: null,
       modelSignature: signature,
       indexDir: dir,
-      knowledgeBases: [],
       overview: { inject: false, maxDepth: 2, maxFoldersPerDir: 20, maxKeywordsPerFolder: 5 },
     };
   }
@@ -317,15 +315,15 @@ describe("KnowledgeIndex embedding signature", () => {
   }
 
   it("keeps entries when the signature matches the current engine", async () => {
-    writeIndex(3, "openai:text-embedding-3-small:4");
-    const idx = new KnowledgeIndex(makeSigConfig(tmpDir, "openai:text-embedding-3-small:4"), new StubEmbedder());
+    writeIndex(3, "transformers:nomic-ai/nomic-embed-text-v1.5:4");
+    const idx = new KnowledgeIndex(makeSigConfig(tmpDir, "transformers:nomic-ai/nomic-embed-text-v1.5:4"), new StubEmbedder());
     await idx.load();
     assert.equal(idx.chunkCount(), 3);
     await idx.close();
   });
 
   it("removes all existing embeddings when the engine changes", async () => {
-    writeIndex(3, "openai:text-embedding-3-small:4");
+    writeIndex(3, "transformers:Xenova/all-MiniLM-L6-v2:4");
     const idx = new KnowledgeIndex(
       makeSigConfig(tmpDir, "transformers:nomic-ai/nomic-embed-text-v1.5:4"),
       new StubEmbedder()
@@ -337,14 +335,14 @@ describe("KnowledgeIndex embedding signature", () => {
 
   it("removes legacy vectors built before signatures existed", async () => {
     writeIndex(3, null);
-    const idx = new KnowledgeIndex(makeSigConfig(tmpDir, "openai:text-embedding-3-small:4"), new StubEmbedder());
+    const idx = new KnowledgeIndex(makeSigConfig(tmpDir, "transformers:nomic-ai/nomic-embed-text-v1.5:4"), new StubEmbedder());
     await idx.load();
     assert.equal(idx.chunkCount(), 0, "signature-less vectors cannot be trusted");
     await idx.close();
   });
 
   it("FTS-only load ignores a signature mismatch (vectors unused)", async () => {
-    writeIndex(3, "openai:text-embedding-3-small:4");
+    writeIndex(3, "transformers:nomic-ai/nomic-embed-text-v1.5:4");
     const idx = new KnowledgeIndex(makeSigConfig(tmpDir, null), null);
     await idx.load();
     assert.equal(idx.chunkCount(), 3);

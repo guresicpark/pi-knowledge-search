@@ -20,7 +20,6 @@ const envKeys = [
   "KNOWLEDGE_SEARCH_INDEX_DIR",
   "KNOWLEDGE_SEARCH_DIRS",
   "KNOWLEDGE_SEARCH_CWD",
-  "OPENAI_API_KEY",
   "HOME",
 ];
 
@@ -58,7 +57,6 @@ describe("config.localPath resolution", () => {
     delete process.env.KNOWLEDGE_SEARCH_INDEX_DIR;
     delete process.env.KNOWLEDGE_SEARCH_DIRS;
     delete process.env.KNOWLEDGE_SEARCH_CWD;
-    delete process.env.OPENAI_API_KEY;
 
     const mod = await import("./config.js");
     resolveLocalBase = mod.resolveLocalBase;
@@ -73,7 +71,6 @@ describe("config.localPath resolution", () => {
     delete process.env.KNOWLEDGE_SEARCH_INDEX_DIR;
     delete process.env.KNOWLEDGE_SEARCH_DIRS;
     delete process.env.KNOWLEDGE_SEARCH_CWD;
-    delete process.env.OPENAI_API_KEY;
     // Clear any prior settings file.
     try {
       fs.rmSync(path.join(tmpProject, ".pi"), { recursive: true, force: true });
@@ -220,7 +217,7 @@ describe("config.localPath resolution", () => {
       path.join(tmpLocal, "config.json"),
       JSON.stringify({
         dirs: ["/tmp/project-docs"],
-        provider: { type: "openai", apiKey: "sk-local" },
+        provider: { type: "transformers" },
       }),
       "utf-8"
     );
@@ -238,7 +235,7 @@ describe("config.localPath resolution", () => {
       path.join(tmpCascade, "knowledge-search", "config.json"),
       JSON.stringify({
         dirs: ["/tmp/cascade-docs"],
-        provider: { type: "openai", apiKey: "sk-cascade" },
+        provider: { type: "transformers" },
       }),
       "utf-8"
     );
@@ -263,7 +260,7 @@ describe("config.localPath resolution", () => {
       path.join(tmpProject, ".pi", "knowledge-search.json"),
       JSON.stringify({
         dirs: ["/tmp/project-docs"],
-        provider: { type: "openai", apiKey: "sk-project" },
+        provider: { type: "transformers" },
       }),
       "utf-8"
     );
@@ -282,7 +279,7 @@ describe("config.localPath resolution", () => {
     saveConfig(
       {
         dirs: ["/tmp/save-test"],
-        provider: { type: "openai", apiKey: "sk-write" },
+        provider: { type: "transformers" },
       },
       tmpProject
     );
@@ -299,7 +296,7 @@ describe("config.localPath resolution", () => {
     saveConfig(
       {
         dirs: ["/tmp/cascade-save"],
-        provider: { type: "openai", apiKey: "sk-cascade" },
+        provider: { type: "transformers" },
       },
       tmpProject
     );
@@ -320,7 +317,7 @@ describe("config.localPath resolution", () => {
       saveConfig(
         {
           dirs: ["/tmp/deep"],
-          provider: { type: "openai", apiKey: "sk-deep" },
+          provider: { type: "transformers" },
         },
         tmpProject
       );

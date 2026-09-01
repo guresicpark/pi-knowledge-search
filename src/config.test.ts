@@ -18,20 +18,8 @@ const envKeys = [
   "KNOWLEDGE_SEARCH_EXTENSIONS",
   "KNOWLEDGE_SEARCH_EXCLUDE",
   "KNOWLEDGE_SEARCH_DIMENSIONS",
-  "KNOWLEDGE_SEARCH_PROVIDER",
-  "KNOWLEDGE_SEARCH_OPENAI_API_KEY",
-  "KNOWLEDGE_SEARCH_OPENAI_MODEL",
-  "KNOWLEDGE_SEARCH_COMPAT_API_KEY",
-  "KNOWLEDGE_SEARCH_COMPAT_BASE_URL",
-  "KNOWLEDGE_SEARCH_COMPAT_MODEL",
-  "KNOWLEDGE_SEARCH_BEDROCK_PROFILE",
-  "KNOWLEDGE_SEARCH_BEDROCK_REGION",
-  "KNOWLEDGE_SEARCH_BEDROCK_MODEL",
-  "KNOWLEDGE_SEARCH_OLLAMA_URL",
-  "KNOWLEDGE_SEARCH_OLLAMA_MODEL",
   "KNOWLEDGE_SEARCH_TRANSFORMERS_MODEL",
   "KNOWLEDGE_SEARCH_INDEX_DIR",
-  "OPENAI_API_KEY",
 ];
 
 let loadConfig: (typeof import("./config.js"))["loadConfig"];
@@ -105,9 +93,8 @@ describe("config", () => {
         excludeDirs: ["node_modules"],
         dimensions: 256,
         provider: {
-          type: "openai",
-          apiKey: "sk-test-key-123",
-          model: "text-embedding-3-small",
+          type: "transformers",
+          model: "Xenova/all-MiniLM-L6-v2",
         },
       })
     );
@@ -118,9 +105,9 @@ describe("config", () => {
     assert.deepStrictEqual(config.dirs, ["/tmp/test-docs"]);
     assert.deepStrictEqual(config.fileExtensions, [".md"]);
     assert.equal(config.dimensions, 256);
-    assert.equal(config.provider.type, "openai");
-    if (config.provider.type === "openai") {
-      assert.equal(config.provider.apiKey, "sk-test-key-123");
+    assert.equal(config.provider.type, "transformers");
+    if (config.provider.type === "transformers") {
+      assert.equal(config.provider.model, "Xenova/all-MiniLM-L6-v2");
     }
   });
 
@@ -130,18 +117,13 @@ describe("config", () => {
     assert.equal(config, null);
   });
 
-  it("uses env var KNOWLEDGE_SEARCH_DIRS as fallback", () => {
+  it("uses env var KNOWLEDGE_SEARCH_DIRS as fallback (FTS-only)", () => {
     process.env.KNOWLEDGE_SEARCH_DIRS = "/tmp/dir-a, /tmp/dir-b";
-    process.env.OPENAI_API_KEY = "sk-env-key";
 
     const config = loadConfig();
     assert.ok(config);
-    assert.ok(config.provider);
+    assert.equal(config.provider, null);
     assert.deepStrictEqual(config.dirs, ["/tmp/dir-a", "/tmp/dir-b"]);
-    assert.equal(config.provider.type, "openai");
-    if (config.provider.type === "openai") {
-      assert.equal(config.provider.apiKey, "sk-env-key");
-    }
   });
 
   it("applies default values for optional fields", () => {
@@ -149,7 +131,7 @@ describe("config", () => {
       configFile,
       JSON.stringify({
         dirs: ["/tmp/docs"],
-        provider: { type: "openai", apiKey: "sk-test" },
+        provider: { type: "transformers" },
       })
     );
 
@@ -160,7 +142,7 @@ describe("config", () => {
     assert.ok(config.excludeDirs.includes(".git"));
     assert.ok(config.excludeDirs.includes(".obsidian"));
     assert.ok(config.excludeDirs.includes(".trash"));
-    assert.equal(config.dimensions, 512);
+    assert.equal(config.dimensions, 768);
   });
 
   it("resolves ~ in directory paths", () => {
@@ -171,7 +153,7 @@ describe("config", () => {
       configFile,
       JSON.stringify({
         dirs: ["~/Documents/notes"],
-        provider: { type: "openai", apiKey: "sk-test" },
+        provider: { type: "transformers" },
       })
     );
 
@@ -181,65 +163,6 @@ describe("config", () => {
       assert.deepStrictEqual(config.dirs, ["/home/testuser/Documents/notes"]);
     } finally {
       process.env.HOME = originalHome;
-    }
-  });
-
-  it("throws for openai provider without API key", () => {
-    fs.writeFileSync(
-      configFile,
-      JSON.stringify({
-        dirs: ["/tmp/docs"],
-        provider: { type: "openai" },
-      })
-    );
-
-    assert.throws(() => loadConfig(), /API key required/);
-  });
-
-  it("configures bedrock provider", () => {
-    fs.writeFileSync(
-      configFile,
-      JSON.stringify({
-        dirs: ["/tmp/docs"],
-        provider: {
-          type: "bedrock",
-          profile: "my-profile",
-          region: "us-west-2",
-          model: "amazon.titan-embed-text-v2:0",
-        },
-      })
-    );
-
-    const config = loadConfig();
-    assert.ok(config);
-    assert.ok(config.provider);
-    assert.equal(config.provider.type, "bedrock");
-    if (config.provider.type === "bedrock") {
-      assert.equal(config.provider.profile, "my-profile");
-      assert.equal(config.provider.region, "us-west-2");
-    }
-  });
-
-  it("configures ollama provider", () => {
-    fs.writeFileSync(
-      configFile,
-      JSON.stringify({
-        dirs: ["/tmp/docs"],
-        provider: {
-          type: "ollama",
-          url: "http://localhost:11434",
-          model: "nomic-embed-text",
-        },
-      })
-    );
-
-    const config = loadConfig();
-    assert.ok(config);
-    assert.ok(config.provider);
-    assert.equal(config.provider.type, "ollama");
-    if (config.provider.type === "ollama") {
-      assert.equal(config.provider.url, "http://localhost:11434");
-      assert.equal(config.provider.model, "nomic-embed-text");
     }
   });
 
@@ -302,13 +225,38 @@ describe("config", () => {
       JSON.stringify({
         dirs: ["/tmp/docs"],
         dimensions: 256,
-        provider: { type: "openai", apiKey: "sk-test", model: "text-embedding-3-small" },
+        provider: { type: "transformers", model: "Xenova/all-MiniLM-L6-v2" },
       })
     );
 
     const config = loadConfig();
     assert.ok(config);
-    assert.equal(config.modelSignature, "openai:text-embedding-3-small:256");
+    assert.equal(config.modelSignature, "transformers:Xenova/all-MiniLM-L6-v2:256");
+  });
+
+  it("throws a helpful migration error for removed provider types", () => {
+    for (const removed of ["openai", "openai-compatible", "bedrock", "ollama"]) {
+      fs.writeFileSync(
+        configFile,
+        JSON.stringify({
+          dirs: ["/tmp/docs"],
+          provider: { type: removed },
+        })
+      );
+
+      assert.throws(
+        () => loadConfig(),
+        (err: unknown) => {
+          assert.ok(err instanceof Error);
+          assert.match(err.message, /Unsupported embedding provider/);
+          assert.match(err.message, new RegExp(`"${removed}"`));
+          assert.match(err.message, /transformers/);
+          assert.match(err.message, /FTS-only/);
+          return true;
+        },
+        `expected loadConfig() to throw for provider "${removed}"`
+      );
+    }
   });
 
   it("throws for unknown provider type", () => {
@@ -320,7 +268,7 @@ describe("config", () => {
       })
     );
 
-    assert.throws(() => loadConfig(), /Unknown provider/);
+    assert.throws(() => loadConfig(), /Unsupported embedding provider/);
   });
 
   it("env vars override config file values", () => {
@@ -329,7 +277,7 @@ describe("config", () => {
       JSON.stringify({
         dirs: ["/tmp/file-dirs"],
         dimensions: 256,
-        provider: { type: "openai", apiKey: "sk-file-key" },
+        provider: { type: "transformers" },
       })
     );
     process.env.KNOWLEDGE_SEARCH_DIRS = "/tmp/env-dirs";
@@ -341,35 +289,17 @@ describe("config", () => {
     assert.equal(config.dimensions, 1024);
   });
 
-  it("env var overrides provider API key", () => {
-    fs.writeFileSync(
-      configFile,
-      JSON.stringify({
-        dirs: ["/tmp/docs"],
-        provider: { type: "openai", apiKey: "sk-file-key" },
-      })
-    );
-    process.env.KNOWLEDGE_SEARCH_OPENAI_API_KEY = "sk-env-override";
-
-    const config = loadConfig();
-    assert.ok(config);
-    assert.ok(config.provider);
-    if (config.provider.type === "openai") {
-      assert.equal(config.provider.apiKey, "sk-env-override");
-    }
-  });
-
   it("saveConfig writes valid JSON to config path", () => {
     const configData = {
       dirs: ["/tmp/saved"],
-      provider: { type: "openai" as const, apiKey: "sk-saved" },
+      provider: { type: "transformers" as const, model: "nomic-ai/nomic-embed-text-v1.5" },
     };
     saveConfig(configData);
 
     const raw = fs.readFileSync(configFile, "utf-8");
     const parsed = JSON.parse(raw);
     assert.deepStrictEqual(parsed.dirs, ["/tmp/saved"]);
-    assert.equal(parsed.provider.type, "openai");
+    assert.equal(parsed.provider.type, "transformers");
   });
 
   it("returns null when dirs resolve to empty", () => {
@@ -377,175 +307,11 @@ describe("config", () => {
       configFile,
       JSON.stringify({
         dirs: [],
-        provider: { type: "openai", apiKey: "sk-test" },
+        provider: { type: "transformers" },
       })
     );
 
     const config = loadConfig();
     assert.equal(config, null);
-  });
-
-  it("bedrock provider uses defaults when fields missing", () => {
-    fs.writeFileSync(
-      configFile,
-      JSON.stringify({
-        dirs: ["/tmp/docs"],
-        provider: { type: "bedrock" },
-      })
-    );
-
-    const config = loadConfig();
-    assert.ok(config);
-    assert.ok(config.provider);
-    if (config.provider.type === "bedrock") {
-      assert.equal(config.provider.profile, "default");
-      assert.equal(config.provider.region, "us-east-1");
-      assert.equal(config.provider.model, "amazon.titan-embed-text-v2:0");
-    }
-  });
-
-  it("ollama provider uses defaults when fields missing", () => {
-    fs.writeFileSync(
-      configFile,
-      JSON.stringify({
-        dirs: ["/tmp/docs"],
-        provider: { type: "ollama" },
-      })
-    );
-
-    const config = loadConfig();
-    assert.ok(config);
-    assert.ok(config.provider);
-    if (config.provider.type === "ollama") {
-      assert.equal(config.provider.url, "http://localhost:11434");
-      assert.equal(config.provider.model, "nomic-embed-text");
-    }
-  });
-
-  // ---------------------------------------------------------------------
-  // openai-compatible provider
-  // ---------------------------------------------------------------------
-
-  it("configures openai-compatible provider from file", () => {
-    fs.writeFileSync(
-      configFile,
-      JSON.stringify({
-        dirs: ["/tmp/docs"],
-        provider: {
-          type: "openai-compatible",
-          baseUrl: "http://127.0.0.1:8080",
-          apiKey: "local-key",
-          model: "qwen3-embeddings",
-        },
-      })
-    );
-
-    const config = loadConfig();
-    assert.ok(config);
-    assert.ok(config.provider);
-    assert.equal(config.provider.type, "openai-compatible");
-    if (config.provider.type === "openai-compatible") {
-      assert.equal(config.provider.baseUrl, "http://127.0.0.1:8080");
-      assert.equal(config.provider.apiKey, "local-key");
-      assert.equal(config.provider.model, "qwen3-embeddings");
-    }
-  });
-
-  it("openai-compatible provider defaults model when omitted", () => {
-    fs.writeFileSync(
-      configFile,
-      JSON.stringify({
-        dirs: ["/tmp/docs"],
-        provider: {
-          type: "openai-compatible",
-          baseUrl: "http://127.0.0.1:8080",
-        },
-      })
-    );
-
-    const config = loadConfig();
-    assert.ok(config);
-    assert.ok(config.provider);
-    if (config.provider.type === "openai-compatible") {
-      assert.equal(config.provider.model, "text-embedding-3-small");
-      assert.equal(config.provider.apiKey, undefined);
-    }
-  });
-
-  it("openai-compatible provider throws when baseUrl missing", () => {
-    fs.writeFileSync(
-      configFile,
-      JSON.stringify({
-        dirs: ["/tmp/docs"],
-        provider: { type: "openai-compatible", apiKey: "x" },
-      })
-    );
-
-    assert.throws(() => loadConfig(), /baseUrl/);
-  });
-
-  it("openai-compatible env vars override file values", () => {
-    fs.writeFileSync(
-      configFile,
-      JSON.stringify({
-        dirs: ["/tmp/docs"],
-        provider: {
-          type: "openai-compatible",
-          baseUrl: "http://file-host:1234",
-          apiKey: "file-key",
-          model: "file-model",
-        },
-      })
-    );
-    process.env.KNOWLEDGE_SEARCH_COMPAT_BASE_URL = "http://env-host:9999";
-    process.env.KNOWLEDGE_SEARCH_COMPAT_API_KEY = "env-key";
-    process.env.KNOWLEDGE_SEARCH_COMPAT_MODEL = "env-model";
-
-    const config = loadConfig();
-    assert.ok(config);
-    assert.ok(config.provider);
-    if (config.provider.type === "openai-compatible") {
-      assert.equal(config.provider.baseUrl, "http://env-host:9999");
-      assert.equal(config.provider.apiKey, "env-key");
-      assert.equal(config.provider.model, "env-model");
-    }
-  });
-
-  it("openai-compatible does NOT fall back to OPENAI_API_KEY (credential-leak guard)", () => {
-    fs.writeFileSync(
-      configFile,
-      JSON.stringify({
-        dirs: ["/tmp/docs"],
-        provider: {
-          type: "openai-compatible",
-          baseUrl: "http://127.0.0.1:8080",
-        },
-      })
-    );
-    process.env.OPENAI_API_KEY = "sk-real-openai-key";
-
-    const config = loadConfig();
-    assert.ok(config);
-    assert.ok(config.provider);
-    if (config.provider.type === "openai-compatible") {
-      // Real OpenAI key must NOT be bled into third-party endpoint
-      assert.equal(config.provider.apiKey, undefined);
-    }
-  });
-
-  it("throws a helpful error if baseUrl is set on type: openai", () => {
-    fs.writeFileSync(
-      configFile,
-      JSON.stringify({
-        dirs: ["/tmp/docs"],
-        provider: {
-          type: "openai",
-          apiKey: "sk-test",
-          baseUrl: "http://127.0.0.1:8080",
-        },
-      })
-    );
-
-    assert.throws(() => loadConfig(), /openai-compatible/);
   });
 });

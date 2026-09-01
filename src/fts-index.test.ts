@@ -21,7 +21,6 @@ function makeConfig(dir: string, dimensions = 4): Config {
     provider: null,
     modelSignature: null,
     indexDir: dir,
-    knowledgeBases: [],
     overview: { inject: false, maxDepth: 2, maxFoldersPerDir: 20, maxKeywordsPerFolder: 5 },
   };
 }
@@ -449,7 +448,6 @@ describe("KnowledgeIndex FTS-only mode (no embedder)", () => {
       provider: null,
       modelSignature: null,
       indexDir,
-      knowledgeBases: [],
       overview: { inject: false, maxDepth: 2, maxFoldersPerDir: 20, maxKeywordsPerFolder: 5 },
     };
   }

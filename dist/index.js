@@ -1,7 +1,6 @@
 // src/index.ts
 import { Type } from "@sinclair/typebox";
 import { fork } from "node:child_process";
-import * as fs5 from "node:fs";
 import { join as join6 } from "node:path";
 
 // src/config.ts
@@ -64,85 +63,28 @@ function loadConfig(cwd) {
     }
   }
   const envDirs = process.env.KNOWLEDGE_SEARCH_DIRS;
-  const hasKBs = (file?.knowledgeBases?.length ?? 0) > 0;
   if (!file && !envDirs) {
     return null;
   }
   const home = process.env.HOME || "/tmp";
   const resolvePath = (p) => p.replace(/^~/, home);
   const dirs = (envDirs ? envDirs.split(",").map((d) => d.trim()) : file?.dirs ?? []).map(resolvePath).filter(Boolean);
-  if (dirs.length === 0 && !hasKBs) return null;
+  if (dirs.length === 0) return null;
   const fileExtensions = envStr("KNOWLEDGE_SEARCH_EXTENSIONS")?.split(",").map((e) => e.trim()) ?? file?.fileExtensions ?? [".md", ".txt"];
   const excludeDirs = envStr("KNOWLEDGE_SEARCH_EXCLUDE")?.split(",").map((d) => d.trim()) ?? file?.excludeDirs ?? ["node_modules", ".git", ".obsidian", ".trash"];
-  const providerType = envStr("KNOWLEDGE_SEARCH_PROVIDER") ?? file?.provider?.type ?? // Convenience default: if OPENAI_API_KEY is exported and nothing else
-  // is configured, assume the user wants the openai provider.
-  (process.env.OPENAI_API_KEY ? "openai" : void 0);
-  const dimensions = envInt("KNOWLEDGE_SEARCH_DIMENSIONS") ?? file?.dimensions ?? (providerType === "transformers" ? 768 : 512);
   let provider = null;
-  if (providerType) {
-    switch (providerType) {
-      case "openai": {
-        if (file?.provider?.type === "openai" && file.provider.baseUrl) {
-          throw new Error(
-            'Custom baseUrl is not supported on provider type "openai" (it would be silently ignored and requests would hit api.openai.com). Change "type" to "openai-compatible" to use a custom endpoint.'
-          );
-        }
-        const apiKey = envStr("KNOWLEDGE_SEARCH_OPENAI_API_KEY") ?? process.env.OPENAI_API_KEY ?? (file?.provider?.type === "openai" ? file.provider.apiKey : void 0);
-        if (!apiKey) {
-          throw new Error(
-            "OpenAI API key required. Run /knowledge-search-setup or set OPENAI_API_KEY."
-          );
-        }
-        provider = {
-          type: "openai",
-          apiKey,
-          model: envStr("KNOWLEDGE_SEARCH_OPENAI_MODEL") ?? (file?.provider?.type === "openai" ? file.provider.model : void 0) ?? "text-embedding-3-small"
-        };
-        break;
-      }
-      case "openai-compatible": {
-        const compatApiKey = envStr("KNOWLEDGE_SEARCH_COMPAT_API_KEY") ?? (file?.provider?.type === "openai-compatible" ? file.provider.apiKey : void 0);
-        const compatBaseUrl = envStr("KNOWLEDGE_SEARCH_COMPAT_BASE_URL") ?? (file?.provider?.type === "openai-compatible" ? file.provider.baseUrl : void 0);
-        if (!compatBaseUrl) {
-          throw new Error(
-            "OpenAI-compatible requires baseUrl. Set KNOWLEDGE_SEARCH_COMPAT_BASE_URL or provide it in your knowledge-search.json config."
-          );
-        }
-        provider = {
-          type: "openai-compatible",
-          apiKey: compatApiKey,
-          model: envStr("KNOWLEDGE_SEARCH_COMPAT_MODEL") ?? (file?.provider?.type === "openai-compatible" ? file.provider.model : void 0) ?? "text-embedding-3-small",
-          baseUrl: compatBaseUrl
-        };
-        break;
-      }
-      case "bedrock":
-        provider = {
-          type: "bedrock",
-          profile: envStr("KNOWLEDGE_SEARCH_BEDROCK_PROFILE") ?? (file?.provider?.type === "bedrock" ? file.provider.profile : void 0) ?? "default",
-          region: envStr("KNOWLEDGE_SEARCH_BEDROCK_REGION") ?? (file?.provider?.type === "bedrock" ? file.provider.region : void 0) ?? "us-east-1",
-          model: envStr("KNOWLEDGE_SEARCH_BEDROCK_MODEL") ?? (file?.provider?.type === "bedrock" ? file.provider.model : void 0) ?? "amazon.titan-embed-text-v2:0"
-        };
-        break;
-      case "ollama":
-        provider = {
-          type: "ollama",
-          url: envStr("KNOWLEDGE_SEARCH_OLLAMA_URL") ?? (file?.provider?.type === "ollama" ? file.provider.url : void 0) ?? "http://localhost:11434",
-          model: envStr("KNOWLEDGE_SEARCH_OLLAMA_MODEL") ?? (file?.provider?.type === "ollama" ? file.provider.model : void 0) ?? "nomic-embed-text"
-        };
-        break;
-      case "transformers":
-        provider = {
-          type: "transformers",
-          model: envStr("KNOWLEDGE_SEARCH_TRANSFORMERS_MODEL") ?? (file?.provider?.type === "transformers" ? file.provider.model : void 0) ?? "nomic-ai/nomic-embed-text-v1.5"
-        };
-        break;
-      default:
-        throw new Error(
-          `Unknown provider: "${providerType}". Use "openai", "openai-compatible", "bedrock", "ollama", or "transformers".`
-        );
+  if (file?.provider) {
+    if (file.provider.type !== "transformers") {
+      throw new Error(
+        `Unsupported embedding provider "${file.provider.type}". Only local search is supported: use { "type": "transformers" } (local ONNX embeddings via Transformers.js), or remove the provider block entirely for FTS-only keyword search.`
+      );
     }
+    provider = {
+      type: "transformers",
+      model: envStr("KNOWLEDGE_SEARCH_TRANSFORMERS_MODEL") ?? file.provider.model ?? "nomic-ai/nomic-embed-text-v1.5"
+    };
   }
+  const dimensions = envInt("KNOWLEDGE_SEARCH_DIMENSIONS") ?? file?.dimensions ?? (provider ? 768 : 512);
   const indexDir = getIndexDir(cwd);
   const overviewFile = file?.overview ?? {};
   const overview = {
@@ -159,7 +101,6 @@ function loadConfig(cwd) {
     provider,
     modelSignature: provider ? `${provider.type}:${provider.model ?? ""}:${dimensions}` : null,
     indexDir,
-    knowledgeBases: file?.knowledgeBases ?? [],
     overview
   };
 }
@@ -188,19 +129,8 @@ function envBool(key) {
 // src/embedder.ts
 import { join as join2 } from "node:path";
 import { homedir } from "node:os";
-function createEmbedder(config, dimensions) {
-  switch (config.type) {
-    case "openai":
-      return new OpenAIEmbedder(config.apiKey, config.model, dimensions, void 0);
-    case "openai-compatible":
-      return new OpenAIEmbedder(config.apiKey ?? "", config.model, dimensions, config.baseUrl);
-    case "bedrock":
-      return new BedrockEmbedder(config.profile, config.region, config.model, dimensions);
-    case "ollama":
-      return new OllamaEmbedder(config.url, config.model);
-    case "transformers":
-      return new TransformersEmbedder(config.model);
-  }
+function createEmbedder(config, _dimensions) {
+  return new TransformersEmbedder(config.model);
 }
 function truncate(text, maxChars = 1e4) {
   return text.length > maxChars ? text.slice(0, maxChars) : text;
@@ -210,220 +140,6 @@ function summarizeErrors(errs, max = 3) {
   const shown = list.slice(0, max).join("; ");
   return list.length > max ? `${shown} (+${list.length - max} more)` : shown;
 }
-var RETRY_DELAYS = [1e3, 2e3, 4e3];
-async function withRateLimitRetry(fn, label) {
-  for (let attempt = 0; ; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      const is429 = err?.message?.includes("429") || err?.name === "ThrottlingException" || err?.$metadata?.httpStatusCode === 429;
-      if (is429 && attempt < RETRY_DELAYS.length) {
-        const delay = RETRY_DELAYS[attempt];
-        console.error(
-          `knowledge-search: ${label} rate limited, retrying in ${delay}ms (attempt ${attempt + 1}/${RETRY_DELAYS.length})`
-        );
-        await new Promise((r) => setTimeout(r, delay));
-        continue;
-      }
-      throw err;
-    }
-  }
-}
-async function parallelMap(items, fn, concurrency, signal) {
-  const results = new Array(items.length);
-  let cursor = 0;
-  const worker = async () => {
-    while (cursor < items.length) {
-      if (signal?.aborted) throw new Error("Aborted");
-      const idx = cursor++;
-      results[idx] = await fn(items[idx], idx);
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => worker()));
-  return results;
-}
-var OpenAIEmbedder = class {
-  apiKey;
-  model;
-  dimensions;
-  endpoint;
-  constructor(apiKey, model, dimensions, baseUrl) {
-    this.apiKey = apiKey;
-    this.model = model;
-    this.dimensions = dimensions;
-    if (baseUrl) {
-      this.endpoint = `${baseUrl.replace(/\/$/, "")}/v1/embeddings`;
-    } else {
-      this.endpoint = `https://api.openai.com/v1/embeddings`;
-    }
-  }
-  async embed(text, signal) {
-    const results = await this.embedBatch([text], signal);
-    if (!results[0]) throw new Error("Embedding failed \u2014 provider returned no vector");
-    return results[0];
-  }
-  async embedBatch(texts, signal) {
-    const BATCH = 100;
-    const results = new Array(texts.length);
-    for (let i = 0; i < texts.length; i += BATCH) {
-      if (signal?.aborted) throw new Error("Aborted");
-      const batch = texts.slice(i, i + BATCH).map((t) => truncate(t));
-      try {
-        const json = await withRateLimitRetry(async () => {
-          const res = await fetch(this.endpoint, {
-            method: "POST",
-            headers: {
-              ...this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {},
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-              input: batch,
-              model: this.model,
-              dimensions: this.dimensions
-            }),
-            signal
-          });
-          if (!res.ok) {
-            const body = await res.text();
-            throw new Error(`OpenAI API ${res.status}: ${body.slice(0, 200)}`);
-          }
-          return await res.json();
-        }, "embedding");
-        for (const item of json.data) {
-          results[i + item.index] = item.embedding;
-        }
-      } catch (err) {
-        for (let j = 0; j < batch.length; j++) {
-          results[i + j] = null;
-        }
-        const label = this.endpoint.includes("api.openai.com") ? "OpenAI" : `Embedding (${this.endpoint})`;
-        console.error(`${label} batch embedding failed: ${err.message}`);
-      }
-    }
-    return results;
-  }
-};
-var BedrockEmbedder = class {
-  client;
-  // Lazy-loaded to avoid hard dep if not using Bedrock
-  model;
-  dimensions;
-  clientPromise;
-  constructor(profile, region, model, dimensions) {
-    this.model = model;
-    this.dimensions = dimensions;
-    this.clientPromise = (async () => {
-      const { BedrockRuntimeClient } = await import("@aws-sdk/client-bedrock-runtime");
-      const { fromIni } = await import("@aws-sdk/credential-providers");
-      return new BedrockRuntimeClient({
-        region,
-        credentials: fromIni({ profile })
-      });
-    })();
-  }
-  async embed(text, signal) {
-    const results = await this.embedBatch([text], signal);
-    if (!results[0]) throw new Error("Embedding failed \u2014 provider returned no vector");
-    return results[0];
-  }
-  async embedBatch(texts, signal, concurrency = 10) {
-    const client = await this.clientPromise;
-    let failed = 0;
-    const errs = /* @__PURE__ */ new Set();
-    const out = await parallelMap(
-      texts,
-      async (text) => {
-        try {
-          return await this.callBedrock(client, text);
-        } catch (err) {
-          failed++;
-          errs.add(err.message);
-          return null;
-        }
-      },
-      concurrency,
-      signal
-    );
-    if (failed > 0) {
-      console.error(
-        `Bedrock embedding failed for ${failed}/${texts.length} chunks: ${summarizeErrors(errs)}`
-      );
-    }
-    return out;
-  }
-  async callBedrock(client, text) {
-    return withRateLimitRetry(async () => {
-      const { InvokeModelCommand } = await import("@aws-sdk/client-bedrock-runtime");
-      const body = JSON.stringify({
-        inputText: truncate(text),
-        dimensions: this.dimensions,
-        normalize: true
-      });
-      const command = new InvokeModelCommand({
-        modelId: this.model,
-        contentType: "application/json",
-        accept: "application/json",
-        body: new TextEncoder().encode(body)
-      });
-      const response = await client.send(command);
-      const responseBody = JSON.parse(new TextDecoder().decode(response.body));
-      if (!responseBody.embedding) {
-        throw new Error(
-          "Unexpected Bedrock response: " + JSON.stringify(responseBody).slice(0, 200)
-        );
-      }
-      return responseBody.embedding;
-    }, "Bedrock embed");
-  }
-};
-var OllamaEmbedder = class {
-  url;
-  model;
-  constructor(url, model) {
-    this.url = url.replace(/\/$/, "");
-    this.model = model;
-  }
-  async embed(text, signal) {
-    return withRateLimitRetry(async () => {
-      const res = await fetch(`${this.url}/api/embed`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: this.model, input: truncate(text) }),
-        signal
-      });
-      if (!res.ok) {
-        const body = await res.text();
-        throw new Error(`Ollama API ${res.status}: ${body.slice(0, 200)}`);
-      }
-      const json = await res.json();
-      return json.embeddings[0];
-    }, "Ollama embed");
-  }
-  async embedBatch(texts, signal, concurrency = 4) {
-    let failed = 0;
-    const errs = /* @__PURE__ */ new Set();
-    const out = await parallelMap(
-      texts,
-      async (text) => {
-        try {
-          return await this.embed(text, signal);
-        } catch (err) {
-          failed++;
-          errs.add(err.message);
-          return null;
-        }
-      },
-      concurrency,
-      signal
-    );
-    if (failed > 0) {
-      console.error(
-        `Ollama embedding failed for ${failed}/${texts.length} chunks: ${summarizeErrors(errs)}`
-      );
-    }
-    return out;
-  }
-};
 var TRANSFORMERS_QUERY_PREFIX = "search_query: ";
 var TRANSFORMERS_DOC_PREFIX = "search_document: ";
 var TRANSFORMERS_BATCH_SIZE = 16;
@@ -1644,94 +1360,6 @@ function dotProduct(a, b) {
   return sum;
 }
 
-// src/kb-searcher.ts
-var BedrockKBSearcher = class {
-  configs;
-  clients = /* @__PURE__ */ new Map();
-  initPromise = null;
-  constructor(configs) {
-    this.configs = configs;
-  }
-  async init() {
-    if (this.initPromise) return this.initPromise;
-    this.initPromise = this._init();
-    return this.initPromise;
-  }
-  async _init() {
-    try {
-      const { BedrockAgentRuntimeClient } = await import("@aws-sdk/client-bedrock-agent-runtime");
-      const { fromIni } = await import("@aws-sdk/credential-providers");
-      for (const config of this.configs) {
-        const region = config.region || "us-east-1";
-        const profile = config.profile || "default";
-        const cacheKey = `${region}:${profile}`;
-        if (!this.clients.has(config.id)) {
-          const existing = [...this.clients.values()].find(
-            (c) => (c.config.region || "us-east-1") === region && (c.config.profile || "default") === profile
-          );
-          if (existing) {
-            this.clients.set(config.id, {
-              client: existing.client,
-              config
-            });
-          } else {
-            const client = new BedrockAgentRuntimeClient({
-              region,
-              credentials: fromIni({ profile })
-            });
-            this.clients.set(config.id, { client, config });
-          }
-        }
-      }
-    } catch (err) {
-      console.error(`knowledge-search: Failed to initialize Bedrock KB client: ${err.message}`);
-      this.configs = [];
-    }
-  }
-  async search(query, limit, signal) {
-    if (this.configs.length === 0) return [];
-    await this.init();
-    const { RetrieveCommand } = await import("@aws-sdk/client-bedrock-agent-runtime");
-    const searches = this.configs.map(async (config) => {
-      const entry = this.clients.get(config.id);
-      if (!entry) return [];
-      try {
-        const command = new RetrieveCommand({
-          knowledgeBaseId: config.id,
-          retrievalQuery: { text: query },
-          retrievalConfiguration: {
-            vectorSearchConfiguration: {
-              numberOfResults: limit
-            }
-          }
-        });
-        const response = await entry.client.send(command, {
-          abortSignal: signal
-        });
-        const results = [];
-        for (const result of response.retrievalResults || []) {
-          const score = result.score ?? 0;
-          if (score < 0.15) continue;
-          const uri = result.location?.s3Location?.uri ?? result.location?.webLocation?.url ?? result.location?.confluenceLocation?.url ?? result.location?.salesforceLocation?.url ?? result.location?.sharePointLocation?.url ?? "unknown";
-          const label = config.label ? ` [${config.label}]` : " [KB]";
-          results.push({
-            path: `${uri}${label}`,
-            score,
-            excerpt: result.content?.text || "",
-            heading: ""
-          });
-        }
-        return results;
-      } catch (err) {
-        console.error(`knowledge-search: KB ${config.id} search failed: ${err.message}`);
-        return [];
-      }
-    });
-    const allResults = (await Promise.all(searches)).flat();
-    return allResults.sort((a, b) => b.score - a.score).slice(0, limit);
-  }
-};
-
 // src/overview.ts
 import * as fs3 from "node:fs";
 import * as path3 from "node:path";
@@ -2204,7 +1832,6 @@ function readNote(absPath, opts = {}) {
 // src/index.ts
 function index_default(pi) {
   let index = null;
-  let kbSearcher = null;
   let currentConfig = null;
   let sessionCwd;
   let syncDone = false;
@@ -2260,9 +1887,6 @@ function index_default(pi) {
     } else if (currentConfig.dirs.length > 0) {
       index = new KnowledgeIndex(currentConfig, null);
       indexLoaded = index.load();
-    }
-    if (currentConfig.knowledgeBases.length > 0) {
-      kbSearcher = new BedrockKBSearcher(currentConfig.knowledgeBases);
     }
     if (!index) {
       syncDone = true;
@@ -2388,11 +2012,8 @@ function index_default(pi) {
         "node_modules, .git, .obsidian, .trash"
       );
       const excludeDirs = (excludeInput || "node_modules, .git, .obsidian, .trash").split(",").map((d) => d.trim()).filter(Boolean);
-      const providerChoice = await ctx.ui.select("Embedding provider:", [
-        "none \u2014 FTS-only keyword search (zero-config, no API key needed)",
-        "openai \u2014 OpenAI API (text-embedding-3-small)",
-        "bedrock \u2014 AWS Bedrock (Titan Embeddings v2)",
-        "ollama \u2014 Local Ollama (nomic-embed-text)",
+      const providerChoice = await ctx.ui.select("Embedding engine:", [
+        "none \u2014 FTS-only keyword search (zero-config, no model download)",
         "transformers \u2014 Local ONNX via Transformers.js (nomic-embed-text-v1.5, no API key)"
       ]);
       if (!providerChoice) {
@@ -2404,56 +2025,6 @@ function index_default(pi) {
       switch (providerType) {
         case "none": {
           configFile = { dirs, fileExtensions, excludeDirs };
-          break;
-        }
-        case "openai": {
-          const apiKey = await ctx.ui.input(
-            "OpenAI API key (or env var name):",
-            process.env.OPENAI_API_KEY ? "(using OPENAI_API_KEY from env)" : ""
-          );
-          const model = await ctx.ui.input("Model:", "text-embedding-3-small");
-          configFile = {
-            dirs,
-            fileExtensions,
-            excludeDirs,
-            provider: {
-              type: "openai",
-              apiKey: apiKey?.startsWith("(") ? void 0 : apiKey || void 0,
-              model: model || "text-embedding-3-small"
-            }
-          };
-          break;
-        }
-        case "bedrock": {
-          const profile = await ctx.ui.input("AWS profile:", "default");
-          const region = await ctx.ui.input("AWS region:", "us-east-1");
-          const model = await ctx.ui.input("Model:", "amazon.titan-embed-text-v2:0");
-          configFile = {
-            dirs,
-            fileExtensions,
-            excludeDirs,
-            provider: {
-              type: "bedrock",
-              profile: profile || "default",
-              region: region || "us-east-1",
-              model: model || "amazon.titan-embed-text-v2:0"
-            }
-          };
-          break;
-        }
-        case "ollama": {
-          const url = await ctx.ui.input("Ollama URL:", "http://localhost:11434");
-          const model = await ctx.ui.input("Model:", "nomic-embed-text");
-          configFile = {
-            dirs,
-            fileExtensions,
-            excludeDirs,
-            provider: {
-              type: "ollama",
-              url: url || "http://localhost:11434",
-              model: model || "nomic-embed-text"
-            }
-          };
           break;
         }
         case "transformers": {
@@ -2475,47 +2046,6 @@ function index_default(pi) {
       }
       saveConfig(configFile, sessionCwd);
       ctx.ui.notify(`Config saved to ${getConfigPath(sessionCwd)}. Run /reload to activate.`, "info");
-    }
-  });
-  pi.registerCommand("knowledge-add-kb", {
-    description: "Add a Bedrock Knowledge Base as a search source",
-    handler: async (_args, ctx) => {
-      const kbId = await ctx.ui.input("Bedrock Knowledge Base ID:", "");
-      if (!kbId) {
-        ctx.ui.notify("Cancelled.", "info");
-        return;
-      }
-      const label = await ctx.ui.input("Label (optional, for display):", "");
-      const region = await ctx.ui.input("AWS region:", "us-east-1");
-      const profile = await ctx.ui.input("AWS profile:", "default");
-      let existing;
-      try {
-        const loaded = loadConfig(sessionCwd);
-        if (loaded) {
-          const raw = fs5.readFileSync(getConfigPath(sessionCwd), "utf-8");
-          existing = JSON.parse(raw);
-        } else {
-          existing = {};
-        }
-      } catch {
-        existing = {};
-      }
-      if (!existing.knowledgeBases) existing.knowledgeBases = [];
-      if (existing.knowledgeBases.some((kb) => kb.id === kbId)) {
-        ctx.ui.notify(`KB ${kbId} already configured.`, "warning");
-        return;
-      }
-      existing.knowledgeBases.push({
-        id: kbId,
-        region: region || "us-east-1",
-        profile: profile || "default",
-        ...label ? { label } : {}
-      });
-      saveConfig(existing, sessionCwd);
-      ctx.ui.notify(
-        `Added KB ${kbId}${label ? ` (${label})` : ""}. Run /reload to activate.`,
-        "info"
-      );
     }
   });
   pi.registerCommand("knowledge-overview", {
@@ -2573,19 +2103,13 @@ function index_default(pi) {
     ],
     parameters: searchParams,
     async execute(toolCallId, params, signal) {
-      const hasLocalIndex = index && index.size() > 0;
-      const hasKB = !!kbSearcher;
-      if (!hasLocalIndex && !hasKB) {
-        const msg = !index && !kbSearcher ? "knowledge-search is not configured. The user can run /knowledge-search-setup to set it up." : !syncDone && index ? "Index is still syncing in the background. Try again in a moment." : "Index is empty.";
+      if (!index || index.size() === 0) {
+        const msg = !index ? "knowledge-search is not configured. The user can run /knowledge-search-setup to set it up." : !syncDone ? "Index is still syncing in the background. Try again in a moment." : "Index is empty.";
         return { content: [{ type: "text", text: msg }], details: {} };
       }
       const limit = Math.min(params.limit ?? 8, 20);
       try {
-        const [localResults, kbResults] = await Promise.all([
-          hasLocalIndex ? index.search(params.query, limit, signal) : [],
-          hasKB ? kbSearcher.search(params.query, limit, signal) : []
-        ]);
-        const results = [...localResults, ...kbResults].sort((a, b) => b.score - a.score).slice(0, limit);
+        const results = await index.search(params.query, limit, signal);
         if (results.length === 0) {
           return {
             content: [
@@ -2606,9 +2130,7 @@ function index_default(pi) {
 
 ${r.excerpt}`;
         }).join("\n\n---\n\n");
-        const indexInfo = hasLocalIndex ? `${index.size()} files, ${index.chunkCount()} chunks indexed` : "";
-        const kbInfo = hasKB ? `${currentConfig.knowledgeBases.length} knowledge base(s)` : "";
-        const sourceInfo = [indexInfo, kbInfo].filter(Boolean).join(" + ");
+        const sourceInfo = `${index.size()} files, ${index.chunkCount()} chunks indexed`;
         const header = `Found ${results.length} results for "${params.query}" (${sourceInfo}):
 
 `;

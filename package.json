@@ -27,11 +27,6 @@
     "@earendil-works/pi-coding-agent": "*",
     "@sinclair/typebox": "*"
   },
-  "optionalDependencies": {
-    "@aws-sdk/client-bedrock-agent-runtime": "3.1123.0",
-    "@aws-sdk/client-bedrock-runtime": "3.1123.0",
-    "@aws-sdk/credential-providers": "3.1123.0"
-  },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
     "remark-frontmatter": "^5.0.0",
