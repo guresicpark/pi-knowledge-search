@@ -167,7 +167,7 @@ describe("KnowledgeIndex streaming load/save", () => {
     fs.writeFileSync(
       path.join(tmpDir, "index.json"),
       JSON.stringify({
-        version: 3,
+        version: 4,
         dimensions: 1024,
         entries: { "a#0": { vector: new Array(1024).fill(0) } },
       })
@@ -310,7 +310,7 @@ describe("KnowledgeIndex embedding signature", () => {
     }
     fs.writeFileSync(
       path.join(tmpDir, "index.json"),
-      JSON.stringify({ version: 3, dimensions: 4, embeddingModel, entries: map })
+      JSON.stringify({ version: 4, dimensions: 4, embeddingModel, entries: map })
     );
   }
 

@@ -232,11 +232,13 @@ function chunkMarkdown(content, maxChunkSize = 3e3, minChunkSize = 200) {
   const sections = splitByHeadings(content);
   if (sections.length === 0) return [];
   if (content.length <= maxChunkSize) {
+    const starts = lineStartOffsets(content);
     return [
       {
         text: content.trim(),
         heading: sections[0]?.heading ?? "intro",
         startLine: 0,
+        endLine: lineFromOffset(content.length - 1, starts),
         charOffset: 0
       }
     ];
@@ -257,11 +259,13 @@ function chunkMarkdown(content, maxChunkSize = 3e3, minChunkSize = 200) {
 }
 function chunkMarkdownFast(content, maxChunkSize, minChunkSize) {
   if (content.length <= maxChunkSize) {
+    const starts2 = lineStartOffsets(content);
     return [
       {
         text: content.trim(),
         heading: "intro",
         startLine: 0,
+        endLine: lineFromOffset(content.length - 1, starts2),
         charOffset: 0
       }
     ];
@@ -279,13 +283,20 @@ function chunkMarkdownFast(content, maxChunkSize, minChunkSize) {
   }
   const sections = [];
   if (headingMatches.length === 0) {
-    sections.push({ text: content, heading: "intro", startLine: 0, charOffset: 0 });
+    sections.push({
+      text: content,
+      heading: "intro",
+      startLine: 0,
+      endLine: lineFromOffset(content.length - 1, starts),
+      charOffset: 0
+    });
   } else {
     if (headingMatches[0].start > 0) {
       sections.push({
         text: content.slice(0, headingMatches[0].start),
         heading: "intro",
         startLine: 0,
+        endLine: lineFromOffset(headingMatches[0].start - 1, starts),
         charOffset: 0
       });
     }
@@ -296,6 +307,7 @@ function chunkMarkdownFast(content, maxChunkSize, minChunkSize) {
         text: content.slice(start, end),
         heading: headingMatches[i].heading,
         startLine: headingMatches[i].startLine,
+        endLine: lineFromOffset(end - 1, starts),
         charOffset: start
       });
     }
@@ -354,7 +366,15 @@ function splitByHeadings(content) {
     };
   }).sort((a, b) => a.start - b.start);
   if (headings.length === 0) {
-    return [{ text: content, heading: "intro", startLine: 0, charOffset: 0 }];
+    return [
+      {
+        text: content,
+        heading: "intro",
+        startLine: 0,
+        endLine: lineFromOffset(content.length - 1, starts),
+        charOffset: 0
+      }
+    ];
   }
   const sections = [];
   if (headings[0].start > 0) {
@@ -362,6 +382,7 @@ function splitByHeadings(content) {
       text: content.slice(0, headings[0].start),
       heading: "intro",
       startLine: 0,
+      endLine: lineFromOffset(headings[0].start - 1, starts),
       charOffset: 0
     });
   }
@@ -372,6 +393,7 @@ function splitByHeadings(content) {
       text: content.slice(start, end),
       heading: headings[i].heading,
       startLine: headings[i].startLine,
+      endLine: lineFromOffset(end - 1, starts),
       charOffset: start
     });
   }
@@ -401,13 +423,16 @@ function splitByBlocks(section, maxChunkSize) {
   let currentText = "";
   let currentOffset = section.charOffset;
   let currentStartLine = section.startLine;
+  let currentEndLine = section.startLine;
   for (const unit of units) {
     const unitText = text.slice(unit.start, unit.end);
+    const unitEndLine = section.startLine + lineFromOffset(Math.max(unit.end - 1, 0), starts);
     if (currentText.length > 0 && currentText.length + unitText.length > maxChunkSize) {
       chunks.push({
         text: currentText.trim(),
         heading: section.heading,
         startLine: currentStartLine,
+        endLine: currentEndLine,
         charOffset: currentOffset
       });
       currentText = unitText;
@@ -416,12 +441,14 @@ function splitByBlocks(section, maxChunkSize) {
     } else {
       currentText += unitText;
     }
+    currentEndLine = unitEndLine;
   }
   if (currentText.trim().length > 0) {
     chunks.push({
       text: currentText.trim(),
       heading: section.heading,
       startLine: currentStartLine,
+      endLine: currentEndLine,
       charOffset: currentOffset
     });
   }
@@ -439,6 +466,7 @@ function splitByParagraphsFallback(section, maxChunkSize) {
         text: currentText.trim(),
         heading: section.heading,
         startLine: currentStartLine,
+        endLine: currentStartLine + currentText.split("\n").length - 1,
         charOffset: currentOffset
       });
       currentOffset = currentOffset + currentText.length + 2;
@@ -453,6 +481,7 @@ function splitByParagraphsFallback(section, maxChunkSize) {
       text: currentText.trim(),
       heading: section.heading,
       startLine: currentStartLine,
+      endLine: currentStartLine + currentText.split("\n").length - 1,
       charOffset: currentOffset
     });
   }
@@ -464,10 +493,13 @@ function hardSplit(chunk, maxSize, overlap) {
   let pos = 0;
   while (pos < text.length) {
     const end = Math.min(pos + maxSize, text.length);
+    const pieceText = text.slice(pos, end);
+    const pieceStartLine = startLine + text.slice(0, pos).split("\n").length - 1;
     chunks.push({
-      text: text.slice(pos, end),
+      text: pieceText,
       heading,
-      startLine: startLine + text.slice(0, pos).split("\n").length - 1,
+      startLine: pieceStartLine,
+      endLine: pieceStartLine + pieceText.split("\n").length - 1,
       charOffset: charOffset + pos
     });
     pos = end - (end < text.length ? overlap : 0);
@@ -485,9 +517,11 @@ function mergeTiny(chunks, minSize, maxSize) {
     const curr = chunks[i];
     if (curr.text.length < minSize && prev.text.length + curr.text.length + 2 <= maxSize) {
       prev.text = prev.text + "\n\n" + curr.text;
+      prev.endLine = curr.endLine;
     } else if (prev.text.length < minSize && prev.text.length + curr.text.length + 2 <= maxSize) {
       prev.text = prev.text + "\n\n" + curr.text;
       prev.heading = curr.heading;
+      prev.endLine = curr.endLine;
     } else {
       merged.push(curr);
     }
@@ -689,7 +723,7 @@ function toFtsQuery(q) {
 }
 
 // src/index-store.ts
-var INDEX_VERSION = 3;
+var INDEX_VERSION = 4;
 var MAX_EXCERPT_LENGTH = 3500;
 var KnowledgeIndex = class _KnowledgeIndex {
   config;
@@ -984,6 +1018,16 @@ var KnowledgeIndex = class _KnowledgeIndex {
 ${chunkText}`;
   }
   /**
+   * 0-indexed inclusive line range a chunk occupies in its source file,
+   * as tracked by the chunker.
+   */
+  chunkLineRange(chunk) {
+    return {
+      startLine: chunk.startLine,
+      endLine: Math.max(chunk.endLine ?? chunk.startLine, chunk.startLine)
+    };
+  }
+  /**
    * Scan all configured directories, find new/changed/removed files, update index.
    */
   async sync(opts) {
@@ -1072,6 +1116,7 @@ ${chunkText}`;
         const chunk = file.chunks[chunkIdx];
         const key = this.entryKey(file.absPath, chunkIdx);
         const excerpt = chunk.text.slice(0, MAX_EXCERPT_LENGTH);
+        const { startLine, endLine } = this.chunkLineRange(chunk);
         this.data.entries[key] = {
           relPath: file.relPath,
           sourceDir: file.sourceDir,
@@ -1079,7 +1124,9 @@ ${chunkText}`;
           vector: storedVector,
           excerpt,
           heading: chunk.heading,
-          chunkIndex: chunkIdx
+          chunkIndex: chunkIdx,
+          startLine,
+          endLine
         };
         this.fts.upsert({
           key,
@@ -1131,6 +1178,17 @@ ${chunkText}`;
       scored.push({ key, absPath: this.absPathFromKey(key), score });
     }
     scored.sort((a, b) => b.score - a.score);
+    const matchesByFile = /* @__PURE__ */ new Map();
+    const rangesByFile = /* @__PURE__ */ new Map();
+    for (const item of scored) {
+      matchesByFile.set(item.absPath, (matchesByFile.get(item.absPath) ?? 0) + 1);
+      const entry = this.data.entries[item.key];
+      if (entry && typeof entry.startLine === "number") {
+        const ranges = rangesByFile.get(item.absPath) ?? [];
+        ranges.push([entry.startLine + 1, (entry.endLine ?? entry.startLine) + 1]);
+        rangesByFile.set(item.absPath, ranges);
+      }
+    }
     const seenPaths = /* @__PURE__ */ new Set();
     const deduped = [];
     for (const item of scored) {
@@ -1145,7 +1203,9 @@ ${chunkText}`;
         path: s.absPath,
         score: s.score,
         excerpt: entry.excerpt,
-        heading: entry.heading
+        heading: entry.heading,
+        matches: matchesByFile.get(s.absPath) ?? 1,
+        lineRanges: (rangesByFile.get(s.absPath) ?? []).sort((a, b) => a[0] - b[0])
       };
     });
   }
@@ -1192,6 +1252,18 @@ ${chunkText}`;
     }
     const displayScale = (K + 1) / Math.max(activeBackends, 1);
     const sorted = [...fused.entries()].sort((a, b) => b[1] - a[1]);
+    const matchesByFile = /* @__PURE__ */ new Map();
+    const rangesByFile = /* @__PURE__ */ new Map();
+    for (const [key] of sorted) {
+      const absPath = this.absPathFromKey(key);
+      matchesByFile.set(absPath, (matchesByFile.get(absPath) ?? 0) + 1);
+      const entry = this.data.entries[key];
+      if (entry && typeof entry.startLine === "number") {
+        const ranges = rangesByFile.get(absPath) ?? [];
+        ranges.push([entry.startLine + 1, (entry.endLine ?? entry.startLine) + 1]);
+        rangesByFile.set(absPath, ranges);
+      }
+    }
     const seen = /* @__PURE__ */ new Set();
     const out = [];
     for (const [key, score] of sorted) {
@@ -1205,14 +1277,18 @@ ${chunkText}`;
           path: absPath,
           score: scaledScore,
           excerpt: entry.excerpt,
-          heading: entry.heading
+          heading: entry.heading,
+          matches: matchesByFile.get(absPath) ?? 1,
+          lineRanges: (rangesByFile.get(absPath) ?? []).sort((a, b) => a[0] - b[0])
         });
       } else {
         out.push({
           path: absPath,
           score: scaledScore,
           excerpt: "",
-          heading: ""
+          heading: "",
+          matches: matchesByFile.get(absPath) ?? 1,
+          lineRanges: []
         });
       }
       if (out.length >= limit) break;
@@ -1275,6 +1351,7 @@ ${chunkText}`;
       const storedVector = vector ?? [];
       const key = this.entryKey(absPath, i);
       const excerpt = chunks[i].text.slice(0, MAX_EXCERPT_LENGTH);
+      const { startLine, endLine } = this.chunkLineRange(chunks[i]);
       this.data.entries[key] = {
         relPath,
         sourceDir,
@@ -1282,7 +1359,9 @@ ${chunkText}`;
         vector: storedVector,
         excerpt,
         heading: chunks[i].heading,
-        chunkIndex: i
+        chunkIndex: i,
+        startLine,
+        endLine
       };
       this.fts.upsert({
         key,

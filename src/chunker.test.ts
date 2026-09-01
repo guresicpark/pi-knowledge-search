@@ -149,6 +149,48 @@ describe("chunkMarkdown", () => {
     assert.equal(chunks[0].startLine, 0);
   });
 
+  it("tracks inclusive endLine across sections", () => {
+    const md = [
+      "## Intro", "intro a", "intro b", "intro c", "intro d", "intro e",
+      "",
+      "## Second", "second a", "second b", "second c", "second d", "second e",
+      "",
+      "## Third", "third a", "third b", "third c", "third d", "third e",
+    ].join("\n");
+    const chunks = chunkMarkdown(md, 60);
+    assert.equal(chunks[0].startLine, 0);
+    assert.equal(chunks[0].endLine, 6, "intro chunk runs through the trailing blank line");
+    assert.equal(chunks[1].startLine, 7);
+    assert.equal(chunks[1].endLine, 13);
+    assert.equal(chunks[2].startLine, 14);
+    assert.equal(chunks[2].endLine, 19);
+    // Ranges must be contiguous: next start is exactly prev end + 1
+    for (let i = 1; i < chunks.length; i++) {
+      assert.equal(chunks[i].startLine, chunks[i - 1].endLine + 1);
+    }
+  });
+
+  it("keeps endLine accurate when a tiny chunk is merged with its neighbor", () => {
+    const filler = "x".repeat(500) + "\n";
+    const md = [
+      "# Title",
+      "",
+      "## Tiny Intro",
+      "only one content line",
+      filler.repeat(4),
+      "## Big Section",
+      "content under the big section",
+      filler.repeat(4),
+    ].join("\n");
+    const chunks = chunkMarkdown(md);
+    assert.ok(chunks.length >= 2, `expected >=2 chunks, got ${chunks.length}`);
+    // The tiny "Tiny Intro" section is merged into the intro block; its merged
+    // chunk must not overrun into the next chunk's heading line.
+    for (let i = 1; i < chunks.length; i++) {
+      assert.equal(chunks[i].startLine, chunks[i - 1].endLine + 1, `chunks ${i - 1} and ${i} overlap`);
+    }
+  });
+
   it("tracks charOffset correctly", () => {
     const md = "Short intro.\n\n## Heading\n\nBody text here.";
     const chunks = chunkMarkdown(md, 20);

@@ -22,6 +22,10 @@ interface IndexEntry {
   heading: string;
   /** Chunk index (0, 1, 2... for multi-chunk files) */
   chunkIndex: number;
+  /** 0-indexed line in the source file where this chunk starts */
+  startLine: number;
+  /** 0-indexed line in the source file where this chunk ends (inclusive) */
+  endLine: number;
 }
 
 interface IndexData {
@@ -47,6 +51,18 @@ export interface SearchResult {
   excerpt: string;
   /** Section heading for context */
   heading: string;
+  /**
+   * Number of chunks in this file that matched the query, regardless of
+   * deduplication or the limit. Lets callers show "file (N hits)" even
+   * though only the best chunk per file is returned.
+   */
+  matches: number;
+  /**
+   * 1-indexed inclusive line ranges in the source file of every matching
+   * chunk, regardless of deduplication or the limit. Empty when the stored
+   * entry predates line-range indexing (fall back to `matches`).
+   */
+  lineRanges: Array<[number, number]>;
 }
 
 /**
@@ -63,7 +79,7 @@ export type SyncProgress =
   | { phase: "embed"; done: number; total: number; currentFile?: string }
   | { phase: "save" };
 
-const INDEX_VERSION = 3; // Bumped from 2 for chunk support
+const INDEX_VERSION = 4; // Bumped from 3 for per-chunk line ranges
 const MAX_EXCERPT_LENGTH = 3500; // Safety cap for stored excerpts
 
 export class KnowledgeIndex {
@@ -422,6 +438,17 @@ export class KnowledgeIndex {
   }
 
   /**
+   * 0-indexed inclusive line range a chunk occupies in its source file,
+   * as tracked by the chunker.
+   */
+  private chunkLineRange(chunk: Chunk): { startLine: number; endLine: number } {
+    return {
+      startLine: chunk.startLine,
+      endLine: Math.max(chunk.endLine ?? chunk.startLine, chunk.startLine),
+    };
+  }
+
+  /**
    * Scan all configured directories, find new/changed/removed files, update index.
    */
   async sync(
@@ -549,6 +576,7 @@ export class KnowledgeIndex {
         const chunk = file.chunks[chunkIdx];
         const key = this.entryKey(file.absPath, chunkIdx);
         const excerpt = chunk.text.slice(0, MAX_EXCERPT_LENGTH);
+        const { startLine, endLine } = this.chunkLineRange(chunk);
         this.data.entries[key] = {
           relPath: file.relPath,
           sourceDir: file.sourceDir,
@@ -557,6 +585,8 @@ export class KnowledgeIndex {
           excerpt,
           heading: chunk.heading,
           chunkIndex: chunkIdx,
+          startLine,
+          endLine,
         };
         this.fts.upsert({
           key,
@@ -620,6 +650,21 @@ export class KnowledgeIndex {
 
     scored.sort((a, b) => b.score - a.score);
 
+    // Collect per-file match counts and line ranges (pre-dedup) so callers
+    // can show "file (N hits, L..-L..)" even though only the best chunk per
+    // file is returned.
+    const matchesByFile = new Map<string, number>();
+    const rangesByFile = new Map<string, Array<[number, number]>>();
+    for (const item of scored) {
+      matchesByFile.set(item.absPath, (matchesByFile.get(item.absPath) ?? 0) + 1);
+      const entry = this.data.entries[item.key];
+      if (entry && typeof entry.startLine === "number") {
+        const ranges = rangesByFile.get(item.absPath) ?? [];
+        ranges.push([entry.startLine + 1, (entry.endLine ?? entry.startLine) + 1]);
+        rangesByFile.set(item.absPath, ranges);
+      }
+    }
+
     // Deduplicate: keep only the best-scoring chunk per file
     const seenPaths = new Set<string>();
     const deduped: { key: string; absPath: string; score: number }[] = [];
@@ -640,6 +685,8 @@ export class KnowledgeIndex {
           score: s.score,
           excerpt: entry.excerpt,
           heading: entry.heading,
+          matches: matchesByFile.get(s.absPath) ?? 1,
+          lineRanges: (rangesByFile.get(s.absPath) ?? []).sort((a, b) => a[0] - b[0]),
         };
       });
   }
@@ -712,6 +759,22 @@ export class KnowledgeIndex {
     // Rank by fused score.
     const sorted = [...fused.entries()].sort((a, b) => b[1] - a[1]);
 
+    // Collect per-file match counts and line ranges (pre-dedup) so callers
+    // can show "file (N hits, L..-L..)" even though only the best chunk per
+    // file is returned.
+    const matchesByFile = new Map<string, number>();
+    const rangesByFile = new Map<string, Array<[number, number]>>();
+    for (const [key] of sorted) {
+      const absPath = this.absPathFromKey(key);
+      matchesByFile.set(absPath, (matchesByFile.get(absPath) ?? 0) + 1);
+      const entry = this.data.entries[key];
+      if (entry && typeof entry.startLine === "number") {
+        const ranges = rangesByFile.get(absPath) ?? [];
+        ranges.push([entry.startLine + 1, (entry.endLine ?? entry.startLine) + 1]);
+        rangesByFile.set(absPath, ranges);
+      }
+    }
+
     // Dedup: keep only the best chunk per file.
     const seen = new Set<string>();
     const out: SearchResult[] = [];
@@ -729,6 +792,8 @@ export class KnowledgeIndex {
           score: scaledScore,
           excerpt: entry.excerpt,
           heading: entry.heading,
+          matches: matchesByFile.get(absPath) ?? 1,
+          lineRanges: (rangesByFile.get(absPath) ?? []).sort((a, b) => a[0] - b[0]),
         });
       } else {
         // Vector-less — synthesise from whatever FTS has.
@@ -737,6 +802,8 @@ export class KnowledgeIndex {
           score: scaledScore,
           excerpt: "",
           heading: "",
+          matches: matchesByFile.get(absPath) ?? 1,
+          lineRanges: [],
         });
       }
       if (out.length >= limit) break;
@@ -816,6 +883,7 @@ export class KnowledgeIndex {
 
       const key = this.entryKey(absPath, i);
       const excerpt = chunks[i].text.slice(0, MAX_EXCERPT_LENGTH);
+      const { startLine, endLine } = this.chunkLineRange(chunks[i]);
       this.data.entries[key] = {
         relPath,
         sourceDir,
@@ -824,6 +892,8 @@ export class KnowledgeIndex {
         excerpt,
         heading: chunks[i].heading,
         chunkIndex: i,
+        startLine,
+        endLine,
       };
       this.fts.upsert({
         key,

@@ -6,7 +6,7 @@ On session start, injects a folder+keyword overview of the indexed vault as a cu
 
 ## Knowledge lookup
 
-Like pi-local-rag's RAG lookup, every user prompt triggers an automatic **knowledge lookup**: the prompt runs through hybrid search (top 5 chunks, min score 0.1) and the hits are injected as a message right after the prompt — full excerpts for the model, and a green `Knowledge lookup — file.md (2), …` summary box for you (red on failure).
+Like pi-local-rag's RAG lookup, every user prompt triggers an automatic **knowledge lookup**: the prompt runs through hybrid search (top 5 chunks, min score 0.1) and the hits are injected as a message right after the prompt — full excerpts for the model, and a green `Knowledge lookup — event_dispatcher.rst:1-8,9-37,44-72, …` summary box for you (red on failure). Each `file:start-end,…` entry lists the exact line ranges in that file where the hits live; a bare number is a single-line hit. The line ranges only exist once the index has been rebuilt with line tracking (index version 4) — entries indexed before that fall back to a `file (n)` hit count until the next `/knowledge-search index`.
 
 Injection is automatically enabled whenever the index holds vectors — at session start and after `/knowledge-search index` — so `/knowledge-search off` acts as a per-session kill-switch that the next startup flips back on (`autoInject` in the config).
 
@@ -128,7 +128,7 @@ Every config field can be overridden via environment variables. This is useful f
 1. On session start, loads the index from disk and incrementally syncs — only re-embeds new or modified files (or everything, once, after an embedding-engine change)
 2. Registers two LLM-facing tools: `knowledge_search` for hybrid ranked search and `knowledge_kb_read` for resolving a note reference to a full file (see [Tools](#tools))
 3. Before every agent turn, runs an automatic knowledge lookup on the prompt and injects the top hits as a message right after it (see [Knowledge lookup](#knowledge-lookup))
-4. Returns ranked results with file paths, relevance scores, and content excerpts
+4. Returns ranked results with file paths, relevance scores, content excerpts, and the exact line ranges of each hit
 
 Sync runs on session startup. Files changed mid-session can be picked up with `/knowledge-search index`.
 

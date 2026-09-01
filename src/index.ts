@@ -173,16 +173,20 @@ export default function (pi: ExtensionAPI) {
       })
       .join("\n\n");
 
-    // One-line summary for the TUI box: file (chunk count), e.g.
-    // "Knowledge lookup — notes/a.md (3), docs/b.md (2)"
-    const countsByFile = new Map<string, number>();
-    for (const r of results) {
-      const p = lookupDisplayPath(r.path);
-      countsByFile.set(p, (countsByFile.get(p) ?? 0) + 1);
-    }
-    const fileSummaries = [...countsByFile.entries()].map(
-      ([file, count]) => `${file} (${count})`
-    );
+    // One-line summary for the TUI box: file (line ranges of every hit), e.g.
+    // "Knowledge lookup — event_dispatcher.rst:1-8,9-37,44-72, notes/a.md:12-25,60-72".
+    // Results are deduped to the best chunk per file, so each carries its
+    // file's full matching line ranges via `lineRanges`; fall back to the hit
+    // count when the stored entry predates line-range indexing.
+    const fileSummaries = results.map((r) => {
+      const display = lookupDisplayPath(r.path);
+      const ranges = r.lineRanges ?? [];
+      if (ranges.length > 0) {
+        const fmt = ranges.map(([s, e]) => (s === e ? `${s}` : `${s}-${e}`)).join(",");
+        return `${display}:${fmt}`;
+      }
+      return `${display} (${r.matches ?? 1})`;
+    });
     const summary = `Knowledge lookup — ${fileSummaries.join(", ")}`;
 
     return {

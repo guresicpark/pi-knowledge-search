@@ -24,6 +24,8 @@ export interface Chunk {
   heading: string;
   /** Line number where this chunk starts (0-indexed) */
   startLine: number;
+  /** Line number where this chunk ends, inclusive (0-indexed) */
+  endLine: number;
   /** Character offset in original content */
   charOffset: number;
 }
@@ -37,6 +39,7 @@ interface Section {
   text: string;
   heading: string;
   startLine: number;
+  endLine: number;
   charOffset: number;
 }
 
@@ -74,11 +77,13 @@ export function chunkMarkdown(content: string, maxChunkSize = 3000, minChunkSize
 
   // If the whole file is small enough, return as single chunk.
   if (content.length <= maxChunkSize) {
+    const starts = lineStartOffsets(content);
     return [
       {
         text: content.trim(),
         heading: sections[0]?.heading ?? "intro",
         startLine: 0,
+        endLine: lineFromOffset(content.length - 1, starts),
         charOffset: 0,
       },
     ];
@@ -113,11 +118,13 @@ export function chunkMarkdown(content: string, maxChunkSize = 3000, minChunkSize
  */
 function chunkMarkdownFast(content: string, maxChunkSize: number, minChunkSize: number): Chunk[] {
   if (content.length <= maxChunkSize) {
+    const starts = lineStartOffsets(content);
     return [
       {
         text: content.trim(),
         heading: "intro",
         startLine: 0,
+        endLine: lineFromOffset(content.length - 1, starts),
         charOffset: 0,
       },
     ];
@@ -138,13 +145,20 @@ function chunkMarkdownFast(content: string, maxChunkSize: number, minChunkSize: 
 
   const sections: Section[] = [];
   if (headingMatches.length === 0) {
-    sections.push({ text: content, heading: "intro", startLine: 0, charOffset: 0 });
+    sections.push({
+      text: content,
+      heading: "intro",
+      startLine: 0,
+      endLine: lineFromOffset(content.length - 1, starts),
+      charOffset: 0,
+    });
   } else {
     if (headingMatches[0].start > 0) {
       sections.push({
         text: content.slice(0, headingMatches[0].start),
         heading: "intro",
         startLine: 0,
+        endLine: lineFromOffset(headingMatches[0].start - 1, starts),
         charOffset: 0,
       });
     }
@@ -156,6 +170,7 @@ function chunkMarkdownFast(content: string, maxChunkSize: number, minChunkSize: 
         text: content.slice(start, end),
         heading: headingMatches[i].heading,
         startLine: headingMatches[i].startLine,
+        endLine: lineFromOffset(end - 1, starts),
         charOffset: start,
       });
     }
@@ -231,7 +246,15 @@ function splitByHeadings(content: string): Section[] {
     .sort((a: any, b: any) => a.start - b.start);
 
   if (headings.length === 0) {
-    return [{ text: content, heading: "intro", startLine: 0, charOffset: 0 }];
+    return [
+      {
+        text: content,
+        heading: "intro",
+        startLine: 0,
+        endLine: lineFromOffset(content.length - 1, starts),
+        charOffset: 0,
+      },
+    ];
   }
 
   const sections: Section[] = [];
@@ -240,6 +263,7 @@ function splitByHeadings(content: string): Section[] {
       text: content.slice(0, headings[0].start),
       heading: "intro",
       startLine: 0,
+      endLine: lineFromOffset(headings[0].start - 1, starts),
       charOffset: 0,
     });
   }
@@ -251,6 +275,7 @@ function splitByHeadings(content: string): Section[] {
       text: content.slice(start, end),
       heading: headings[i].heading,
       startLine: headings[i].startLine,
+      endLine: lineFromOffset(end - 1, starts),
       charOffset: start,
     });
   }
@@ -295,14 +320,17 @@ function splitByBlocks(section: Section, maxChunkSize: number): Chunk[] {
   let currentText = "";
   let currentOffset = section.charOffset;
   let currentStartLine = section.startLine;
+  let currentEndLine = section.startLine;
 
   for (const unit of units) {
     const unitText = text.slice(unit.start, unit.end);
+    const unitEndLine = section.startLine + lineFromOffset(Math.max(unit.end - 1, 0), starts);
     if (currentText.length > 0 && currentText.length + unitText.length > maxChunkSize) {
       chunks.push({
         text: currentText.trim(),
         heading: section.heading,
         startLine: currentStartLine,
+        endLine: currentEndLine,
         charOffset: currentOffset,
       });
       currentText = unitText;
@@ -311,6 +339,7 @@ function splitByBlocks(section: Section, maxChunkSize: number): Chunk[] {
     } else {
       currentText += unitText;
     }
+    currentEndLine = unitEndLine;
   }
 
   if (currentText.trim().length > 0) {
@@ -318,6 +347,7 @@ function splitByBlocks(section: Section, maxChunkSize: number): Chunk[] {
       text: currentText.trim(),
       heading: section.heading,
       startLine: currentStartLine,
+      endLine: currentEndLine,
       charOffset: currentOffset,
     });
   }
@@ -339,6 +369,7 @@ function splitByParagraphsFallback(section: Section, maxChunkSize: number): Chun
         text: currentText.trim(),
         heading: section.heading,
         startLine: currentStartLine,
+        endLine: currentStartLine + currentText.split("\n").length - 1,
         charOffset: currentOffset,
       });
       currentOffset = currentOffset + currentText.length + 2;
@@ -354,6 +385,7 @@ function splitByParagraphsFallback(section: Section, maxChunkSize: number): Chun
       text: currentText.trim(),
       heading: section.heading,
       startLine: currentStartLine,
+      endLine: currentStartLine + currentText.split("\n").length - 1,
       charOffset: currentOffset,
     });
   }
@@ -369,10 +401,13 @@ function hardSplit(chunk: Chunk, maxSize: number, overlap: number): Chunk[] {
 
   while (pos < text.length) {
     const end = Math.min(pos + maxSize, text.length);
+    const pieceText = text.slice(pos, end);
+    const pieceStartLine = startLine + text.slice(0, pos).split("\n").length - 1;
     chunks.push({
-      text: text.slice(pos, end),
+      text: pieceText,
       heading,
-      startLine: startLine + text.slice(0, pos).split("\n").length - 1,
+      startLine: pieceStartLine,
+      endLine: pieceStartLine + pieceText.split("\n").length - 1,
       charOffset: charOffset + pos,
     });
     pos = end - (end < text.length ? overlap : 0);
@@ -398,9 +433,11 @@ function mergeTiny(chunks: Chunk[], minSize: number, maxSize: number): Chunk[] {
     // Merge if current is tiny and combined size fits
     if (curr.text.length < minSize && prev.text.length + curr.text.length + 2 <= maxSize) {
       prev.text = prev.text + "\n\n" + curr.text;
+      prev.endLine = curr.endLine;
     } else if (prev.text.length < minSize && prev.text.length + curr.text.length + 2 <= maxSize) {
       prev.text = prev.text + "\n\n" + curr.text;
       prev.heading = curr.heading; // adopt the bigger chunk's heading
+      prev.endLine = curr.endLine;
     } else {
       merged.push(curr);
     }

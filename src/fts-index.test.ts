@@ -246,6 +246,8 @@ describe("KnowledgeIndex hybrid search", () => {
       heading?: string;
       excerpt: string;
       vector: number[];
+      startLine?: number;
+      endLine?: number;
     }>,
   ): void {
     const internal = index as unknown as {
@@ -265,6 +267,8 @@ describe("KnowledgeIndex hybrid search", () => {
         excerpt: e.excerpt,
         heading: e.heading ?? "",
         chunkIndex: ci,
+        startLine: e.startLine ?? 0,
+        endLine: e.endLine ?? 0,
       };
     }
   }
@@ -277,7 +281,7 @@ describe("KnowledgeIndex hybrid search", () => {
     // signature must match the fixed always-nomic engine for the entries
     // to be accepted.
     const data = {
-      version: 3,
+      version: 4,
       dimensions: 4,
       embeddingModel: "transformers:nomic-ai/nomic-embed-text-v1.5:768",
       entries: {
@@ -392,18 +396,24 @@ describe("KnowledgeIndex hybrid search", () => {
         chunkIndex: 0,
         vector: [0.9, 0.1, 0, 0],
         excerpt: "widgets introduction",
+        startLine: 0,
+        endLine: 4,
       },
       {
         absPath: "/v/doc.md",
         chunkIndex: 1,
         vector: [0.8, 0.1, 0, 0],
         excerpt: "widgets advanced usage",
+        startLine: 5,
+        endLine: 9,
       },
       {
         absPath: "/v/doc.md",
         chunkIndex: 2,
         vector: [0.7, 0.1, 0, 0],
         excerpt: "widgets conclusion",
+        startLine: 10,
+        endLine: 14,
       },
     ]);
     (idx as unknown as { rebuildFtsFromEntries: () => void }).rebuildFtsFromEntries();
@@ -411,6 +421,20 @@ describe("KnowledgeIndex hybrid search", () => {
     const results = await idx.hybridSearch("widgets", 5);
     assert.equal(results.length, 1, "should only return one hit per file");
     assert.equal(results[0].path, "/v/doc.md");
+    assert.equal(
+      results[0].matches,
+      3,
+      "should report the file's full matching-chunk count despite dedup",
+    );
+    assert.deepEqual(
+      results[0].lineRanges,
+      [
+        [1, 5],
+        [6, 10],
+        [11, 15],
+      ],
+      "should report 1-indexed line ranges of every matching chunk despite dedup",
+    );
     await idx.close();
   });
 });
