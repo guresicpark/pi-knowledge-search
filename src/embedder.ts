@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import type { ProviderConfig } from "./config.js";
 
@@ -67,6 +68,17 @@ export function resolveTransformersCacheDir(): string {
   if (process.env.TRANSFORMERS_CACHE) return process.env.TRANSFORMERS_CACHE;
   if (process.env.HF_HOME) return join(process.env.HF_HOME, "transformers");
   return join(homedir(), ".cache", "huggingface", "transformers");
+}
+
+/**
+ * Whether a model's q8 ONNX weights are already present in the local
+ * HuggingFace cache (Transformers.js stores them under
+ * `<cacheDir>/<model>/onnx/model_quantized.onnx`). Callers use this to
+ * explain a cold-start download (~111 MB for nomic) before indexing
+ * appears to stall, mirroring pi-local-rag's onModelLoad notice.
+ */
+export function isTransformersModelCached(model: string): boolean {
+  return existsSync(join(resolveTransformersCacheDir(), model, "onnx", "model_quantized.onnx"));
 }
 
 class TransformersEmbedder implements Embedder {

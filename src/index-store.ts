@@ -49,6 +49,20 @@ export interface SearchResult {
   heading: string;
 }
 
+/**
+ * Progress events emitted by sync() for UI rendering.
+ *
+ * - scan: directory scan finished — reports how many files need
+ *   (re)embedding, how many are unchanged, and the total chunk count
+ * - embed: one embed batch completed — done/total chunks plus the file
+ *   the latest batch ended in (best effort)
+ * - save: the index is being persisted to disk
+ */
+export type SyncProgress =
+  | { phase: "scan"; filesToProcess: number; unchanged: number; totalChunks: number }
+  | { phase: "embed"; done: number; total: number; currentFile?: string }
+  | { phase: "save" };
+
 const INDEX_VERSION = 3; // Bumped from 2 for chunk support
 const MAX_EXCERPT_LENGTH = 3500; // Safety cap for stored excerpts
 
@@ -410,7 +424,9 @@ export class KnowledgeIndex {
   /**
    * Scan all configured directories, find new/changed/removed files, update index.
    */
-  async sync(): Promise<{ added: number; updated: number; removed: number }> {
+  async sync(
+    opts?: { onProgress?: (progress: SyncProgress) => void }
+  ): Promise<{ added: number; updated: number; removed: number }> {
     const allFiles = this.scanAllFiles();
     const currentPaths = new Set(allFiles.map((f) => f.absPath));
 
@@ -453,6 +469,7 @@ export class KnowledgeIndex {
 
     let added = 0;
     let updated = 0;
+    const report = opts?.onProgress;
 
     if (toProcess.length > 0) {
       // Flatten all chunks for batch embedding
@@ -468,6 +485,13 @@ export class KnowledgeIndex {
         }
       }
 
+      report?.({
+        phase: "scan",
+        filesToProcess: toProcess.length,
+        unchanged: allFiles.length - toProcess.length - removed,
+        totalChunks: allChunkTexts.length,
+      });
+
       // Embed in batches — skipped entirely in FTS-only mode.
       const allVectors: (number[] | null)[] = new Array(allChunkTexts.length).fill(null);
       if (this.embedder) {
@@ -478,7 +502,25 @@ export class KnowledgeIndex {
           for (let j = 0; j < vectors.length; j++) {
             allVectors[i + j] = vectors[j];
           }
+          // Best-effort current file: the file the finished batch ended in.
+          const lastMeta = chunkMeta[Math.min(i + vectors.length, chunkMeta.length) - 1];
+          report?.({
+            phase: "embed",
+            done: Math.min(i + vectors.length, allChunkTexts.length),
+            total: allChunkTexts.length,
+            currentFile: lastMeta ? toProcess[lastMeta.fileIdx].relPath : undefined,
+          });
         }
+      } else {
+        // FTS-only: no embedding work, jump the bar straight to complete so
+        // the UI doesn't sit at 0% through the store loop.
+        const lastMeta = chunkMeta[chunkMeta.length - 1];
+        report?.({
+          phase: "embed",
+          done: allChunkTexts.length,
+          total: allChunkTexts.length,
+          currentFile: lastMeta ? toProcess[lastMeta.fileIdx].relPath : undefined,
+        });
       }
 
       // Store results, grouped by file
@@ -530,6 +572,7 @@ export class KnowledgeIndex {
     }
 
     if (added + updated + removed > 0) {
+      report?.({ phase: "save" });
       await this.save();
     }
 

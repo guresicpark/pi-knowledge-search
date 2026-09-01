@@ -969,7 +969,7 @@ ${chunkText}`;
   /**
    * Scan all configured directories, find new/changed/removed files, update index.
    */
-  async sync() {
+  async sync(opts) {
     const allFiles = this.scanAllFiles();
     const currentPaths = new Set(allFiles.map((f) => f.absPath));
     let removed = 0;
@@ -995,6 +995,7 @@ ${chunkText}`;
     }
     let added = 0;
     let updated = 0;
+    const report = opts?.onProgress;
     if (toProcess.length > 0) {
       const allChunkTexts = [];
       const chunkMeta = [];
@@ -1006,6 +1007,12 @@ ${chunkText}`;
           chunkMeta.push({ fileIdx: fi, chunkIdx: ci });
         }
       }
+      report?.({
+        phase: "scan",
+        filesToProcess: toProcess.length,
+        unchanged: allFiles.length - toProcess.length - removed,
+        totalChunks: allChunkTexts.length
+      });
       const allVectors = new Array(allChunkTexts.length).fill(null);
       if (this.embedder) {
         const BATCH_SIZE = 50;
@@ -1015,7 +1022,22 @@ ${chunkText}`;
           for (let j = 0; j < vectors.length; j++) {
             allVectors[i + j] = vectors[j];
           }
+          const lastMeta = chunkMeta[Math.min(i + vectors.length, chunkMeta.length) - 1];
+          report?.({
+            phase: "embed",
+            done: Math.min(i + vectors.length, allChunkTexts.length),
+            total: allChunkTexts.length,
+            currentFile: lastMeta ? toProcess[lastMeta.fileIdx].relPath : void 0
+          });
         }
+      } else {
+        const lastMeta = chunkMeta[chunkMeta.length - 1];
+        report?.({
+          phase: "embed",
+          done: allChunkTexts.length,
+          total: allChunkTexts.length,
+          currentFile: lastMeta ? toProcess[lastMeta.fileIdx].relPath : void 0
+        });
       }
       const processedFiles = /* @__PURE__ */ new Set();
       for (let i = 0; i < chunkMeta.length; i++) {
@@ -1055,6 +1077,7 @@ ${chunkText}`;
       }
     }
     if (added + updated + removed > 0) {
+      report?.({ phase: "save" });
       await this.save();
     }
     return { added, updated, removed };

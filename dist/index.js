@@ -123,6 +123,7 @@ function envBool(key) {
 
 // src/embedder.ts
 import { join as join2 } from "node:path";
+import { existsSync as existsSync2 } from "node:fs";
 import { homedir } from "node:os";
 function createEmbedder(config, _dimensions) {
   return new TransformersEmbedder(config.model);
@@ -143,6 +144,9 @@ function resolveTransformersCacheDir() {
   if (process.env.TRANSFORMERS_CACHE) return process.env.TRANSFORMERS_CACHE;
   if (process.env.HF_HOME) return join2(process.env.HF_HOME, "transformers");
   return join2(homedir(), ".cache", "huggingface", "transformers");
+}
+function isTransformersModelCached(model) {
+  return existsSync2(join2(resolveTransformersCacheDir(), model, "onnx", "model_quantized.onnx"));
 }
 var TransformersEmbedder = class {
   model;
@@ -979,7 +983,7 @@ ${chunkText}`;
   /**
    * Scan all configured directories, find new/changed/removed files, update index.
    */
-  async sync() {
+  async sync(opts) {
     const allFiles = this.scanAllFiles();
     const currentPaths = new Set(allFiles.map((f) => f.absPath));
     let removed = 0;
@@ -1005,6 +1009,7 @@ ${chunkText}`;
     }
     let added = 0;
     let updated = 0;
+    const report = opts?.onProgress;
     if (toProcess.length > 0) {
       const allChunkTexts = [];
       const chunkMeta = [];
@@ -1016,6 +1021,12 @@ ${chunkText}`;
           chunkMeta.push({ fileIdx: fi, chunkIdx: ci });
         }
       }
+      report?.({
+        phase: "scan",
+        filesToProcess: toProcess.length,
+        unchanged: allFiles.length - toProcess.length - removed,
+        totalChunks: allChunkTexts.length
+      });
       const allVectors = new Array(allChunkTexts.length).fill(null);
       if (this.embedder) {
         const BATCH_SIZE = 50;
@@ -1025,7 +1036,22 @@ ${chunkText}`;
           for (let j = 0; j < vectors.length; j++) {
             allVectors[i + j] = vectors[j];
           }
+          const lastMeta = chunkMeta[Math.min(i + vectors.length, chunkMeta.length) - 1];
+          report?.({
+            phase: "embed",
+            done: Math.min(i + vectors.length, allChunkTexts.length),
+            total: allChunkTexts.length,
+            currentFile: lastMeta ? toProcess[lastMeta.fileIdx].relPath : void 0
+          });
         }
+      } else {
+        const lastMeta = chunkMeta[chunkMeta.length - 1];
+        report?.({
+          phase: "embed",
+          done: allChunkTexts.length,
+          total: allChunkTexts.length,
+          currentFile: lastMeta ? toProcess[lastMeta.fileIdx].relPath : void 0
+        });
       }
       const processedFiles = /* @__PURE__ */ new Set();
       for (let i = 0; i < chunkMeta.length; i++) {
@@ -1065,6 +1091,7 @@ ${chunkText}`;
       }
     }
     if (added + updated + removed > 0) {
+      report?.({ phase: "save" });
       await this.save();
     }
     return { added, updated, removed };
@@ -1825,6 +1852,10 @@ function readNote(absPath, opts = {}) {
 }
 
 // src/index.ts
+function renderProgressBar(current, total, width = 24) {
+  const filled = total > 0 ? Math.round(current / total * width) : width;
+  return `\x1B[36m${"\u2588".repeat(filled)}\x1B[2m${"\u2591".repeat(width - filled)}\x1B[0m`;
+}
 function index_default(pi) {
   let index = null;
   let currentConfig = null;
@@ -2139,17 +2170,54 @@ function index_default(pi) {
       ctx.ui.notify("No directories configured. Run /knowledge-search add <dir> first.", "warning");
       return;
     }
+    const clearProgressUI = () => {
+      ctx.ui.setStatus("knowledge-search", void 0);
+      ctx.ui.setWidget("knowledge-search", void 0);
+    };
     try {
       await ensureIndexLoaded();
-      ctx.ui.notify("Indexing (incremental)...", "info");
-      const { added, updated, removed } = await index.sync();
+      if (currentConfig.provider?.type === "transformers" && !isTransformersModelCached(currentConfig.provider.model)) {
+        ctx.ui.notify(
+          `\u23F3 Loading embedding model: ${currentConfig.provider.model} \u2014 first run downloads it (~111 MB, this can take a few minutes)`,
+          "info"
+        );
+      }
+      const theme = ctx.ui.theme;
+      const verb = theme.fg("accent", "Indexing");
+      const { added, updated, removed } = await index.sync({
+        onProgress: (p) => {
+          if (p.phase === "scan") {
+            const label = p.filesToProcess > 0 ? `Found ${p.filesToProcess} file(s) to index \xB7 ${p.unchanged} unchanged \xB7 ${p.totalChunks} chunks` : `Nothing to index \xB7 ${p.unchanged} files unchanged`;
+            ctx.ui.setStatus("knowledge-search", `\u25A0 Scanning\u2026 ${label}`);
+            ctx.ui.setWidget("knowledge-search", [verb, theme.fg("dim", label)]);
+            return;
+          }
+          if (p.phase === "embed") {
+            const percent = p.total ? Math.round(p.done / p.total * 100) : 100;
+            const bar = renderProgressBar(p.done, p.total);
+            ctx.ui.setStatus(
+              "knowledge-search",
+              `\u25A0 Indexing ${percent}% \u2502 ${p.done}/${p.total} chunks`
+            );
+            ctx.ui.setWidget("knowledge-search", [
+              `${verb}  ${bar}  ${theme.fg("success", `${percent}%`)}`,
+              `${theme.fg("dim", "file:    ")}${p.currentFile ?? "\u2026"}`,
+              `${theme.fg("dim", "chunks:  ")}${theme.fg("success", String(p.done))}/${p.total}`
+            ]);
+            return;
+          }
+          ctx.ui.setStatus("knowledge-search", "\u25A0 Saving index...");
+        }
+      });
       syncDone = true;
+      clearProgressUI();
       const changed = added + updated + removed;
       ctx.ui.notify(
         changed === 0 ? `\u2705 Up to date \xB7 ${index.size()} files (${index.chunkCount()} chunks) indexed` : `\u2705 Indexed ${added} new \xB7 ${updated} changed \xB7 ${removed} removed \xB7 ${index.size()} files (${index.chunkCount()} chunks) total`,
         "info"
       );
     } catch (err) {
+      clearProgressUI();
       ctx.ui.notify(`Index failed: ${err.message}`, "error");
     }
   }

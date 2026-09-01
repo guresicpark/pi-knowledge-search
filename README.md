@@ -71,7 +71,7 @@ Everything is driven by the `/knowledge-search` command (mirroring pi-local-rag'
 /knowledge-search                 # show status: indexed dirs, excludes, extensions, engine
 /knowledge-search add ~/notes     # add directories to index (space- or comma-separated)
 /knowledge-search exclude build   # add an excluded directory name (-<name> removes, bare lists)
-/knowledge-search index           # incrementally index new/changed files
+/knowledge-search index           # incrementally index new/changed files (progress bar, like /rag)
 /knowledge-search clear           # clear ALL project data + reset settings to defaults (confirm first)
 /knowledge-search help            # list all subcommands
 ```

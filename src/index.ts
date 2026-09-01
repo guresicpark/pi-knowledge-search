@@ -9,10 +9,16 @@ import { fork } from "node:child_process";
 import * as fs from "node:fs";
 import { join, resolve } from "node:path";
 import { loadConfig, saveConfig, getConfigPath, getIndexDir, type Config, type ConfigFile } from "./config.js";
-import { createEmbedder } from "./embedder.js";
-import { KnowledgeIndex } from "./index-store.js";
+import { createEmbedder, isTransformersModelCached } from "./embedder.js";
+import { KnowledgeIndex, type SyncProgress } from "./index-store.js";
 import { buildOverview, formatOverview } from "./overview.js";
 import { resolveNote, readNote } from "./kb-reader.js";
+
+/** Render a 24-cell block progress bar (cyan filled / dim empty), like /rag's. */
+function renderProgressBar(current: number, total: number, width = 24): string {
+  const filled = total > 0 ? Math.round((current / total) * width) : width;
+  return `\x1b[36m${"█".repeat(filled)}\x1b[2m${"░".repeat(width - filled)}\x1b[0m`;
+}
 
 export default function (pi: ExtensionAPI) {
   let index: KnowledgeIndex | null = null;
@@ -455,17 +461,72 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  /** /knowledge-search index — incremental sync of new/changed files. */
+  /**
+   * /knowledge-search index — incremental sync of new/changed files, with
+   * pi-local-rag-style progress: footer status line + widget with a block
+   * progress bar, plus a cold-start notice when the embedding model needs
+   * downloading.
+   */
   async function handleIndex(ctx: ExtensionCommandContext): Promise<void> {
     if (!currentConfig || currentConfig.dirs.length === 0) {
       ctx.ui.notify("No directories configured. Run /knowledge-search add <dir> first.", "warning");
       return;
     }
+
+    const clearProgressUI = () => {
+      ctx.ui.setStatus("knowledge-search", undefined);
+      ctx.ui.setWidget("knowledge-search", undefined);
+    };
+
     try {
       await ensureIndexLoaded();
-      ctx.ui.notify("Indexing (incremental)...", "info");
-      const { added, updated, removed } = await index!.sync();
+
+      // Cold-start notice: a missing model triggers a ~111 MB download that
+      // can stall the first index for minutes — say so before it happens
+      // (mirrors pi-local-rag's onModelLoad).
+      if (
+        currentConfig.provider?.type === "transformers" &&
+        !isTransformersModelCached(currentConfig.provider.model)
+      ) {
+        ctx.ui.notify(
+          `⏳ Loading embedding model: ${currentConfig.provider.model} — first run downloads it (~111 MB, this can take a few minutes)`,
+          "info"
+        );
+      }
+
+      const theme = ctx.ui.theme;
+      const verb = theme.fg("accent", "Indexing");
+      const { added, updated, removed } = await index!.sync({
+        onProgress: (p: SyncProgress) => {
+          if (p.phase === "scan") {
+            const label =
+              p.filesToProcess > 0
+                ? `Found ${p.filesToProcess} file(s) to index · ${p.unchanged} unchanged · ${p.totalChunks} chunks`
+                : `Nothing to index · ${p.unchanged} files unchanged`;
+            ctx.ui.setStatus("knowledge-search", `■ Scanning… ${label}`);
+            ctx.ui.setWidget("knowledge-search", [verb, theme.fg("dim", label)]);
+            return;
+          }
+          if (p.phase === "embed") {
+            const percent = p.total ? Math.round((p.done / p.total) * 100) : 100;
+            const bar = renderProgressBar(p.done, p.total);
+            ctx.ui.setStatus(
+              "knowledge-search",
+              `■ Indexing ${percent}% │ ${p.done}/${p.total} chunks`
+            );
+            ctx.ui.setWidget("knowledge-search", [
+              `${verb}  ${bar}  ${theme.fg("success", `${percent}%`)}`,
+              `${theme.fg("dim", "file:    ")}${p.currentFile ?? "…"}`,
+              `${theme.fg("dim", "chunks:  ")}${theme.fg("success", String(p.done))}/${p.total}`,
+            ]);
+            return;
+          }
+          ctx.ui.setStatus("knowledge-search", "■ Saving index...");
+        },
+      });
       syncDone = true;
+      clearProgressUI();
+
       const changed = added + updated + removed;
       ctx.ui.notify(
         changed === 0
@@ -474,6 +535,7 @@ export default function (pi: ExtensionAPI) {
         "info"
       );
     } catch (err: any) {
+      clearProgressUI();
       ctx.ui.notify(`Index failed: ${err.message}`, "error");
     }
   }

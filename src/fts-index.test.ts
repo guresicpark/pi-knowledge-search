@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { KnowledgeIndex } from "./index-store.js";
+import { KnowledgeIndex, type SyncProgress } from "./index-store.js";
 import { FtsChunkIndex, toFtsQuery } from "./fts-index.js";
 import type { Config } from "./config.js";
 import type { Embedder } from "./embedder.js";
@@ -485,6 +485,67 @@ describe("KnowledgeIndex FTS-only mode (no embedder)", () => {
       assert.deepEqual(e.vector, []);
     }
     await idx.close();
+  });
+
+  it("sync() reports scan/embed/save progress (FTS-only)", async () => {
+    fs.writeFileSync(
+      path.join(vaultDir, "a.md"),
+      "# Cookies\n\nChocolate chip cookies recipe with flour and butter.",
+    );
+
+    const indexDir = path.join(tmpDir, "idx-progress-fts");
+    fs.mkdirSync(indexDir);
+    const idx = new KnowledgeIndex(makeFtsOnlyConfig(indexDir), null);
+    await idx.load();
+
+    const events: SyncProgress[] = [];
+    await idx.sync({ onProgress: (p) => events.push(p) });
+    await idx.close();
+
+    const scan = events.find((e) => e.phase === "scan");
+    assert.ok(scan && scan.phase === "scan");
+    assert.equal(scan.filesToProcess, 1);
+    assert.equal(scan.totalChunks, 1);
+
+    // FTS-only jumps the embed bar straight to complete.
+    const embed = events.filter((e) => e.phase === "embed");
+    assert.equal(embed.length, 1);
+    assert.ok(embed[0].phase === "embed");
+    assert.equal(embed[0].done, embed[0].total);
+    assert.equal(embed[0].currentFile, "a.md");
+
+    assert.ok(events.some((e) => e.phase === "save"), "save event expected");
+  });
+
+  it("sync() reports per-batch embed progress with an embedder", async () => {
+    fs.writeFileSync(
+      path.join(vaultDir, "a.md"),
+      "# Cookies\n\nChocolate chip cookies recipe with flour and butter.",
+    );
+
+    // Stub embedder: one vector per text, no failures.
+    const stub: Embedder = {
+      embed: async () => [1],
+      embedBatch: async (texts) => texts.map(() => [1, 0, 0, 0]),
+    };
+
+    const indexDir = path.join(tmpDir, "idx-progress-embed");
+    fs.mkdirSync(indexDir);
+    const idx = new KnowledgeIndex(makeFtsOnlyConfig(indexDir), stub);
+    await idx.load();
+
+    const events: SyncProgress[] = [];
+    await idx.sync({ onProgress: (p) => events.push(p) });
+    await idx.close();
+
+    const embeds = events.filter((e) => e.phase === "embed");
+    assert.ok(embeds.length >= 1, "at least one embed event");
+    const last = embeds[embeds.length - 1];
+    assert.ok(last.phase === "embed");
+    assert.equal(last.done, last.total, "final embed event completes the bar");
+    assert.equal(last.currentFile, "a.md");
+    assert.ok(events.some((e) => e.phase === "scan"));
+    assert.ok(events.some((e) => e.phase === "save"));
   });
 
   it("search() returns BM25 results in FTS-only mode", async () => {
