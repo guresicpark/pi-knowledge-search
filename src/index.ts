@@ -963,12 +963,12 @@ export default function (pi: ExtensionAPI) {
   type ReadDetails = { resolvedPath?: string; candidates?: string[]; truncated?: boolean };
 
   pi.registerTool<typeof readParams, ReadDetails>({
-    name: "kb_read",
+    name: "knowledge_kb_read",
     label: "KB Read",
     description:
       "Read a note from the knowledge base by name, relative path, or [[wikilink]]. Resolves fuzzy references without needing an absolute path — use this when you know the note's title/filename but not its full path on disk.",
     promptGuidelines: [
-      "Use kb_read when a note is referenced by name or [[wikilink]] — don't run find/grep first.",
+      "Use knowledge_kb_read when a note is referenced by name or [[wikilink]] — don't run find/grep first.",
       "Use the standard `read` tool for non-indexed files or when you already have an absolute path.",
     ],
     parameters: readParams,
@@ -1013,7 +1013,7 @@ export default function (pi: ExtensionAPI) {
               type: "text",
               text:
                 `"${result.normalizedRef}" is ambiguous. ${result.matches.length} candidates:\n\n${listed}\n\n` +
-                `Call kb_read again with a more specific path (e.g. the exact relative path) to disambiguate.`,
+                `Call knowledge_kb_read again with a more specific path (e.g. the exact relative path) to disambiguate.`,
             },
           ],
           details: { candidates: result.matches.map((m) => m.absPath) },
@@ -1044,7 +1044,7 @@ export default function (pi: ExtensionAPI) {
       // the reason so the agent can decide whether to trust the result or refine
       // the reference. High-confidence tiers are resolved silently.
       const fuzzyNote = !result.unique
-        ? `\n\n_(fuzzy match via ${match.reason} — if this isn't the note you meant, re-run kb_read with a more specific path)_`
+        ? `\n\n_(fuzzy match via ${match.reason} — if this isn't the note you meant, re-run knowledge_kb_read with a more specific path)_`
         : "";
       const header = `# ${display}${section}${truncNote}${fuzzyNote}\n\n`;
 

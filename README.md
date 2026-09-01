@@ -1,6 +1,6 @@
 # pi-knowledge-search
 
-Hybrid **local** search over local files for [pi](https://github.com/badlogic/pi). Indexes directories of text/markdown files using local ONNX vector embeddings (always `nomic-ai/nomic-embed-text-v1.5` — the engine is fixed, not configurable) **and** SQLite FTS5 keyword search, exposes `knowledge_search` + `kb_read` tools the LLM can call, and auto-injects a knowledge lookup on every prompt (like pi-local-rag's RAG lookup). Everything runs on your machine — no embedding APIs, no cloud services. Indexing runs on session startup; mid-session file changes are picked up with `/knowledge-search index`.
+Hybrid **local** search over local files for [pi](https://github.com/badlogic/pi). Indexes directories of text/markdown files using local ONNX vector embeddings (always `nomic-ai/nomic-embed-text-v1.5` — the engine is fixed, not configurable) **and** SQLite FTS5 keyword search, exposes `knowledge_search` + `knowledge_kb_read` tools the LLM can call, and auto-injects a knowledge lookup on every prompt (like pi-local-rag's RAG lookup). Everything runs on your machine — no embedding APIs, no cloud services. Indexing runs on session startup; mid-session file changes are picked up with `/knowledge-search index`.
 
 On session start, injects a folder+keyword overview of the indexed vault as a custom message so the model knows what’s worth searching for before it asks.
 
@@ -26,9 +26,9 @@ The extension registers two LLM-facing tools:
 | Tool | What it does |
 |------|--------------|
 | `knowledge_search` | Hybrid vector + BM25 search over indexed files. Returns passage-level excerpts ranked by Reciprocal Rank Fusion. |
-| `kb_read` | Resolve a note reference — `[[wikilink]]`, basename, or relative path — to an indexed file and return its full content. Use when the model knows a note's name but not its full path, instead of running find/grep first. |
+| `knowledge_kb_read` | Resolve a note reference — `[[wikilink]]`, basename, or relative path — to an indexed file and return its full content. Use when the model knows a note's name but not its full path, instead of running find/grep first. |
 
-`kb_read` handles `[[Foo]]`, `[[Foo|alias]]`, `[[Foo#Heading]]`, bare names with or without extension (`Foo`, `Foo.md`), and relative paths (`evergreen/foo`). Multi-match references get a disambiguation prompt instead of guessing.
+`knowledge_kb_read` handles `[[Foo]]`, `[[Foo|alias]]`, `[[Foo#Heading]]`, bare names with or without extension (`Foo`, `Foo.md`), and relative paths (`evergreen/foo`). Multi-match references get a disambiguation prompt instead of guessing.
 
 ## Overview injection
 
@@ -126,7 +126,7 @@ Every config field can be overridden via environment variables. This is useful f
 ## How it works
 
 1. On session start, loads the index from disk and incrementally syncs — only re-embeds new or modified files (or everything, once, after an embedding-engine change)
-2. Registers a `knowledge_search` tool the LLM calls with natural language queries
+2. Registers two LLM-facing tools: `knowledge_search` for hybrid ranked search and `knowledge_kb_read` for resolving a note reference to a full file (see [Tools](#tools))
 3. Before every agent turn, runs an automatic knowledge lookup on the prompt and injects the top hits as a message right after it (see [Knowledge lookup](#knowledge-lookup))
 4. Returns ranked results with file paths, relevance scores, and content excerpts
 

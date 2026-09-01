@@ -742,7 +742,7 @@ var KnowledgeIndex = class _KnowledgeIndex {
   /**
    * Aggregate all chunks into a per-file view: one entry per indexed file with
    * the merged list of section headings found across its chunks. Used by the
-   * overview builder and the kb_read resolver — both want file-level data, not
+   * overview builder and the knowledge_kb_read resolver — both want file-level data, not
    * chunk-level.
    */
   listFiles() {
@@ -1687,7 +1687,7 @@ function formatOverview(overview) {
   const lines = [];
   lines.push("## Knowledge-search vault overview");
   lines.push(
-    `You have a local knowledge base indexed by pi-knowledge-search. Use the \`knowledge_search\` tool for semantic/keyword lookup and \`kb_read\` to pull a note by name or \`[[wikilink]]\`.`
+    `You have a local knowledge base indexed by pi-knowledge-search. Use the \`knowledge_search\` tool for semantic/keyword lookup and \`knowledge_kb_read\` to pull a note by name or \`[[wikilink]]\`.`
   );
   lines.push("");
   const home = process.env.HOME || "";
@@ -2529,11 +2529,11 @@ ${r.excerpt}`;
     )
   });
   pi.registerTool({
-    name: "kb_read",
+    name: "knowledge_kb_read",
     label: "KB Read",
     description: "Read a note from the knowledge base by name, relative path, or [[wikilink]]. Resolves fuzzy references without needing an absolute path \u2014 use this when you know the note's title/filename but not its full path on disk.",
     promptGuidelines: [
-      "Use kb_read when a note is referenced by name or [[wikilink]] \u2014 don't run find/grep first.",
+      "Use knowledge_kb_read when a note is referenced by name or [[wikilink]] \u2014 don't run find/grep first.",
       "Use the standard `read` tool for non-indexed files or when you already have an absolute path."
     ],
     parameters: readParams,
@@ -2571,7 +2571,7 @@ ${r.excerpt}`;
 
 ${listed}
 
-Call kb_read again with a more specific path (e.g. the exact relative path) to disambiguate.`
+Call knowledge_kb_read again with a more specific path (e.g. the exact relative path) to disambiguate.`
             }
           ],
           details: { candidates: result.matches.map((m) => m.absPath) }
@@ -2598,7 +2598,7 @@ _(truncated: showing first ${note.content.length} of ${note.totalBytes} bytes)_`
       const section = result.subheading ? ` \u2014 section "${result.subheading}"` : "";
       const fuzzyNote = !result.unique ? `
 
-_(fuzzy match via ${match.reason} \u2014 if this isn't the note you meant, re-run kb_read with a more specific path)_` : "";
+_(fuzzy match via ${match.reason} \u2014 if this isn't the note you meant, re-run knowledge_kb_read with a more specific path)_` : "";
       const header = `# ${display}${section}${truncNote}${fuzzyNote}
 
 `;

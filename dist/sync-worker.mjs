@@ -727,7 +727,7 @@ var KnowledgeIndex = class _KnowledgeIndex {
   /**
    * Aggregate all chunks into a per-file view: one entry per indexed file with
    * the merged list of section headings found across its chunks. Used by the
-   * overview builder and the kb_read resolver — both want file-level data, not
+   * overview builder and the knowledge_kb_read resolver — both want file-level data, not
    * chunk-level.
    */
   listFiles() {

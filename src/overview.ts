@@ -284,7 +284,7 @@ export function formatOverview(overview: Overview): string {
   lines.push("## Knowledge-search vault overview");
   lines.push(
     `You have a local knowledge base indexed by pi-knowledge-search. Use the ` +
-      `\`knowledge_search\` tool for semantic/keyword lookup and \`kb_read\` to ` +
+      `\`knowledge_search\` tool for semantic/keyword lookup and \`knowledge_kb_read\` to ` +
       `pull a note by name or \`[[wikilink]]\`.`
   );
   lines.push("");

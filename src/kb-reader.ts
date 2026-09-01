@@ -1,5 +1,5 @@
 /**
- * kb_read resolver — map a human-typed note reference to an indexed file.
+ * knowledge_kb_read resolver — map a human-typed note reference to an indexed file.
  *
  * Accepts:
  *   - Absolute paths (must be inside a configured source dir).
