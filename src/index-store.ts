@@ -80,7 +80,27 @@ export type SyncProgress =
   | { phase: "save" };
 
 const INDEX_VERSION = 4; // Bumped from 3 for per-chunk line ranges
+
+/**
+ * Oldest on-disk index format we can adopt without re-embedding. v3
+ * introduced the per-chunk key format (`${absPath}#${chunkIndex}`) and the
+ * current IndexEntry shape; v4 only added the optional startLine/endLine
+ * line-range fields. Indexes at or above this version are structurally
+ * compatible — their vectors are still valid, so they load as-is. Older
+ * (v1/v2) flat whole-file indexes use bare absPath keys and a different
+ * entry shape, so they still force a full rebuild.
+ */
+const MIN_LOADABLE_INDEX_VERSION = 3;
+
 const MAX_EXCERPT_LENGTH = 3500; // Safety cap for stored excerpts
+
+/**
+ * Plain-text files larger than this are skipped during scanning — mirrors
+ * pi-local-rag's TEXT_MAX_BYTES. Keeps pathological files (minified bundles,
+ * dumped JSON/CSV, base64 blobs) from blowing up read time, chunk count, and
+ * the embedding batch's padded wall time.
+ */
+const TEXT_MAX_BYTES = 500_000;
 
 export class KnowledgeIndex {
   private config: Config;
@@ -202,7 +222,9 @@ export class KnowledgeIndex {
           parsed = JSON.parse(raw) as IndexData;
         }
         // Accept the on-disk index when:
-        //  - version matches AND
+        //  - version is a known-compatible chunked format (current or an
+        //    older one — v3 and v4 differ only by optional per-chunk line
+        //    ranges, so an older index is migrated, not re-embedded) AND
         //  - dimensions match OR we're in FTS-only mode (dimensions are a
         //    vector-only concern; FTS-only installs should never invalidate
         //    a perfectly good entry map over them) AND
@@ -213,11 +235,21 @@ export class KnowledgeIndex {
           this.isFtsOnly || parsed?.dimensions === this.config.dimensions;
         const sigOk =
           this.isFtsOnly || parsed?.embeddingModel === this.config.modelSignature;
-        if (parsed && parsed.version === INDEX_VERSION && dimsOk && sigOk) {
-          this.data = parsed;
+        if (
+          parsed &&
+          parsed.version >= MIN_LOADABLE_INDEX_VERSION &&
+          parsed.version <= INDEX_VERSION &&
+          dimsOk &&
+          sigOk
+        ) {
+          // Normalize the version so the next save persists the current
+          // format. Entries missing the optional startLine/endLine fields
+          // fall back to the per-file match count in search — no re-embed
+          // needed to keep their vectors.
+          this.data = { ...parsed, version: INDEX_VERSION };
         }
-        // Version, dimension, or signature mismatch → keep fresh data, caller
-        // will re-index.
+        // Version (older than v3), dimension, or signature mismatch → keep
+        // fresh data, caller will re-index.
       } catch {
         // Corrupt file / partial write / IO error → fresh index.
       }
@@ -522,7 +554,10 @@ export class KnowledgeIndex {
       // Embed in batches — skipped entirely in FTS-only mode.
       const allVectors: (number[] | null)[] = new Array(allChunkTexts.length).fill(null);
       if (this.embedder) {
-        const BATCH_SIZE = 50;
+        // One chunk per sync step matches pi-local-rag's BATCH_SIZE (16 texts
+        // per ONNX forward pass), so each step is a single padded forward pass
+        // and progress ticks per pass instead of every 50 chunks.
+        const BATCH_SIZE = 16;
         for (let i = 0; i < allChunkTexts.length; i += BATCH_SIZE) {
           const batchTexts = allChunkTexts.slice(i, i + BATCH_SIZE);
           const vectors = await this.embedder.embedBatch(batchTexts);
@@ -852,6 +887,10 @@ export class KnowledgeIndex {
     if (this.shouldSkip(relPath, path.basename(absPath))) return;
 
     const stat = fs.statSync(absPath);
+    if (stat.size >= TEXT_MAX_BYTES) {
+      this.removeFile(absPath);
+      return;
+    }
     const content = this.readFileContent(absPath);
     if (!content || content.trim().length <= 20) {
       this.removeFile(absPath);
@@ -994,6 +1033,7 @@ export class KnowledgeIndex {
         if (this.shouldSkip(relPath, entry.name)) continue;
         try {
           const stat = fs.statSync(absPath);
+          if (stat.size >= TEXT_MAX_BYTES) continue;
           results.push({ absPath, relPath, sourceDir, mtime: stat.mtimeMs });
         } catch {
           // Skip unreadable

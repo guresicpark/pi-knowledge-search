@@ -6,7 +6,7 @@ On session start, injects a folder+keyword overview of the indexed vault as a cu
 
 ## Knowledge lookup
 
-Like pi-local-rag's RAG lookup, every user prompt triggers an automatic **knowledge lookup**: the prompt runs through hybrid search (top 5 chunks, min score 0.1) and the hits are injected as a message right after the prompt — full excerpts for the model, and a green `Knowledge lookup — event_dispatcher.rst:1-8,9-37,44-72, …` summary box for you (red on failure). Each `file:start-end,…` entry lists the exact line ranges in that file where the hits live; a bare number is a single-line hit. The line ranges only exist once the index has been rebuilt with line tracking (index version 4) — entries indexed before that fall back to a `file (n)` hit count until the next `/knowledge-search index`.
+Like pi-local-rag's RAG lookup, every user prompt triggers an automatic **knowledge lookup**: the prompt runs through hybrid search (top 5 chunks, min score 0.1) and the hits are injected as a message right after the prompt — full excerpts for the model, and a green `Knowledge lookup — event_dispatcher.rst:1-8,9-37,44-72, …` summary box for you (red on failure). Each `file:start-end,…` entry lists the exact line ranges in that file where the hits live; a bare number is a single-line hit. Line ranges only appear on entries indexed by the current format (index version 4) — entries from an older-but-compatible index are kept as-is on load (no re-embedding) and fall back to a `file (n)` hit count until the file is next re-indexed.
 
 Injection is automatically enabled whenever the index holds vectors — at session start and after `/knowledge-search index` — so `/knowledge-search off` acts as a per-session kill-switch that the next startup flips back on (`autoInject` in the config).
 
@@ -109,6 +109,8 @@ Default `fileExtensions` mirror the extensions pi-local-rag's nomic model indexe
 
 (.pdf/.docx also go to nomic in pi-local-rag but need extraction libraries and are not indexed here.) Extension matching is case-insensitive; code extensions (`.ts`, `.py`, …) are not in nomic's group — set `fileExtensions` explicitly if you want them.
 
+Files larger than **500 KB** are skipped during scanning (mirroring pi-local-rag's `TEXT_MAX_BYTES`) — this keeps minified bundles, dumped JSON/CSV, and base64 blobs from blowing up read time, chunk count, and embedding wall time. Files that exceed the cap after having been indexed are dropped on the next sync.
+
 > **Migrating from older configs:** legacy `provider` and `dimensions` keys are ignored — the embedding engine is always nomic and not configurable. Vectors previously built by any other engine are removed on the first load after upgrading, and the next sync re-embeds everything with nomic.
 
 ### Embedding engine (always nomic)
@@ -125,7 +127,7 @@ Every config field can be overridden via environment variables. This is useful f
 
 ## How it works
 
-1. On session start, loads the index from disk and incrementally syncs — only re-embeds new or modified files (or everything, once, after an embedding-engine change)
+1. On session start, loads the index from disk and incrementally syncs — only re-embeds new or modified files. Older-but-compatible indexes (e.g. a pre-line-tracking version 3) are adopted as-is without a full re-embed; only an embedding-engine change (or a pre-chunk flat index) forces re-embedding everything. Files at or above 500 KB are skipped (see [Setup](#setup))
 2. Registers two LLM-facing tools: `knowledge_search` for hybrid ranked search and `knowledge_kb_read` for resolving a note reference to a full file (see [Tools](#tools))
 3. Before every agent turn, runs an automatic knowledge lookup on the prompt and injects the top hits as a message right after it (see [Knowledge lookup](#knowledge-lookup))
 4. Returns ranked results with file paths, relevance scores, content excerpts, and the exact line ranges of each hit
@@ -159,6 +161,8 @@ Indicative numbers for local ONNX embeddings (nomic-embed-text-v1.5, q8, Apple S
 | Index file size               | ~5MB            |
 
 First run per machine also downloads the nomic model (~111 MB, shared with pi-local-rag) — `/knowledge-search index` shows a notice before the download starts.
+
+Chunks are embedded in batches of **16** — one padded ONNX forward pass per batch, mirroring pi-local-rag's `BATCH_SIZE` — so the progress bar ticks per pass instead of every 50 chunks.
 
 ## Project-local storage
 

@@ -162,6 +162,62 @@ describe("KnowledgeIndex streaming load/save", () => {
     assert.equal(reader.chunkCount(), 0);
   });
 
+  it("loads an older-but-compatible chunked index (v3) without re-embedding", async () => {
+    const config = makeConfig(tmpDir, 4);
+    fs.writeFileSync(
+      path.join(tmpDir, "index.json"),
+      JSON.stringify({
+        version: 3,
+        dimensions: 4,
+        embeddingModel: config.modelSignature,
+        entries: {
+          "/vault/a.md#0": {
+            relPath: "a.md",
+            sourceDir: "/vault",
+            mtime: 1_700_000_000_000,
+            vector: [1, 0, 0, 0],
+            excerpt: "Excerpt A",
+            heading: "intro",
+            chunkIndex: 0,
+          },
+        },
+      })
+    );
+    const reader = new KnowledgeIndex(config, new StubEmbedder());
+    await reader.load();
+    assert.equal(reader.chunkCount(), 1);
+    const internal = reader as unknown as { data: { version: number; entries: Record<string, unknown> } };
+    assert.equal(internal.data.version, 4, "version should normalize to the current format on load");
+    const entry = internal.data.entries["/vault/a.md#0"] as { vector: number[] };
+    assert.deepStrictEqual(entry.vector, [1, 0, 0, 0], "existing vectors must be preserved");
+    await reader.close();
+  });
+
+  it("load discards a pre-chunk (v2) index to force a rebuild", async () => {
+    const config = makeConfig(tmpDir, 4);
+    fs.writeFileSync(
+      path.join(tmpDir, "index.json"),
+      JSON.stringify({
+        version: 2,
+        dimensions: 4,
+        embeddingModel: config.modelSignature,
+        entries: {
+          "/vault/a.md": {
+            relPath: "a.md",
+            sourceDir: "/vault",
+            mtime: 1_700_000_000_000,
+            vector: [1, 0, 0, 0],
+            excerpt: "A",
+          },
+        },
+      })
+    );
+    const reader = new KnowledgeIndex(config, new StubEmbedder());
+    await reader.load();
+    assert.equal(reader.chunkCount(), 0);
+    await reader.close();
+  });
+
   it("load discards an index with mismatched dimensions (triggers re-index)", async () => {
     const config = makeConfig(tmpDir, 4);
     fs.writeFileSync(
@@ -358,6 +414,73 @@ describe("KnowledgeIndex embedding signature", () => {
     await saveMethod.call(idx);
     const raw = JSON.parse(fs.readFileSync(path.join(tmpDir, "index.json"), "utf-8"));
     assert.equal(raw.embeddingModel, "transformers:nomic-ai/nomic-embed-text-v1.5:4");
+    await idx.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Text file size cap (mirrors pi-local-rag's TEXT_MAX_BYTES = 500_000)
+// ---------------------------------------------------------------------------
+
+describe("KnowledgeIndex text file size cap", () => {
+  let tmpDir: string;
+
+  before(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ks-sizecap-"));
+  });
+
+  beforeEach(() => {
+    for (const f of fs.readdirSync(tmpDir)) {
+      fs.rmSync(path.join(tmpDir, f), { recursive: true, force: true });
+    }
+  });
+
+  after(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /** Embedder that returns fixed-dim vectors without hitting the model. */
+  function stubEmbedder(dim = 4): Embedder {
+    return {
+      embed: async () => new Array(dim).fill(0.25),
+      embedBatch: async (texts: string[]) => texts.map(() => new Array(dim).fill(0.25)),
+    };
+  }
+
+  it("skips files at or above 500,000 bytes during sync", async () => {
+    const vault = path.join(tmpDir, "vault");
+    fs.mkdirSync(vault, { recursive: true });
+
+    const smallFile = path.join(vault, "small.md");
+    fs.writeFileSync(smallFile, "# Small\n\nThis is a small note that fits.\n");
+
+    const bigFile = path.join(vault, "big.md");
+    fs.writeFileSync(bigFile, "x".repeat(500_000));
+
+    const indexDir = path.join(tmpDir, "index");
+    const config = makeConfig(indexDir, 4);
+    config.dirs = [vault];
+    const idx = new KnowledgeIndex(config, stubEmbedder(4));
+    await idx.load();
+    const { added } = await idx.sync();
+    assert.equal(added, 1, "only the small file should be indexed");
+    assert.equal(idx.size(), 1);
+    await idx.close();
+  });
+
+  it("skips oversized files in updateFile", async () => {
+    const vault = path.join(tmpDir, "vault2");
+    fs.mkdirSync(vault, { recursive: true });
+
+    const bigFile = path.join(vault, "big.md");
+    fs.writeFileSync(bigFile, "y".repeat(500_000));
+
+    const indexDir = path.join(tmpDir, "index2");
+    const config = makeConfig(indexDir, 4);
+    const idx = new KnowledgeIndex(config, stubEmbedder(4));
+    await idx.load();
+    await idx.updateFile(bigFile, vault);
+    assert.equal(idx.size(), 0, "oversized file must not be indexed");
     await idx.close();
   });
 });

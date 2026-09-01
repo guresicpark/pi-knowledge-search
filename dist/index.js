@@ -739,7 +739,9 @@ function toFtsQuery(q) {
 
 // src/index-store.ts
 var INDEX_VERSION = 4;
+var MIN_LOADABLE_INDEX_VERSION = 3;
 var MAX_EXCERPT_LENGTH = 3500;
+var TEXT_MAX_BYTES = 5e5;
 var KnowledgeIndex = class _KnowledgeIndex {
   config;
   /** Embedder may be null in FTS-only mode (no provider configured). */
@@ -839,8 +841,8 @@ var KnowledgeIndex = class _KnowledgeIndex {
         }
         const dimsOk = this.isFtsOnly || parsed?.dimensions === this.config.dimensions;
         const sigOk = this.isFtsOnly || parsed?.embeddingModel === this.config.modelSignature;
-        if (parsed && parsed.version === INDEX_VERSION && dimsOk && sigOk) {
-          this.data = parsed;
+        if (parsed && parsed.version >= MIN_LOADABLE_INDEX_VERSION && parsed.version <= INDEX_VERSION && dimsOk && sigOk) {
+          this.data = { ...parsed, version: INDEX_VERSION };
         }
       } catch {
       }
@@ -1091,7 +1093,7 @@ ${chunkText}`;
       });
       const allVectors = new Array(allChunkTexts.length).fill(null);
       if (this.embedder) {
-        const BATCH_SIZE = 50;
+        const BATCH_SIZE = 16;
         for (let i = 0; i < allChunkTexts.length; i += BATCH_SIZE) {
           const batchTexts = allChunkTexts.slice(i, i + BATCH_SIZE);
           const vectors = await this.embedder.embedBatch(batchTexts);
@@ -1342,6 +1344,10 @@ ${chunkText}`;
     const relPath = path2.relative(sourceDir, absPath);
     if (this.shouldSkip(relPath, path2.basename(absPath))) return;
     const stat = fs2.statSync(absPath);
+    if (stat.size >= TEXT_MAX_BYTES) {
+      this.removeFile(absPath);
+      return;
+    }
     const content = this.readFileContent(absPath);
     if (!content || content.trim().length <= 20) {
       this.removeFile(absPath);
@@ -1446,6 +1452,7 @@ ${chunkText}`;
         if (this.shouldSkip(relPath, entry.name)) continue;
         try {
           const stat = fs2.statSync(absPath);
+          if (stat.size >= TEXT_MAX_BYTES) continue;
           results.push({ absPath, relPath, sourceDir, mtime: stat.mtimeMs });
         } catch {
         }
