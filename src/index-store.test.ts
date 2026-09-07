@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { KnowledgeIndex, dotProduct } from "./index-store.js";
+import { KnowledgeIndex, dotProduct, type SyncProgress } from "./index-store.js";
 import type { Config } from "./config.js";
 import type { Embedder } from "./embedder.js";
 
@@ -481,6 +481,105 @@ describe("KnowledgeIndex text file size cap", () => {
     await idx.load();
     await idx.updateFile(bigFile, vault);
     assert.equal(idx.size(), 0, "oversized file must not be indexed");
+    await idx.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sync() scan progress — the "unchanged" count must never go negative
+// ---------------------------------------------------------------------------
+
+describe("KnowledgeIndex sync scan progress", () => {
+  let tmpDir: string;
+
+  before(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ks-progress-"));
+  });
+
+  beforeEach(() => {
+    for (const f of fs.readdirSync(tmpDir)) {
+      fs.rmSync(path.join(tmpDir, f), { recursive: true, force: true });
+    }
+  });
+
+  after(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /** Embedder that returns fixed-dim vectors without hitting the model. */
+  function stubEmbedder(dim = 4): Embedder {
+    return {
+      embed: async () => new Array(dim).fill(0.25),
+      embedBatch: async (texts: string[]) => texts.map(() => new Array(dim).fill(0.25)),
+    };
+  }
+
+  it("reports a non-negative unchanged count when files were removed", async () => {
+    const vault = path.join(tmpDir, "vault");
+    fs.mkdirSync(vault, { recursive: true });
+    fs.writeFileSync(path.join(vault, "a.md"), "# A\n\nContent for a that is long enough.\n");
+    fs.writeFileSync(path.join(vault, "b.md"), "# B\n\nContent for b that is long enough.\n");
+
+    const indexDir = path.join(tmpDir, "index");
+    const config = makeConfig(indexDir, 4);
+    config.dirs = [vault];
+    const idx = new KnowledgeIndex(config, stubEmbedder(4));
+    await idx.load();
+
+    const scans: Extract<SyncProgress, { phase: "scan" }>[] = [];
+    await idx.sync({
+      onProgress: (p) => {
+        if (p.phase === "scan") scans.push(p);
+      },
+    });
+    assert.equal(scans[0].filesToProcess, 2);
+    assert.equal(scans[0].unchanged, 0);
+
+    // Add one file, modify one, delete one — then sync again.
+    fs.writeFileSync(path.join(vault, "c.md"), "# C\n\nBrand new content for c.\n");
+    fs.writeFileSync(path.join(vault, "b.md"), "# B v2\n\nRewritten content for b.\n");
+    fs.rmSync(path.join(vault, "a.md"));
+
+    scans.length = 0;
+    const { removed } = await idx.sync({
+      onProgress: (p) => {
+        if (p.phase === "scan") scans.push(p);
+      },
+    });
+
+    assert.equal(removed, 1);
+    assert.equal(scans.length, 1, "scan event must fire when there is work");
+    // a.md was deleted from disk, so the fresh scan (2 files: b.md + c.md)
+    // never saw it — the old formula subtracted `removed` here and produced -1.
+    assert.equal(scans[0].filesToProcess, 2);
+    assert.equal(
+      scans[0].unchanged,
+      0,
+      "unchanged must stay non-negative when deletions accompany re-indexing"
+    );
+    await idx.close();
+  });
+
+  it("reports all files as unchanged on a no-op sync", async () => {
+    const vault = path.join(tmpDir, "vault2");
+    fs.mkdirSync(vault, { recursive: true });
+    fs.writeFileSync(path.join(vault, "a.md"), "# A\n\nSteady content that will not change.\n");
+
+    const indexDir = path.join(tmpDir, "index2");
+    const config = makeConfig(indexDir, 4);
+    config.dirs = [vault];
+    const idx = new KnowledgeIndex(config, stubEmbedder(4));
+    await idx.load();
+    await idx.sync();
+
+    const scans: Extract<SyncProgress, { phase: "scan" }>[] = [];
+    const counts = await idx.sync({
+      onProgress: (p) => {
+        if (p.phase === "scan") scans.push(p);
+      },
+    });
+    assert.equal(counts.added + counts.updated + counts.removed, 0);
+    assert.equal(scans.length, 0, "no scan event fires when nothing to process");
     await idx.close();
   });
 });

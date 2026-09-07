@@ -384,7 +384,7 @@ export default function (pi: ExtensionAPI) {
   const KS_SUBCOMMANDS: { value: string; label: string; description: string }[] = [
     { value: "add", label: "add", description: "Add directories to the index" },
     { value: "exclude", label: "exclude", description: "Manage excluded directory names (-<name> removes)" },
-    { value: "index", label: "index", description: "Incrementally index new/changed files" },
+    { value: "index", label: "index", description: "Incrementally index added/changed/removed files" },
     { value: "clear", label: "clear", description: "Clear the index and reset config to defaults" },
     { value: "on", label: "on", description: "Enable per-turn knowledge lookup injection" },
     { value: "off", label: "off", description: "Disable per-turn knowledge lookup injection" },
@@ -788,7 +788,7 @@ export default function (pi: ExtensionAPI) {
   let statusWidgetVisible = false;
 
   pi.registerCommand("knowledge-search", {
-    description: "knowledge-search: (status) | add <dir> | exclude <name> | index | clear | on | off | help",
+    description: "knowledge-search: (status) | add <dir> | exclude <name> | index (added/changed/removed) | clear | on | off | help",
     getArgumentCompletions: (prefix: string) => getSubcommandCompletions(prefix),
     handler: async (args, ctx) => {
       const parts = (args || "").trim().split(/\s+/);

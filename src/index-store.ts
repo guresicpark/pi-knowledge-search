@@ -575,7 +575,10 @@ export class KnowledgeIndex {
       report?.({
         phase: "scan",
         filesToProcess: toProcess.length,
-        unchanged: allFiles.length - toProcess.length - removed,
+        // Files scanned that need no reprocessing. `removed` files are NOT
+        // subtracted — they were deleted from disk, so the fresh scan never
+        // saw them; subtracting them here produced negative "unchanged" counts.
+        unchanged: allFiles.length - toProcess.length,
         totalChunks: allChunkTexts.length,
       });
 

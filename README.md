@@ -84,7 +84,7 @@ Everything is driven by the `/knowledge-search` command (mirroring pi-local-rag'
 /knowledge-search                 # show status: indexed dirs, excludes, extensions, engine
 /knowledge-search add ~/notes     # add directories to index (space- or comma-separated)
 /knowledge-search exclude build   # add an excluded directory name (-<name> removes, bare lists)
-/knowledge-search index           # incrementally index new/changed files (progress bar, like /rag)
+/knowledge-search index           # incrementally index added/changed/removed files across all dirs (progress bar, like /rag)
 /knowledge-search clear           # clear ALL project data + reset settings to defaults (confirm first)
 /knowledge-search on | off        # enable/disable the per-turn knowledge lookup injection
 /knowledge-search help            # list all subcommands
@@ -136,12 +136,12 @@ Every config field can be overridden via environment variables. This is useful f
 
 ## How it works
 
-1. On session start, loads the index from disk and incrementally syncs — only re-embeds new or modified files. Older-but-compatible indexes (e.g. a pre-line-tracking version 3) are adopted as-is without a full re-embed; only an embedding-engine change (or a pre-chunk flat index) forces re-embedding everything. Files at or above 500 KB are skipped (see [Setup](#setup))
+1. On session start, loads the index from disk and incrementally syncs — re-indexes new or modified files and drops deleted ones, across every configured directory. Older-but-compatible indexes (e.g. a pre-line-tracking version 3) are adopted as-is without a full re-embed; only an embedding-engine change (or a pre-chunk flat index) forces re-embedding everything. Files at or above 500 KB are skipped (see [Setup](#setup))
 2. Registers two LLM-facing tools: `knowledge_search` for hybrid ranked search and `knowledge_kb_read` for resolving a note reference to a full file (see [Tools](#tools))
 3. Before every agent turn, runs an automatic knowledge lookup on the prompt and injects the top hits as a message right after it (see [Knowledge lookup](#knowledge-lookup))
 4. Returns ranked results with file paths, relevance scores, content excerpts, and the exact line ranges of each hit
 
-Sync runs on session startup. Files changed mid-session can be picked up with `/knowledge-search index`.
+Sync runs on session startup. Files added, changed, or removed mid-session — in any configured directory — can be picked up with `/knowledge-search index`.
 
 The index is stored at `{cwd}/.pi/knowledge-search/index.json` (project-local; see [Project-local storage](#project-local-storage)).
 
@@ -152,7 +152,7 @@ The index is stored at `{cwd}/.pi/knowledge-search/index.json` (project-local; s
 | `/knowledge-search`                  | Show status: dirs, excludes, extensions, engine      |
 | `/knowledge-search add <dir>`        | Add directories to the index                         |
 | `/knowledge-search exclude <name>`   | Manage excluded directory names (`-<name>` removes)  |
-| `/knowledge-search index`            | Incrementally index new/changed files                |
+| `/knowledge-search index`            | Incrementally index added/changed/removed files      |
 | `/knowledge-search clear`            | Clear all project data; reset settings to defaults  |
 | `/knowledge-search on` / `off`       | Toggle per-turn knowledge lookup injection           |
 | `/knowledge-search help`             | List all subcommands                                 |

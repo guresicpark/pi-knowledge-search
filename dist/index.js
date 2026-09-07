@@ -1110,7 +1110,10 @@ ${chunkText}`;
       report?.({
         phase: "scan",
         filesToProcess: toProcess.length,
-        unchanged: allFiles.length - toProcess.length - removed,
+        // Files scanned that need no reprocessing. `removed` files are NOT
+        // subtracted — they were deleted from disk, so the fresh scan never
+        // saw them; subtracting them here produced negative "unchanged" counts.
+        unchanged: allFiles.length - toProcess.length,
         totalChunks: allChunkTexts.length
       });
       const allVectors = new Array(allChunkTexts.length).fill(null);
@@ -2265,7 +2268,7 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
   const KS_SUBCOMMANDS = [
     { value: "add", label: "add", description: "Add directories to the index" },
     { value: "exclude", label: "exclude", description: "Manage excluded directory names (-<name> removes)" },
-    { value: "index", label: "index", description: "Incrementally index new/changed files" },
+    { value: "index", label: "index", description: "Incrementally index added/changed/removed files" },
     { value: "clear", label: "clear", description: "Clear the index and reset config to defaults" },
     { value: "on", label: "on", description: "Enable per-turn knowledge lookup injection" },
     { value: "off", label: "off", description: "Disable per-turn knowledge lookup injection" },
@@ -2550,7 +2553,7 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
   }
   let statusWidgetVisible = false;
   pi.registerCommand("knowledge-search", {
-    description: "knowledge-search: (status) | add <dir> | exclude <name> | index | clear | on | off | help",
+    description: "knowledge-search: (status) | add <dir> | exclude <name> | index (added/changed/removed) | clear | on | off | help",
     getArgumentCompletions: (prefix) => getSubcommandCompletions(prefix),
     handler: async (args, ctx) => {
       const parts = (args || "").trim().split(/\s+/);
