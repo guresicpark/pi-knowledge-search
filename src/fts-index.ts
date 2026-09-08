@@ -172,6 +172,28 @@ export class FtsChunkIndex {
     return Number(res.changes ?? 0);
   }
 
+  /**
+   * Delete every chunk whose sourceDir is one of the given dirs. Used when
+   * removing a whole source directory — catches rows that no longer have a
+   * vector-side counterpart (e.g. orphaned by a previously failed write).
+   */
+  deleteBySourceDirs(dirs: string[]): number {
+    const db = this.requireDb();
+    const del = db.prepare("DELETE FROM chunks WHERE sourceDir = ?");
+    let changes = 0;
+    db.exec("BEGIN");
+    try {
+      for (const dir of dirs) {
+        changes += Number(del.run(dir).changes ?? 0);
+      }
+      db.exec("COMMIT");
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
+    return changes;
+  }
+
   /** Remove all entries. */
   clear(): void {
     this.requireDb().exec("DELETE FROM chunks");

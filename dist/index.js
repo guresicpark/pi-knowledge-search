@@ -674,6 +674,27 @@ var FtsChunkIndex = class {
     const res = this.requireDb().prepare("DELETE FROM chunks WHERE absPath = ?").run(absPath);
     return Number(res.changes ?? 0);
   }
+  /**
+   * Delete every chunk whose sourceDir is one of the given dirs. Used when
+   * removing a whole source directory — catches rows that no longer have a
+   * vector-side counterpart (e.g. orphaned by a previously failed write).
+   */
+  deleteBySourceDirs(dirs) {
+    const db = this.requireDb();
+    const del = db.prepare("DELETE FROM chunks WHERE sourceDir = ?");
+    let changes = 0;
+    db.exec("BEGIN");
+    try {
+      for (const dir of dirs) {
+        changes += Number(del.run(dir).changes ?? 0);
+      }
+      db.exec("COMMIT");
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
+    return changes;
+  }
   /** Remove all entries. */
   clear() {
     this.requireDb().exec("DELETE FROM chunks");
@@ -1482,6 +1503,31 @@ ${chunkText}`;
       this.scheduleSave();
     }
   }
+  /**
+   * Remove every trace of files indexed from the given source dirs — used
+   * when a whole directory is dropped from the config. Complements
+   * removeFile(): entries are matched by their stored sourceDir (so keys
+   * pointing elsewhere are still caught) and FTS rows are swept by
+   * sourceDir even when no vector entry references them anymore.
+   * Returns the number of distinct files removed from the vector store.
+   */
+  removeBySourceDirs(dirs) {
+    const targets = new Set(dirs);
+    const touched = /* @__PURE__ */ new Set();
+    for (const key of Object.keys(this.data.entries)) {
+      if (targets.has(this.data.entries[key].sourceDir)) {
+        touched.add(this.absPathFromKey(key));
+      }
+    }
+    for (const absPath of touched) {
+      this.removeAllChunks(absPath);
+    }
+    this.fts.deleteBySourceDirs(dirs);
+    if (touched.size > 0) {
+      this.scheduleSave();
+    }
+    return touched.size;
+  }
   /** Alias for removeFile — removes all data for a file path. */
   deleteFile(absPath) {
     this.removeFile(absPath);
@@ -2267,12 +2313,13 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
   });
   const KS_SUBCOMMANDS = [
     { value: "add", label: "add", description: "Add directories to the index" },
+    { value: "remove", label: "remove", description: "Remove directories from the index (purges their files)" },
     { value: "exclude", label: "exclude", description: "Manage excluded directory names (-<name> removes)" },
     { value: "index", label: "index", description: "Incrementally index added/changed/removed files" },
     { value: "clear", label: "clear", description: "Clear the index and reset config to defaults" },
     { value: "on", label: "on", description: "Enable per-turn knowledge lookup injection" },
     { value: "off", label: "off", description: "Disable per-turn knowledge lookup injection" },
-    { value: "help", label: "help", description: "Show all /knowledge-search commands" }
+    { value: "help", label: "help", description: "Show all /knowledge commands" }
   ];
   function getSubcommandCompletions(prefix) {
     const matches = KS_SUBCOMMANDS.filter((s) => s.value.startsWith(prefix)).map((s) => ({
@@ -2294,6 +2341,11 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
     const expanded = p.startsWith("~") ? home + p.slice(1) : p;
     return resolve2(sessionCwd ?? process.cwd(), expanded);
   }
+  function isUnderDir(abs, dir) {
+    if (abs === dir) return true;
+    const rel = relative2(dir, abs);
+    return rel !== "" && !rel.startsWith("..") && !isAbsolute2(rel);
+  }
   async function ensureIndexLoaded() {
     if (index) return;
     index = new KnowledgeIndex(currentConfig, createEmbedder());
@@ -2309,21 +2361,22 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
     if (index) {
       lines.push("  " + label("Indexed:") + theme.fg("success", `${index.size()} files \xB7 ${index.chunkCount()} chunks`));
     } else {
-      lines.push("  " + label("Indexed:") + theme.fg("dim", "0 files (run /knowledge-search index)"));
+      lines.push("  " + label("Indexed:") + theme.fg("dim", "0 files (run /knowledge index)"));
     }
     lines.push("", "  " + theme.bold("Directories indexed:"));
     const dirs = currentConfig?.dirs ?? [];
     if (dirs.length) {
       for (const dir of dirs) lines.push("    " + theme.fg("muted", dir));
+      lines.push("    " + theme.fg("dim", "(remove with /knowledge remove <dir>)"));
     } else {
-      lines.push("    " + theme.fg("dim", "(none \u2014 add with /knowledge-search add <dir>)"));
+      lines.push("    " + theme.fg("dim", "(none \u2014 add with /knowledge add <dir>)"));
     }
     lines.push("", "  " + theme.bold("Excluded directories:"));
     const excludes = currentConfig?.excludeDirs ?? [];
     if (excludes.length) {
       for (const name of excludes) lines.push("    " + theme.fg("muted", name));
     } else {
-      lines.push("    " + theme.fg("dim", "(none \u2014 add with /knowledge-search exclude <name>)"));
+      lines.push("    " + theme.fg("dim", "(none \u2014 add with /knowledge exclude <name>)"));
     }
     lines.push("", "  " + theme.bold("File extensions:"));
     const exts = currentConfig?.fileExtensions ?? [];
@@ -2342,7 +2395,7 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
   async function handleAdd(parts, ctx) {
     const raw = parts.slice(1).join(" ").split(/[\s,]+/).map((p) => p.trim()).filter(Boolean);
     if (raw.length === 0) {
-      ctx.ui.notify("Usage: /knowledge-search add <dir> [<dir>...]", "warning");
+      ctx.ui.notify("Usage: /knowledge add <dir> [<dir>...]", "warning");
       return;
     }
     const resolved = raw.map(resolveUserPath);
@@ -2364,9 +2417,64 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
     }
     const newCount = added.length;
     ctx.ui.notify(
-      `Added ${newCount} director${newCount === 1 ? "y" : "ies"} \xB7 ${dirs.size} total. Run /knowledge-search index to index them.`,
+      `Added ${newCount} director${newCount === 1 ? "y" : "ies"} \xB7 ${dirs.size} total. Run /knowledge index to index them.`,
       "info"
     );
+  }
+  async function handleRemove(parts, ctx) {
+    const raw = parts.slice(1).join(" ").split(/[\s,]+/).map((p) => p.trim()).filter(Boolean);
+    if (raw.length === 0) {
+      ctx.ui.notify("Usage: /knowledge remove <dir> [<dir>...]", "warning");
+      return;
+    }
+    const resolved = raw.map(resolveUserPath);
+    const file = readRawConfig();
+    const configured = new Set(file.dirs ?? []);
+    const removed = resolved.filter((d) => configured.has(d));
+    const unknown = resolved.filter((d) => !configured.has(d));
+    if (removed.length === 0) {
+      ctx.ui.notify(`Not configured: ${unknown.join(", ")}`, "warning");
+      return;
+    }
+    file.dirs = [...configured].filter((d) => !removed.includes(d));
+    saveConfig(file, sessionCwd);
+    if (currentConfig) {
+      currentConfig.dirs = file.dirs;
+    } else {
+      currentConfig = loadConfig(sessionCwd);
+    }
+    let abortedSync = false;
+    if (activeWorker) {
+      workerExitExpected = true;
+      activeWorker.kill();
+      activeWorker = null;
+      abortedSync = true;
+    }
+    let purged = 0;
+    if (currentConfig) {
+      try {
+        await ensureIndexLoaded();
+        for (const f of index.listFiles()) {
+          if (removed.some((dir) => isUnderDir(f.absPath, dir))) {
+            index.removeFile(f.absPath);
+            purged += 1;
+          }
+        }
+        purged += index.removeBySourceDirs(removed);
+      } catch (err) {
+        ctx.ui.notify(`Purging indexed files failed: ${err.message}`, "warning");
+      }
+    }
+    const bits = [
+      `Removed ${removed.length} director${removed.length === 1 ? "y" : "ies"} \xB7 ${file.dirs.length} remaining`
+    ];
+    if (purged > 0) bits.push(`purged ${purged} indexed file${purged === 1 ? "" : "s"}`);
+    if (unknown.length > 0) bits.push(`not configured: ${unknown.join(", ")}`);
+    if (abortedSync) bits.push("startup sync aborted \u2014 run /knowledge index to re-sync the remaining dirs");
+    if (file.dirs.length === 0) {
+      bits.push("no directories left \u2014 run /knowledge clear to wipe the leftover index");
+    }
+    ctx.ui.notify(bits.join(" \xB7 "), "info");
   }
   function handleExclude(parts, ctx) {
     const expression = parts.slice(1).join(" ").trim();
@@ -2374,13 +2482,13 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
     if (!expression) {
       const excludes2 = file.excludeDirs ?? [];
       if (!excludes2.length) {
-        ctx.ui.notify("No excluded directories. Add one with: /knowledge-search exclude <name>", "info");
+        ctx.ui.notify("No excluded directories. Add one with: /knowledge exclude <name>", "info");
         return;
       }
       const theme = ctx.ui.theme;
       const lines = [theme.bold(`Excluded directories (${excludes2.length})`), ""];
       for (const name of excludes2) lines.push("  " + theme.fg("muted", name));
-      lines.push("", theme.fg("dim", "Remove with: /knowledge-search exclude -<name>"));
+      lines.push("", theme.fg("dim", "Remove with: /knowledge exclude -<name>"));
       ctx.ui.setWidget("knowledge-search-exclude", lines);
       return;
     }
@@ -2395,7 +2503,7 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
       saveConfig(file, sessionCwd);
       if (currentConfig) currentConfig.excludeDirs = file.excludeDirs;
       ctx.ui.notify(
-        `Removed exclude: ${target} \xB7 ${file.excludeDirs.length} remain. Run /knowledge-search index to re-apply.`,
+        `Removed exclude: ${target} \xB7 ${file.excludeDirs.length} remain. Run /knowledge index to re-apply.`,
         "info"
       );
       return;
@@ -2410,13 +2518,13 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
     saveConfig(file, sessionCwd);
     if (currentConfig) currentConfig.excludeDirs = excludes;
     ctx.ui.notify(
-      `Added exclude: ${expression} \xB7 ${excludes.length} total. Run /knowledge-search index to re-apply.`,
+      `Added exclude: ${expression} \xB7 ${excludes.length} total. Run /knowledge index to re-apply.`,
       "info"
     );
   }
   async function handleIndex(ctx) {
     if (!currentConfig || currentConfig.dirs.length === 0) {
-      ctx.ui.notify("No directories configured. Run /knowledge-search add <dir> first.", "warning");
+      ctx.ui.notify("No directories configured. Run /knowledge add <dir> first.", "warning");
       return;
     }
     const clearProgressUI = () => {
@@ -2480,7 +2588,7 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
   async function handleClear(ctx) {
     const confirmed = await ctx.ui.confirm(
       "Clear knowledge search?",
-      "Deletes all project data (vector index + keyword side-car + config) and resets project settings to defaults, including any localPath override in .pi/settings.json. Re-index afterwards with /knowledge-search add + index. The shared HuggingFace model cache is not touched."
+      "Deletes all project data (vector index + keyword side-car + config) and resets project settings to defaults, including any localPath override in .pi/settings.json. Re-index afterwards with /knowledge add + index. The shared HuggingFace model cache is not touched."
     );
     if (!confirmed) {
       ctx.ui.notify("Clear cancelled.", "info");
@@ -2544,22 +2652,26 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
   }
   function handleHelp(ctx) {
     const theme = ctx.ui.theme;
-    const lines = [theme.bold("/knowledge-search commands"), ""];
+    const lines = [theme.bold("/knowledge commands"), ""];
     for (const s of KS_SUBCOMMANDS) {
       lines.push("  " + theme.fg("accent", s.label.padEnd(10)) + theme.fg("dim", s.description));
     }
-    lines.push("", theme.fg("dim", "Bare /knowledge-search shows the current status."));
+    lines.push("", theme.fg("dim", "Bare /knowledge shows the current status."));
     ctx.ui.setWidget("knowledge-search-help", lines);
   }
   let statusWidgetVisible = false;
-  pi.registerCommand("knowledge-search", {
-    description: "knowledge-search: (status) | add <dir> | exclude <name> | index (added/changed/removed) | clear | on | off | help",
+  pi.registerCommand("knowledge", {
+    description: "knowledge: (status) | add <dir> | remove <dir> | exclude <name> | index (added/changed/removed) | clear | on | off | help",
     getArgumentCompletions: (prefix) => getSubcommandCompletions(prefix),
     handler: async (args, ctx) => {
       const parts = (args || "").trim().split(/\s+/);
       const subcommand = parts[0] || "";
       if (subcommand === "add") {
         await handleAdd(parts, ctx);
+        return;
+      }
+      if (subcommand === "remove") {
+        await handleRemove(parts, ctx);
         return;
       }
       if (subcommand === "exclude") {
@@ -2591,7 +2703,7 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
         return;
       }
       if (subcommand) {
-        ctx.ui.notify(`Unknown /knowledge-search command: ${subcommand}. Try /knowledge-search help`, "error");
+        ctx.ui.notify(`Unknown /knowledge command: ${subcommand}. Try /knowledge help`, "error");
         return;
       }
       if (statusWidgetVisible) {
@@ -2640,7 +2752,7 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
     parameters: searchParams,
     async execute(toolCallId, params, signal) {
       if (!index || index.size() === 0) {
-        const msg = !index ? "knowledge-search is not configured. The user can run /knowledge-search add <dir> to set it up." : !syncDone ? "Index is still syncing in the background. Try again in a moment." : "Index is empty.";
+        const msg = !index ? "knowledge-search is not configured. The user can run /knowledge add <dir> to set it up." : !syncDone ? "Index is still syncing in the background. Try again in a moment." : "Index is empty.";
         return { content: [{ type: "text", text: msg }], details: {} };
       }
       const limit = Math.min(params.limit ?? 8, 20);
@@ -2700,7 +2812,7 @@ ${r.excerpt}`;
     parameters: readParams,
     async execute(_toolCallId, params) {
       if (!index || index.size() === 0) {
-        const msg = !index ? "knowledge-search is not configured. Run /knowledge-search add <dir> to set it up." : !syncDone ? "Index is still syncing in the background. Try again in a moment." : "Index is empty.";
+        const msg = !index ? "knowledge-search is not configured. Run /knowledge add <dir> to set it up." : !syncDone ? "Index is still syncing in the background. Try again in a moment." : "Index is empty.";
         return { content: [{ type: "text", text: msg }], details: {} };
       }
       const result = resolveNote(params.name, index.listFiles(), {

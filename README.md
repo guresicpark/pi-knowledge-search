@@ -1,6 +1,6 @@
 # pi-knowledge-search
 
-Hybrid **local** search over local files for [pi](https://github.com/badlogic/pi). Indexes directories of text/markdown files using local ONNX vector embeddings (always `nomic-ai/nomic-embed-text-v1.5` — the engine is fixed, not configurable) **and** SQLite FTS5 keyword search, exposes `knowledge_search` + `knowledge_kb_read` tools the LLM can call, and auto-injects a knowledge lookup on every prompt (like pi-local-rag's RAG lookup). Everything runs on your machine — no embedding APIs, no cloud services. Indexing runs on session startup; mid-session file changes are picked up with `/knowledge-search index`.
+Hybrid **local** search over local files for [pi](https://github.com/badlogic/pi). Indexes directories of text/markdown files using local ONNX vector embeddings (always `nomic-ai/nomic-embed-text-v1.5` — the engine is fixed, not configurable) **and** SQLite FTS5 keyword search, exposes `knowledge_search` + `knowledge_kb_read` tools the LLM can call, and auto-injects a knowledge lookup on every prompt (like pi-local-rag's RAG lookup). Everything runs on your machine — no embedding APIs, no cloud services. Indexing runs on session startup; mid-session file changes are picked up with `/knowledge index`.
 
 On session start, injects a folder+keyword overview of the indexed vault as a custom message so the model knows what’s worth searching for before it asks.
 
@@ -14,7 +14,7 @@ Knowledge lookup — nomic (event_dispatcher.rst:1-8,9-37,notes/a.md:12-25) — 
 
 Each group lists `file:start-end,…` entries with the exact line ranges where the hits live; a bare number is a single-line hit. The **nomic** group holds the fused hits the vector side drove into the ranking; the **bm25** group holds the keyword side's view — hits the BM25 term dominated (e.g. exact error-code matches the embeddings treat as noise) plus files only the FTS5 side-car found. A group is omitted when empty, so a pure-keyword fallback renders as `Knowledge lookup — bm25 (…)`. Line ranges only appear on entries indexed by the current format (index version 4) — entries from an older-but-compatible index are kept as-is on load (no re-embedding) and fall back to a `file (n)` hit count until the file is next re-indexed.
 
-Injection is automatically enabled whenever the index holds vectors — at session start and after `/knowledge-search index` — so `/knowledge-search off` acts as a per-session kill-switch that the next startup flips back on (`autoInject` in the config).
+Injection is automatically enabled whenever the index holds vectors — at session start and after `/knowledge index` — so `/knowledge off` acts as a per-session kill-switch that the next startup flips back on (`autoInject` in the config).
 
 ## How search works
 
@@ -29,9 +29,9 @@ Multi-term queries use implicit AND (space-separated quoted phrases), matching p
 
 The extension registers two LLM-facing tools:
 
-| Tool | What it does |
-|------|--------------|
-| `knowledge_search` | Hybrid vector + BM25 search over indexed files (pi-local-rag's alpha blend: 0.4 × BM25 + 0.6 × vector). Returns passage-level excerpts. |
+| Tool                | What it does                                                                                                                                                                                                              |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `knowledge_search`  | Hybrid vector + BM25 search over indexed files (pi-local-rag's alpha blend: 0.4 × BM25 + 0.6 × vector). Returns passage-level excerpts.                                                                                   |
 | `knowledge_kb_read` | Resolve a note reference — `[[wikilink]]`, basename, or relative path — to an indexed file and return its full content. Use when the model knows a note's name but not its full path, instead of running find/grep first. |
 
 `knowledge_kb_read` handles `[[Foo]]`, `[[Foo|alias]]`, `[[Foo#Heading]]`, bare names with or without extension (`Foo`, `Foo.md`), and relative paths (`evergreen/foo`). Multi-match references get a disambiguation prompt instead of guessing.
@@ -78,19 +78,47 @@ Requires **Node 24+** — `node:sqlite` must include FTS5, which Node 22's bundl
 
 ## Setup
 
-Everything is driven by the `/knowledge-search` command (mirroring pi-local-rag's `/rag`):
+Everything is driven by the `/knowledge` command (mirroring pi-local-rag's `/rag`):
 
 ```
-/knowledge-search                 # show status: indexed dirs, excludes, extensions, engine
-/knowledge-search add ~/notes     # add directories to index (space- or comma-separated)
-/knowledge-search exclude build   # add an excluded directory name (-<name> removes, bare lists)
-/knowledge-search index           # incrementally index added/changed/removed files across all dirs (progress bar, like /rag)
-/knowledge-search clear           # clear ALL project data + reset settings to defaults (confirm first)
-/knowledge-search on | off        # enable/disable the per-turn knowledge lookup injection
-/knowledge-search help            # list all subcommands
+/knowledge                 # show status: indexed dirs, excludes, extensions, engine
+/knowledge add ~/notes     # add directories to index (space- or comma-separated)
+/knowledge remove ~/notes  # remove directories from the index (purges their indexed files)
+/knowledge exclude build   # add an excluded directory name (-<name> removes, bare lists)
+/knowledge index           # incrementally index added/changed/removed files across all dirs (progress bar, like /rag)
+/knowledge clear           # clear ALL project data + reset settings to defaults (confirm first)
+/knowledge on | off        # enable/disable the per-turn knowledge lookup injection
+/knowledge help            # list all subcommands
 ```
 
-The first `add` writes the config to `{cwd}/.pi/knowledge-search.json` — project-local, relative to the directory pi was started in. Directories added mid-session are picked up by `/knowledge-search index` without a reload.
+The first `add` writes the config to `{cwd}/.pi/knowledge-search.json` — project-local, relative to the directory pi was started in. Directories added mid-session are picked up by `/knowledge index` without a reload.
+
+### Usage example
+
+A typical session, from zero to searching:
+
+```bash
+/knowledge add ~/notes ~/docs    # track two directories (writes the project config)
+/knowledge index                 # build the index (progress bar; first run downloads the model)
+
+# ...ask the model things — it searches automatically, or call knowledge_search directly:
+#   "What did I write about event dispatchers?"
+
+/knowledge exclude node_modules  # skip a directory name during scans (bare lists current excludes)
+/knowledge index                 # re-sync after config or file changes
+```
+
+Adding and removing directories mid-session:
+
+```bash
+/knowledge add ~/archive         # new dir is indexed on the next /knowledge index
+/knowledge remove ~/docs         # drop a dir — its config entry and indexed files
+                                 # (vector entries + keyword side-car) are purged
+                                 # immediately, no re-index needed
+/knowledge index                 # optional: re-sync the remaining dirs
+```
+
+`remove` takes effect instantly — you don't need to run `index` afterwards for the removal itself. If it fires while the startup sync is still running, that sync is aborted (its result would resurrect the removed dir); the notice tells you to run `/knowledge index` to re-sync the remaining dirs. Removing all directories leaves the index in place — use `/knowledge clear` for a full wipe.
 
 ### Config file
 
@@ -122,7 +150,7 @@ Files larger than **500 KB** are skipped during scanning (mirroring pi-local-rag
 
 ### Embedding engine (always nomic)
 
-The embedding engine is fixed: `nomic-ai/nomic-embed-text-v1.5` (768-dim, q8 quantized) via [Transformers.js](https://huggingface.co/docs/transformers.js) local ONNX inference — no API key, no server, no configuration. It uses the model's `search_query:` / `search_document:` task prefixes, mirroring pi-local-rag's text pipeline. Model weights are downloaded once (~111 MB) into a shared HuggingFace cache (`~/.cache/huggingface/transformers` by default, or `PI_RAG_MODEL_CACHE` / `TRANSFORMERS_CACHE` / `HF_HOME`), so pi-knowledge-search and pi-local-rag reuse the same download. `/knowledge-search index` shows a notice before the first download.
+The embedding engine is fixed: `nomic-ai/nomic-embed-text-v1.5` (768-dim, q8 quantized) via [Transformers.js](https://huggingface.co/docs/transformers.js) local ONNX inference — no API key, no server, no configuration. It uses the model's `search_query:` / `search_document:` task prefixes, mirroring pi-local-rag's text pipeline. Model weights are downloaded once (~111 MB) into a shared HuggingFace cache (`~/.cache/huggingface/transformers` by default, or `PI_RAG_MODEL_CACHE` / `TRANSFORMERS_CACHE` / `HF_HOME`), so pi-knowledge-search and pi-local-rag reuse the same download. `/knowledge index` shows a notice before the first download.
 
 Transformers.js pulls in `sharp` (for vision preprocessing); since pi loads pi-local-rag alongside this extension in the same process, `sharp` is pinned to exactly the same version pi-local-rag resolves (0.35.3 → libvips 8.18.3) via npm `overrides`. Loading two different libvips dylibs into one process makes macOS objc emit a duplicate-class warning (`GNotificationCenterDelegate implemented in both …`) that can cause spurious casting failures and mysterious crashes.
 
@@ -141,35 +169,36 @@ Every config field can be overridden via environment variables. This is useful f
 3. Before every agent turn, runs an automatic knowledge lookup on the prompt and injects the top hits as a message right after it (see [Knowledge lookup](#knowledge-lookup))
 4. Returns ranked results with file paths, relevance scores, content excerpts, and the exact line ranges of each hit
 
-Sync runs on session startup. Files added, changed, or removed mid-session — in any configured directory — can be picked up with `/knowledge-search index`.
+Sync runs on session startup. Files added, changed, or removed mid-session — in any configured directory — can be picked up with `/knowledge index`.
 
 The index is stored at `{cwd}/.pi/knowledge-search/index.json` (project-local; see [Project-local storage](#project-local-storage)).
 
 ## Commands
 
-| Command                              | Description                                          |
-| ------------------------------------ | ---------------------------------------------------- |
-| `/knowledge-search`                  | Show status: dirs, excludes, extensions, engine      |
-| `/knowledge-search add <dir>`        | Add directories to the index                         |
-| `/knowledge-search exclude <name>`   | Manage excluded directory names (`-<name>` removes)  |
-| `/knowledge-search index`            | Incrementally index added/changed/removed files      |
-| `/knowledge-search clear`            | Clear all project data; reset settings to defaults  |
-| `/knowledge-search on` / `off`       | Toggle per-turn knowledge lookup injection           |
-| `/knowledge-search help`             | List all subcommands                                 |
-| `/knowledge-overview`                | Force-rebuild and re-inject the vault overview       |
+| Command                     | Description                                         |
+| --------------------------- | --------------------------------------------------- |
+| `/knowledge`                | Show status: dirs, excludes, extensions, engine     |
+| `/knowledge add <dir>`      | Add directories to the index                        |
+| `/knowledge remove <dir>`   | Remove directories and purge their indexed files    |
+| `/knowledge exclude <name>` | Manage excluded directory names (`-<name>` removes) |
+| `/knowledge index`          | Incrementally index added/changed/removed files     |
+| `/knowledge clear`          | Clear all project data; reset settings to defaults  |
+| `/knowledge on` / `off`     | Toggle per-turn knowledge lookup injection          |
+| `/knowledge help`           | List all subcommands                                |
+| `/knowledge-overview`       | Force-rebuild and re-inject the vault overview      |
 
 ## Performance
 
 Indicative numbers for local ONNX embeddings (nomic-embed-text-v1.5, q8, Apple Silicon, warm model cache) on ~500 markdown files (~20 MB, ~500 chunks):
 
-| Operation                     | Time            |
-| ----------------------------- | --------------- |
+| Operation                     | Time                         |
+| ----------------------------- | ---------------------------- |
 | Full index build              | ~40s (chunked, batched ONNX) |
-| Incremental sync (no changes) | ~15ms           |
-| Search query                  | ~300ms          |
-| Index file size               | ~5MB            |
+| Incremental sync (no changes) | ~15ms                        |
+| Search query                  | ~300ms                       |
+| Index file size               | ~5MB                         |
 
-First run per machine also downloads the nomic model (~111 MB, shared with pi-local-rag) — `/knowledge-search index` shows a notice before the download starts.
+First run per machine also downloads the nomic model (~111 MB, shared with pi-local-rag) — `/knowledge index` shows a notice before the download starts.
 
 Chunks are embedded in batches of **16** — one padded ONNX forward pass per batch, mirroring pi-local-rag's `BATCH_SIZE` — so the progress bar ticks per pass instead of every 50 chunks.
 
@@ -182,8 +211,8 @@ To relocate them elsewhere within a project, add the following to `{project}/.pi
 ```jsonc
 {
   "pi-knowledge-search": {
-    "localPath": ".pi/knowledge-search"   // config.json + index/ under this path
-  }
+    "localPath": ".pi/knowledge-search", // config.json + index/ under this path
+  },
 }
 ```
 
@@ -193,9 +222,9 @@ To relocate them elsewhere within a project, add the following to `{project}/.pi
 2. `pi-knowledge-search.localPath` in `{cwd}/.pi/settings.json`
 3. Project default: `{cwd}/.pi/knowledge-search.json` + `{cwd}/.pi/knowledge-search/`
 
-**Migration from the global config:** versions prior to this change stored config at `~/.pi/knowledge-search.json` and the index at `~/.pi/knowledge-search/`. That location is no longer read — move the files into your project's `.pi/` directory to migrate, or re-run `/knowledge-search add <dir>` in the project.
+**Migration from the global config:** versions prior to this change stored config at `~/.pi/knowledge-search.json` and the index at `~/.pi/knowledge-search/`. That location is no longer read — move the files into your project's `.pi/` directory to migrate, or re-run `/knowledge add <dir>` in the project.
 
-**What `/knowledge-search clear` resets:** both databases (`index.json` vector index + `kb-fts.db` keyword side-car), the config file, and any `pi-knowledge-search.localPath` override in `{project}/.pi/settings.json` — leaving the project in a fresh-install state. The HuggingFace model cache (`~/.cache/huggingface/transformers`) is machine-wide and shared with pi-local-rag, so it is intentionally not touched.
+**What `/knowledge clear` resets:** both databases (`index.json` vector index + `kb-fts.db` keyword side-car), the config file, and any `pi-knowledge-search.localPath` override in `{project}/.pi/settings.json` — leaving the project in a fresh-install state. The HuggingFace model cache (`~/.cache/huggingface/transformers`) is machine-wide and shared with pi-local-rag, so it is intentionally not touched.
 
 ## License
 

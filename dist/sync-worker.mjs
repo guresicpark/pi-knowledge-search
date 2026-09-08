@@ -659,6 +659,27 @@ var FtsChunkIndex = class {
     const res = this.requireDb().prepare("DELETE FROM chunks WHERE absPath = ?").run(absPath);
     return Number(res.changes ?? 0);
   }
+  /**
+   * Delete every chunk whose sourceDir is one of the given dirs. Used when
+   * removing a whole source directory — catches rows that no longer have a
+   * vector-side counterpart (e.g. orphaned by a previously failed write).
+   */
+  deleteBySourceDirs(dirs) {
+    const db = this.requireDb();
+    const del = db.prepare("DELETE FROM chunks WHERE sourceDir = ?");
+    let changes = 0;
+    db.exec("BEGIN");
+    try {
+      for (const dir of dirs) {
+        changes += Number(del.run(dir).changes ?? 0);
+      }
+      db.exec("COMMIT");
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
+    return changes;
+  }
   /** Remove all entries. */
   clear() {
     this.requireDb().exec("DELETE FROM chunks");
@@ -1466,6 +1487,31 @@ ${chunkText}`;
     if (removed > 0) {
       this.scheduleSave();
     }
+  }
+  /**
+   * Remove every trace of files indexed from the given source dirs — used
+   * when a whole directory is dropped from the config. Complements
+   * removeFile(): entries are matched by their stored sourceDir (so keys
+   * pointing elsewhere are still caught) and FTS rows are swept by
+   * sourceDir even when no vector entry references them anymore.
+   * Returns the number of distinct files removed from the vector store.
+   */
+  removeBySourceDirs(dirs) {
+    const targets = new Set(dirs);
+    const touched = /* @__PURE__ */ new Set();
+    for (const key of Object.keys(this.data.entries)) {
+      if (targets.has(this.data.entries[key].sourceDir)) {
+        touched.add(this.absPathFromKey(key));
+      }
+    }
+    for (const absPath of touched) {
+      this.removeAllChunks(absPath);
+    }
+    this.fts.deleteBySourceDirs(dirs);
+    if (touched.size > 0) {
+      this.scheduleSave();
+    }
+    return touched.size;
   }
   /** Alias for removeFile — removes all data for a file path. */
   deleteFile(absPath) {

@@ -41,7 +41,7 @@ export default function (pi: ExtensionAPI) {
   let sessionCwd: string | undefined;
   let syncDone = false;
   let workerExitExpected = false;
-  /** In-flight sync worker, so `/knowledge-search clear` can kill it before wiping storage. */
+  /** In-flight sync worker, so `/knowledge clear` can kill it before wiping storage. */
   let activeWorker: ChildProcess | null = null;
 
   /**
@@ -232,7 +232,7 @@ export default function (pi: ExtensionAPI) {
         // Auto-enable the per-turn knowledge lookup whenever the index
         // holds chunks — with the always-nomic engine, chunks imply
         // vectors. Mirrors pi-local-rag's startup auto-enable (ragEnabled
-        // flips on once chunks exist). /knowledge-search off is therefore a
+        // flips on once chunks exist). /knowledge off is therefore a
         // per-session kill-switch: the next startup with an indexed vault
         // turns injection back on.
         if (
@@ -376,19 +376,20 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ------------------------------------------------------------------
-  // /knowledge-search command: status (bare, toggling), add, exclude,
+  // /knowledge command: status (bare, toggling), add, exclude,
   // index (incremental), clear, and help.
   // ------------------------------------------------------------------
 
-  /** Subcommand table for autocomplete and /knowledge-search help. */
+  /** Subcommand table for autocomplete and /knowledge help. */
   const KS_SUBCOMMANDS: { value: string; label: string; description: string }[] = [
     { value: "add", label: "add", description: "Add directories to the index" },
+    { value: "remove", label: "remove", description: "Remove directories from the index (purges their files)" },
     { value: "exclude", label: "exclude", description: "Manage excluded directory names (-<name> removes)" },
     { value: "index", label: "index", description: "Incrementally index added/changed/removed files" },
     { value: "clear", label: "clear", description: "Clear the index and reset config to defaults" },
     { value: "on", label: "on", description: "Enable per-turn knowledge lookup injection" },
     { value: "off", label: "off", description: "Disable per-turn knowledge lookup injection" },
-    { value: "help", label: "help", description: "Show all /knowledge-search commands" },
+    { value: "help", label: "help", description: "Show all /knowledge commands" },
   ];
 
   function getSubcommandCompletions(prefix: string) {
@@ -419,6 +420,13 @@ export default function (pi: ExtensionAPI) {
     return resolve(sessionCwd ?? process.cwd(), expanded);
   }
 
+  /** True when abs is dir itself or anywhere beneath it. */
+  function isUnderDir(abs: string, dir: string): boolean {
+    if (abs === dir) return true;
+    const rel = relative(dir, abs);
+    return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+  }
+
   /**
    * Ensure an in-memory KnowledgeIndex exists for the current config.
    * Mutating `currentConfig` in place keeps an existing index's config
@@ -447,15 +455,16 @@ export default function (pi: ExtensionAPI) {
     if (index) {
       lines.push("  " + label("Indexed:") + theme.fg("success", `${index.size()} files · ${index.chunkCount()} chunks`));
     } else {
-      lines.push("  " + label("Indexed:") + theme.fg("dim", "0 files (run /knowledge-search index)"));
+      lines.push("  " + label("Indexed:") + theme.fg("dim", "0 files (run /knowledge index)"));
     }
 
     lines.push("", "  " + theme.bold("Directories indexed:"));
     const dirs = currentConfig?.dirs ?? [];
     if (dirs.length) {
       for (const dir of dirs) lines.push("    " + theme.fg("muted", dir));
+      lines.push("    " + theme.fg("dim", "(remove with /knowledge remove <dir>)"));
     } else {
-      lines.push("    " + theme.fg("dim", "(none — add with /knowledge-search add <dir>)"));
+      lines.push("    " + theme.fg("dim", "(none — add with /knowledge add <dir>)"));
     }
 
     lines.push("", "  " + theme.bold("Excluded directories:"));
@@ -463,7 +472,7 @@ export default function (pi: ExtensionAPI) {
     if (excludes.length) {
       for (const name of excludes) lines.push("    " + theme.fg("muted", name));
     } else {
-      lines.push("    " + theme.fg("dim", "(none — add with /knowledge-search exclude <name>)"));
+      lines.push("    " + theme.fg("dim", "(none — add with /knowledge exclude <name>)"));
     }
 
     lines.push("", "  " + theme.bold("File extensions:"));
@@ -489,7 +498,7 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setWidget("knowledge-search-status", lines);
   }
 
-  /** /knowledge-search add <dir> [<dir>...] — track directories to index. */
+  /** /knowledge add <dir> [<dir>...] — track directories to index. */
   async function handleAdd(parts: string[], ctx: ExtensionCommandContext): Promise<void> {
     const raw = parts
       .slice(1)
@@ -499,7 +508,7 @@ export default function (pi: ExtensionAPI) {
       .filter(Boolean);
 
     if (raw.length === 0) {
-      ctx.ui.notify("Usage: /knowledge-search add <dir> [<dir>...]", "warning");
+      ctx.ui.notify("Usage: /knowledge add <dir> [<dir>...]", "warning");
       return;
     }
 
@@ -528,12 +537,98 @@ export default function (pi: ExtensionAPI) {
 
     const newCount = added.length;
     ctx.ui.notify(
-      `Added ${newCount} director${newCount === 1 ? "y" : "ies"} · ${dirs.size} total. Run /knowledge-search index to index them.`,
+      `Added ${newCount} director${newCount === 1 ? "y" : "ies"} · ${dirs.size} total. Run /knowledge index to index them.`,
       "info"
     );
   }
 
-  /** /knowledge-search exclude [<name>|-<name>] — manage excluded directory names. */
+  /** /knowledge remove <dir> [<dir>...] — drop directories from the index. */
+  async function handleRemove(parts: string[], ctx: ExtensionCommandContext): Promise<void> {
+    const raw = parts
+      .slice(1)
+      .join(" ")
+      .split(/[\s,]+/)
+      .map((p) => p.trim())
+      .filter(Boolean);
+
+    if (raw.length === 0) {
+      ctx.ui.notify("Usage: /knowledge remove <dir> [<dir>...]", "warning");
+      return;
+    }
+
+    // No existence check — removing a deleted or moved dir is the common case.
+    const resolved = raw.map(resolveUserPath);
+    const file = readRawConfig();
+    const configured = new Set(file.dirs ?? []);
+    const removed = resolved.filter((d) => configured.has(d));
+    const unknown = resolved.filter((d) => !configured.has(d));
+
+    if (removed.length === 0) {
+      ctx.ui.notify(`Not configured: ${unknown.join(", ")}`, "warning");
+      return;
+    }
+
+    file.dirs = [...configured].filter((d) => !removed.includes(d));
+    saveConfig(file as ConfigFile, sessionCwd);
+
+    // Keep the in-session config in sync so a follow-up `index` doesn't
+    // resurrect the removed dirs.
+    if (currentConfig) {
+      currentConfig.dirs = file.dirs!;
+    } else {
+      currentConfig = loadConfig(sessionCwd);
+    }
+
+    // Kill an in-flight startup sync worker before purging. It captured the
+    // old config at fork and its sync() never prunes the removed dir's
+    // entries (the files still exist on disk) — if it saved after us, the
+    // removed dir would silently reappear in the index.
+    let abortedSync = false;
+    if (activeWorker) {
+      workerExitExpected = true;
+      activeWorker.kill();
+      activeWorker = null;
+      abortedSync = true;
+    }
+
+    // Purge the removed dirs' files from the index (vector entries + FTS
+    // side-car chunks). sync() alone won't drop them — those files still
+    // exist on disk, so it only prunes entries whose files vanished.
+    let purged = 0;
+    if (currentConfig) {
+      try {
+        await ensureIndexLoaded();
+        // Files physically under the removed dirs, regardless of which
+        // sourceDir they were indexed from.
+        for (const f of index!.listFiles()) {
+          if (removed.some((dir) => isUnderDir(f.absPath, dir))) {
+            index!.removeFile(f.absPath);
+            purged += 1;
+          }
+        }
+        // Anything still keyed to the removed dirs, plus orphaned FTS
+        // side-car rows the per-file pass can't see (files whose vector
+        // entry is already gone). Not double-counted: entries removed
+        // above are no longer in the map.
+        purged += index!.removeBySourceDirs(removed);
+      } catch (err: any) {
+        ctx.ui.notify(`Purging indexed files failed: ${err.message}`, "warning");
+      }
+    }
+
+    const bits = [
+      `Removed ${removed.length} director${removed.length === 1 ? "y" : "ies"} · ${file.dirs!.length} remaining`,
+    ];
+    if (purged > 0) bits.push(`purged ${purged} indexed file${purged === 1 ? "" : "s"}`);
+    if (unknown.length > 0) bits.push(`not configured: ${unknown.join(", ")}`);
+    if (abortedSync) bits.push("startup sync aborted — run /knowledge index to re-sync the remaining dirs");
+    if (file.dirs!.length === 0) {
+      bits.push("no directories left — run /knowledge clear to wipe the leftover index");
+    }
+    ctx.ui.notify(bits.join(" · "), "info");
+  }
+
+  /** /knowledge exclude [<name>|-<name>] — manage excluded directory names. */
   function handleExclude(parts: string[], ctx: ExtensionCommandContext): void {
     const expression = parts.slice(1).join(" ").trim();
     const file = readRawConfig();
@@ -541,13 +636,13 @@ export default function (pi: ExtensionAPI) {
     if (!expression) {
       const excludes = file.excludeDirs ?? [];
       if (!excludes.length) {
-        ctx.ui.notify("No excluded directories. Add one with: /knowledge-search exclude <name>", "info");
+        ctx.ui.notify("No excluded directories. Add one with: /knowledge exclude <name>", "info");
         return;
       }
       const theme = ctx.ui.theme;
       const lines: string[] = [theme.bold(`Excluded directories (${excludes.length})`), ""];
       for (const name of excludes) lines.push("  " + theme.fg("muted", name));
-      lines.push("", theme.fg("dim", "Remove with: /knowledge-search exclude -<name>"));
+      lines.push("", theme.fg("dim", "Remove with: /knowledge exclude -<name>"));
       ctx.ui.setWidget("knowledge-search-exclude", lines);
       return;
     }
@@ -563,7 +658,7 @@ export default function (pi: ExtensionAPI) {
       saveConfig(file as ConfigFile, sessionCwd);
       if (currentConfig) currentConfig.excludeDirs = file.excludeDirs!;
       ctx.ui.notify(
-        `Removed exclude: ${target} · ${file.excludeDirs!.length} remain. Run /knowledge-search index to re-apply.`,
+        `Removed exclude: ${target} · ${file.excludeDirs!.length} remain. Run /knowledge index to re-apply.`,
         "info"
       );
       return;
@@ -579,20 +674,20 @@ export default function (pi: ExtensionAPI) {
     saveConfig(file as ConfigFile, sessionCwd);
     if (currentConfig) currentConfig.excludeDirs = excludes;
     ctx.ui.notify(
-      `Added exclude: ${expression} · ${excludes.length} total. Run /knowledge-search index to re-apply.`,
+      `Added exclude: ${expression} · ${excludes.length} total. Run /knowledge index to re-apply.`,
       "info"
     );
   }
 
   /**
-   * /knowledge-search index — incremental sync of new/changed files, with
+   * /knowledge index — incremental sync of new/changed files, with
    * pi-local-rag-style progress: footer status line + widget with a block
    * progress bar, plus a cold-start notice when the embedding model needs
    * downloading.
    */
   async function handleIndex(ctx: ExtensionCommandContext): Promise<void> {
     if (!currentConfig || currentConfig.dirs.length === 0) {
-      ctx.ui.notify("No directories configured. Run /knowledge-search add <dir> first.", "warning");
+      ctx.ui.notify("No directories configured. Run /knowledge add <dir> first.", "warning");
       return;
     }
 
@@ -672,13 +767,13 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * /knowledge-search clear — empty the index (vectors + FTS side-car) and
+   * /knowledge clear — empty the index (vectors + FTS side-car) and
    * reset the config to fresh defaults, mirroring pi-local-rag's /rag clear.
    */
   async function handleClear(ctx: ExtensionCommandContext): Promise<void> {
     const confirmed = await ctx.ui.confirm(
       "Clear knowledge search?",
-      "Deletes all project data (vector index + keyword side-car + config) and resets project settings to defaults, including any localPath override in .pi/settings.json. Re-index afterwards with /knowledge-search add + index. The shared HuggingFace model cache is not touched."
+      "Deletes all project data (vector index + keyword side-car + config) and resets project settings to defaults, including any localPath override in .pi/settings.json. Re-index afterwards with /knowledge add + index. The shared HuggingFace model cache is not touched."
     );
     if (!confirmed) {
       ctx.ui.notify("Clear cancelled.", "info");
@@ -774,21 +869,21 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  /** /knowledge-search help — subcommand list widget. */
+  /** /knowledge help — subcommand list widget. */
   function handleHelp(ctx: ExtensionCommandContext): void {
     const theme = ctx.ui.theme;
-    const lines: string[] = [theme.bold("/knowledge-search commands"), ""];
+    const lines: string[] = [theme.bold("/knowledge commands"), ""];
     for (const s of KS_SUBCOMMANDS) {
       lines.push("  " + theme.fg("accent", s.label.padEnd(10)) + theme.fg("dim", s.description));
     }
-    lines.push("", theme.fg("dim", "Bare /knowledge-search shows the current status."));
+    lines.push("", theme.fg("dim", "Bare /knowledge shows the current status."));
     ctx.ui.setWidget("knowledge-search-help", lines);
   }
 
   let statusWidgetVisible = false;
 
-  pi.registerCommand("knowledge-search", {
-    description: "knowledge-search: (status) | add <dir> | exclude <name> | index (added/changed/removed) | clear | on | off | help",
+  pi.registerCommand("knowledge", {
+    description: "knowledge: (status) | add <dir> | remove <dir> | exclude <name> | index (added/changed/removed) | clear | on | off | help",
     getArgumentCompletions: (prefix: string) => getSubcommandCompletions(prefix),
     handler: async (args, ctx) => {
       const parts = (args || "").trim().split(/\s+/);
@@ -796,6 +891,10 @@ export default function (pi: ExtensionAPI) {
 
       if (subcommand === "add") {
         await handleAdd(parts, ctx);
+        return;
+      }
+      if (subcommand === "remove") {
+        await handleRemove(parts, ctx);
         return;
       }
       if (subcommand === "exclude") {
@@ -829,11 +928,11 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (subcommand) {
-        ctx.ui.notify(`Unknown /knowledge-search command: ${subcommand}. Try /knowledge-search help`, "error");
+        ctx.ui.notify(`Unknown /knowledge command: ${subcommand}. Try /knowledge help`, "error");
         return;
       }
 
-      // Bare /knowledge-search toggles the status widget (like /rag).
+      // Bare /knowledge toggles the status widget (like /rag).
       if (statusWidgetVisible) {
         statusWidgetVisible = false;
         ctx.ui.setWidget("knowledge-search-status", undefined);
@@ -896,7 +995,7 @@ export default function (pi: ExtensionAPI) {
       if (!index || index.size() === 0) {
         const msg =
           !index
-            ? "knowledge-search is not configured. The user can run /knowledge-search add <dir> to set it up."
+            ? "knowledge-search is not configured. The user can run /knowledge add <dir> to set it up."
             : !syncDone
               ? "Index is still syncing in the background. Try again in a moment."
               : "Index is empty.";
@@ -975,7 +1074,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params) {
       if (!index || index.size() === 0) {
         const msg = !index
-          ? "knowledge-search is not configured. Run /knowledge-search add <dir> to set it up."
+          ? "knowledge-search is not configured. Run /knowledge add <dir> to set it up."
           : !syncDone
             ? "Index is still syncing in the background. Try again in a moment."
             : "Index is empty.";

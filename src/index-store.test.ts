@@ -583,3 +583,137 @@ describe("KnowledgeIndex sync scan progress", () => {
     await idx.close();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Directory removal — /knowledge remove <dir> must flush the removed dir's
+// config entry, vector entries, and FTS side-car rows (including FTS rows
+// orphaned without a vector counterpart), while leaving other dirs intact.
+// Mirrors handleRemove's purge: per-file removeFile for paths under the
+// removed dir, then removeBySourceDirs for anything still keyed to it.
+// ---------------------------------------------------------------------------
+
+describe("KnowledgeIndex source-dir removal flush", () => {
+  let tmpDir: string;
+
+  before(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ks-remove-dir-"));
+  });
+
+  after(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /** Embedder that returns fixed-dim vectors without hitting the model. */
+  function stubEmbedder(dim = 4): Embedder {
+    return {
+      embed: async () => new Array(dim).fill(0.25),
+      embedBatch: async (texts: string[]) => texts.map(() => new Array(dim).fill(0.25)),
+    };
+  }
+
+  function isUnderDir(abs: string, dir: string): boolean {
+    if (abs === dir) return true;
+    const rel = path.relative(dir, abs);
+    return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+  }
+
+  /** handleRemove's purge sequence, extracted verbatim. */
+  async function purgeDir(indexDir: string, dirs: string[], removed: string[]): Promise<number> {
+    const config = makeConfig(indexDir, 4);
+    config.dirs = dirs;
+    const idx = new KnowledgeIndex(config, stubEmbedder(4));
+    await idx.load();
+    let purged = 0;
+    for (const f of idx.listFiles()) {
+      if (removed.some((d) => isUnderDir(f.absPath, d))) {
+        idx.removeFile(f.absPath);
+        purged += 1;
+      }
+    }
+    purged += idx.removeBySourceDirs(removed);
+    await idx.close();
+    return purged;
+  }
+
+  it("flushes vector + FTS data for the removed dir and keeps other dirs", async () => {
+    const vaultA = path.join(tmpDir, "vault-a");
+    const vaultB = path.join(tmpDir, "vault-b");
+    fs.mkdirSync(vaultA, { recursive: true });
+    fs.mkdirSync(vaultB, { recursive: true });
+    fs.writeFileSync(path.join(vaultA, "alpha.md"), "# Alpha\n\nXylophone quarantine content lives here.\n");
+    fs.writeFileSync(path.join(vaultB, "beta.md"), "# Beta\n\nCompletely different keepsake content.\n");
+
+    // Index both dirs.
+    const config = makeConfig(path.join(tmpDir, "idx"), 4);
+    config.dirs = [vaultA, vaultB];
+    const writer = new KnowledgeIndex(config, stubEmbedder(4));
+    await writer.load();
+    const { added } = await writer.sync();
+    assert.equal(added, 2);
+    const fts = writer as unknown as { fts: { count(): number } };
+    assert.equal(fts.fts.count(), 2, "FTS side-car holds both files' chunks");
+    await writer.close();
+
+    // Remove vault A — config + purge, like /knowledge remove.
+    const purged = await purgeDir(path.join(tmpDir, "idx"), [vaultA, vaultB], [vaultA]);
+    assert.ok(purged >= 1, "at least vault A's file is purged");
+
+    // Reopen: no trace of vault A on either side; vault B untouched.
+    const reader = new KnowledgeIndex(config, stubEmbedder(4));
+    await reader.load();
+    const paths = reader.listFiles().map((f) => f.absPath);
+    assert.deepEqual(paths, [path.join(vaultB, "beta.md")]);
+    assert.equal((reader as unknown as typeof fts).fts.count(), 1, "FTS holds only vault B's chunk");
+    const hits = await reader.search("Xylophone quarantine", 10);
+    assert.equal(hits.length, 0, "removed dir's content is unsearchable");
+    const kept = await reader.search("keepsake", 10);
+    assert.equal(kept.length, 1, "kept dir still searchable");
+    await reader.close();
+  });
+
+  it("sweeps FTS rows orphaned without a vector entry", async () => {
+    const vaultA = path.join(tmpDir, "orphan-a");
+    const vaultB = path.join(tmpDir, "orphan-b");
+    fs.mkdirSync(vaultA, { recursive: true });
+    fs.mkdirSync(vaultB, { recursive: true });
+    fs.writeFileSync(path.join(vaultA, "a1.md"), "# A1\n\nWobble content for a1.\n");
+    fs.writeFileSync(path.join(vaultA, "a2.md"), "# A2\n\nGrommet content for a2.\n");
+    fs.writeFileSync(path.join(vaultB, "b1.md"), "# B1\n\nPlinth content for b1.\n");
+
+    const config = makeConfig(path.join(tmpDir, "idx-orphan"), 4);
+    config.dirs = [vaultA, vaultB];
+    const writer = new KnowledgeIndex(config, stubEmbedder(4));
+    await writer.load();
+    await writer.sync();
+
+    // Simulate an orphaned FTS row: a2.md's vector entries vanish (e.g. a
+    // previously failed write left the FTS rows behind) — the per-file
+    // removeFile pass driven by listFiles() can no longer see a2.md, but
+    // removeBySourceDirs must still sweep its FTS rows.
+    const internal = writer as unknown as {
+      data: { entries: Record<string, unknown> };
+      fts: { count(): number; deleteByAbsPath(p: string): number };
+      save(): Promise<void>;
+    };
+    for (const key of Object.keys(internal.data.entries)) {
+      if (key.startsWith(path.join(vaultA, "a2.md") + "#")) {
+        delete internal.data.entries[key];
+      }
+    }
+    await internal.save();
+    const ftsCountWithOrphan = internal.fts.count();
+    assert.equal(ftsCountWithOrphan, 3, "a2.md's FTS row is orphaned but present");
+    await writer.close();
+
+    const purged = await purgeDir(path.join(tmpDir, "idx-orphan"), [vaultA, vaultB], [vaultA]);
+    assert.equal(purged, 1, "only a1.md is still visible to the per-file pass");
+
+    const reader = new KnowledgeIndex(config, stubEmbedder(4));
+    await reader.load();
+    const fts = reader as unknown as { fts: { count(): number } };
+    assert.equal(fts.fts.count(), 1, "orphaned FTS row swept — only vault B's chunk remains");
+    const hits = await reader.search("Grommet Wobble", 10);
+    assert.equal(hits.length, 0, "neither a1 nor orphaned a2 content is searchable");
+    await reader.close();
+  });
+});

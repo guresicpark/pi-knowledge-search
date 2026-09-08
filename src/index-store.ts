@@ -1057,6 +1057,34 @@ export class KnowledgeIndex {
     }
   }
 
+  /**
+   * Remove every trace of files indexed from the given source dirs — used
+   * when a whole directory is dropped from the config. Complements
+   * removeFile(): entries are matched by their stored sourceDir (so keys
+   * pointing elsewhere are still caught) and FTS rows are swept by
+   * sourceDir even when no vector entry references them anymore.
+   * Returns the number of distinct files removed from the vector store.
+   */
+  removeBySourceDirs(dirs: string[]): number {
+    const targets = new Set(dirs);
+    const touched = new Set<string>();
+    for (const key of Object.keys(this.data.entries)) {
+      if (targets.has(this.data.entries[key].sourceDir)) {
+        touched.add(this.absPathFromKey(key));
+      }
+    }
+    for (const absPath of touched) {
+      this.removeAllChunks(absPath);
+    }
+    // Sweep FTS rows under the removed dirs even when the vector side has
+    // no matching entries (orphaned by a previously failed/locked write).
+    this.fts.deleteBySourceDirs(dirs);
+    if (touched.size > 0) {
+      this.scheduleSave();
+    }
+    return touched.size;
+  }
+
   /** Alias for removeFile — removes all data for a file path. */
   deleteFile(absPath: string): void {
     this.removeFile(absPath);
