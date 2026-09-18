@@ -164,7 +164,7 @@ The embedding engine is fixed, mirroring pi-local-rag's two embedding groups:
 
 Both run via [Transformers.js](https://huggingface.co/docs/transformers.js) local ONNX inference — no API key, no server, no configuration. Weights are downloaded once (~111 MB nomic, ~170 MB jina-code) into a shared HuggingFace cache (`~/.cache/huggingface/transformers` by default, or `PI_RAG_MODEL_CACHE` / `TRANSFORMERS_CACHE` / `HF_HOME`), so pi-knowledge-search and pi-local-rag reuse the same downloads. `/knowledge index` shows a notice before the first download of each model (jina only when code files are being indexed).
 
-Transformers.js pulls in `sharp` (for vision preprocessing); since pi loads pi-local-rag alongside this extension in the same process, `sharp` is pinned to exactly the same version pi-local-rag resolves (0.35.3 → libvips 8.18.3) via npm `overrides`. Loading two different libvips dylibs into one process makes macOS objc emit a duplicate-class warning (`GNotificationCenterDelegate implemented in both …`) that can cause spurious casting failures and mysterious crashes.
+Transformers.js pulls in `sharp` (for vision preprocessing) and `onnxruntime-node`; `sharp` is pinned to the audited release (0.35.4) and `adm-zip` to ≥ 0.6.1 via npm `overrides`, keeping `npm audit` clean. Loading two different libvips dylibs into one process makes macOS objc emit a duplicate-class warning (`GNotificationCenterDelegate implemented in both …`) that can cause spurious casting failures and mysterious crashes — pi-local-rag avoids this by shipping a JS sharp *stub* (its embeddings are text-only), so even with both extensions in one process only this extension's native sharp loads.
 
 ### Engine-signature invalidation
 

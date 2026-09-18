@@ -455,7 +455,6 @@ export class KnowledgeIndex {
     return new Promise((resolve, reject) => {
       const stream = fs.createReadStream(file, { highWaterMark: 256 * 1024 });
       const parser = makeParser();
-      const assembler = Assembler.connectTo(parser);
 
       let settled = false;
       const settle = (ok: () => void, err?: (e: Error) => void) => {
@@ -465,8 +464,9 @@ export class KnowledgeIndex {
         else ok();
       };
 
-      assembler.on("done", (asm) => {
-        settle(() => resolve(asm.current as IndexData));
+      // stream-json 3.x replaced the 2.x 'done' event with the onDone option.
+      const assembler = Assembler.connectTo<IndexData>(parser, {
+        onDone: (asm) => settle(() => resolve(asm.current)),
       });
       stream.on("error", (e) => settle(() => resolve(null), () => reject(e)));
       parser.on("error", (e) => settle(() => resolve(null), () => reject(e)));

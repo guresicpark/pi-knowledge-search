@@ -1010,7 +1010,6 @@ var KnowledgeIndex = class _KnowledgeIndex {
     return new Promise((resolve, reject) => {
       const stream = fs2.createReadStream(file, { highWaterMark: 256 * 1024 });
       const parser = makeParser();
-      const assembler = Assembler.connectTo(parser);
       let settled = false;
       const settle = (ok, err) => {
         if (settled) return;
@@ -1018,8 +1017,8 @@ var KnowledgeIndex = class _KnowledgeIndex {
         if (err) err(new Error("assembler failed"));
         else ok();
       };
-      assembler.on("done", (asm) => {
-        settle(() => resolve(asm.current));
+      const assembler = Assembler.connectTo(parser, {
+        onDone: (asm) => settle(() => resolve(asm.current))
       });
       stream.on("error", (e) => settle(() => resolve(null), () => reject(e)));
       parser.on("error", (e) => settle(() => resolve(null), () => reject(e)));
