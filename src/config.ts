@@ -227,10 +227,24 @@ export function loadConfig(cwd?: string): Config | null {
 
   if (dirs.length === 0) return null;
 
+  // Legacy-config migration: versions before the dual-model engine shipped
+  // the text-group-only default as an explicit `fileExtensions` list. A
+  // config still carrying exactly that list is treated as stale — left
+  // alone it would silently hide every code extension (.ts, .sql, …) from
+  // the jina side, so it upgrades to the current union default. Any other
+  // explicit list is a deliberate narrowing and stays authoritative.
+  let fileExtensionsFromFile = file?.fileExtensions?.map((e) => e.toLowerCase());
+  if (fileExtensionsFromFile && sameExtensionSet(fileExtensionsFromFile, DEFAULT_DOC_EXTENSIONS)) {
+    console.error(
+      "pi-knowledge-search: upgrading legacy fileExtensions (text-only default) to the dual-group default — code extensions (.ts, .py, .sql, …) are now indexed with jina-code. Re-run /knowledge index to pick them up."
+    );
+    fileExtensionsFromFile = undefined;
+  }
+
   const fileExtensions = (envStr("KNOWLEDGE_SEARCH_EXTENSIONS")
     ?.split(",")
     .map((e) => e.trim().toLowerCase()) ??
-    file?.fileExtensions?.map((e) => e.toLowerCase()) ??
+    fileExtensionsFromFile ??
     DEFAULT_FILE_EXTENSIONS)
     .filter(Boolean);
 
@@ -307,6 +321,14 @@ export function saveConfig(config: ConfigFile, cwd?: string): void {
 function envStr(key: string): string | undefined {
   const v = process.env[key]?.trim();
   return v || undefined;
+}
+
+/** Order-insensitive comparison of two lowercase extension lists. */
+function sameExtensionSet(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const sortedA = [...a].sort();
+  const sortedB = [...b].sort();
+  return sortedA.every((ext, i) => ext === sortedB[i]);
 }
 
 function envInt(key: string): number | undefined {

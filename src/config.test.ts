@@ -25,6 +25,7 @@ let loadConfig: (typeof import("./config.js"))["loadConfig"];
 let getConfigPath: (typeof import("./config.js"))["getConfigPath"];
 let saveConfig: (typeof import("./config.js"))["saveConfig"];
 let classifyFileGroup: (typeof import("./config.js"))["classifyFileGroup"];
+let DEFAULT_FILE_EXTENSIONS: (typeof import("./config.js"))["DEFAULT_FILE_EXTENSIONS"];
 
 const originalEnv: Record<string, string | undefined> = {};
 
@@ -49,6 +50,7 @@ describe("config", () => {
     getConfigPath = configModule.getConfigPath;
     saveConfig = configModule.saveConfig;
     classifyFileGroup = configModule.classifyFileGroup;
+    DEFAULT_FILE_EXTENSIONS = configModule.DEFAULT_FILE_EXTENSIONS;
   });
 
   beforeEach(() => {
@@ -153,6 +155,45 @@ describe("config", () => {
     // Code-group classification defaults to pi-local-rag's code list.
     assert.ok(config.codeExtensions.includes(".ts"));
     assert.ok(!config.codeExtensions.includes(".md"));
+  });
+
+  it("upgrades a legacy text-only default fileExtensions to the dual-group default", () => {
+    // Configs written before the dual-model engine persisted the old
+    // text-only default as an explicit list — it must not silently hide
+    // code extensions from the jina side.
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({
+        dirs: ["/tmp/docs"],
+        fileExtensions: [
+          ".md", ".mdx", ".txt", ".rst",
+          ".html", ".htm",
+          ".json", ".jsonc", ".yaml", ".yml", ".toml", ".ini", ".xml", ".csv", ".tsv",
+          ".env", ".gitignore", ".dockerfile",
+        ],
+      })
+    );
+
+    const config = loadConfig();
+    assert.ok(config);
+    assert.ok(config.fileExtensions.includes(".sql"), ".sql picked up after legacy upgrade");
+    assert.ok(config.fileExtensions.includes(".ts"), ".ts picked up after legacy upgrade");
+    assert.ok(config.fileExtensions.includes(".md"), "text extensions still present");
+    assert.equal(config.fileExtensions.length, DEFAULT_FILE_EXTENSIONS.length);
+  });
+
+  it("keeps an explicit non-default fileExtensions list (deliberate narrowing)", () => {
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({
+        dirs: ["/tmp/docs"],
+        fileExtensions: [".md", ".txt"],
+      })
+    );
+
+    const config = loadConfig();
+    assert.ok(config);
+    assert.deepStrictEqual(config.fileExtensions, [".md", ".txt"]);
   });
 
   it("lowercases file extensions from file and env", () => {
