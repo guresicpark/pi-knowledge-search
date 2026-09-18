@@ -59,7 +59,7 @@ export default function (pi: ExtensionAPI) {
     force: boolean
   ):
     | { status: "skipped"; reason: string }
-    | { status: "injected"; totalNotes: number; sourceCount: number } {
+    | { status: "injected"; totalNotes: number; totalSources: number; sourceCount: number } {
     if (!index || !currentConfig) return { status: "skipped", reason: "not configured" };
     if (!force && !currentConfig.overview.inject) {
       return { status: "skipped", reason: "overview.inject=false" };
@@ -90,6 +90,7 @@ export default function (pi: ExtensionAPI) {
       display: true,
       details: {
         totalNotes: overview.totalNotes,
+        totalSources: overview.totalSources ?? 0,
         sourceCount: overview.sources.length,
         forced: force,
       },
@@ -97,6 +98,7 @@ export default function (pi: ExtensionAPI) {
     return {
       status: "injected",
       totalNotes: overview.totalNotes,
+      totalSources: overview.totalSources ?? 0,
       sourceCount: overview.sources.length,
     };
   }
@@ -227,7 +229,17 @@ export default function (pi: ExtensionAPI) {
     // session_start critical path; injectOverview itself runs in a
     // microtask after load() resolves, while pi's outbound model HTTP
     // already fired during session_start's earlier return.
+    //
+    // The injection result is captured so the sync worker's exit handler
+    // can re-inject when the startup view was empty and the worker just
+    // indexed the vault's first files (otherwise the session would keep
+    // a stale "0 notes" overview all along).
     // ----------------------------------------------------------------
+    let startupOverview:
+      | { status: "skipped"; reason: string }
+      | { status: "injected"; totalNotes: number; totalSources: number; sourceCount: number }
+      | undefined;
+
     indexLoaded
       .then(() => {
         // Auto-enable the per-turn knowledge lookup whenever the index
@@ -251,7 +263,7 @@ export default function (pi: ExtensionAPI) {
         }
 
         try {
-          injectOverview(ctx, false);
+          startupOverview = injectOverview(ctx, false);
         } catch (err: unknown) {
           // Overview is a nice-to-have — never let it break startup.
           const msg = err instanceof Error ? err.message : String(err);
@@ -325,6 +337,23 @@ export default function (pi: ExtensionAPI) {
                 `Index: +${result.added} ~${result.updated} -${result.removed} (${result.size} files, ${result.chunks} chunks)`
               );
               setTimeout(() => ctx.ui.setStatus("knowledge-search", ""), 5000);
+              // The startup overview was injected from the pre-sync index —
+              // when it saw an empty store (e.g. first run, or a vault that
+              // only just became indexable like a SQL folder behind a legacy
+              // config), re-inject now that the worker filled it. Otherwise
+              // the session would keep the stale "0 notes" view.
+              const startupWasEmpty =
+                startupOverview?.status === "injected"
+                  ? startupOverview.totalNotes + startupOverview.totalSources === 0
+                  : startupOverview?.reason === "index is empty" ||
+                    startupOverview?.reason === "empty overview";
+              if (startupWasEmpty) {
+                try {
+                  injectOverview(ctx, true);
+                } catch {
+                  // overview refresh is best-effort
+                }
+              }
             }
           } catch {
             // ignore parse errors

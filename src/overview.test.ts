@@ -46,6 +46,36 @@ describe("buildOverview", () => {
     assert.equal(byPath.get("taskei"), 1);
   });
 
+  it("counts code-group files as sources, not notes", () => {
+    const files = [
+      { absPath: "/v/doc.md", relPath: "doc.md", sourceDir: "/v", headings: [] },
+      { absPath: "/v/schema.sql", relPath: "schema.sql", sourceDir: "/v", headings: [], group: "code" as const },
+      { absPath: "/v/sub/auth.ts", relPath: "sub/auth.ts", sourceDir: "/v", headings: [], group: "code" as const },
+    ];
+    const o = buildOverview(files, ["/v"], { maxDepth: 2, maxKeywordsPerFolder: 0 });
+    assert.equal(o.totalNotes, 1, "only prose files count as notes");
+    assert.equal(o.totalSources, 2, "code files count as sources");
+    assert.equal(o.sources[0].noteCount, 1);
+    assert.equal(o.sources[0].sourceCount, 2);
+    const root = o.sources[0].folders.find((f) => f.path === "");
+    assert.equal(root?.noteCount, 1);
+    assert.equal(root?.sourceCount, 1);
+    const sub = o.sources[0].folders.find((f) => f.path === "sub");
+    assert.equal(sub?.noteCount, 0);
+    assert.equal(sub?.sourceCount, 1);
+  });
+
+  it("sorts folders by combined note + source count", () => {
+    const files = [
+      { absPath: "/v/notes/a.md", relPath: "notes/a.md", sourceDir: "/v", headings: [] },
+      { absPath: "/v/code/a.ts", relPath: "code/a.ts", sourceDir: "/v", headings: [], group: "code" as const },
+      { absPath: "/v/code/b.sql", relPath: "code/b.sql", sourceDir: "/v", headings: [], group: "code" as const },
+      { absPath: "/v/code/c.ts", relPath: "code/c.ts", sourceDir: "/v", headings: [], group: "code" as const },
+    ];
+    const o = buildOverview(files, ["/v"], { maxDepth: 1, maxKeywordsPerFolder: 0 });
+    assert.equal(o.sources[0].folders[0].path, "code", "code folder (3 files) outranks notes folder (1)");
+  });
+
   it("derives keywords from filenames weighted higher than headings", () => {
     const files = [
       {
@@ -203,5 +233,28 @@ describe("formatOverview", () => {
     assert.doesNotMatch(out, /LONG README BODY/);
     assert.doesNotMatch(out, /kw-one/);
     assert.doesNotMatch(out, /daily log entries/);
+  });
+
+  it("renders code-only dirs as sources and mixed dirs as notes · sources", () => {
+    const out = formatOverview({
+      totalNotes: 2,
+      totalSources: 5,
+      sources: [
+        { dir: "/docs", displayName: "docs", noteCount: 2, folders: [] },
+        { dir: "/tables", displayName: "tables", noteCount: 0, sourceCount: 5, folders: [] },
+        {
+          dir: "/mixed",
+          displayName: "mixed",
+          noteCount: 1,
+          sourceCount: 1,
+          folders: [],
+        },
+      ],
+    });
+    assert.match(out, /- \*\*\/docs\*\* — 2 notes/);
+    assert.match(out, /- \*\*\/tables\*\* — 5 sources\b/, "code-only dir reads as sources");
+    assert.match(out, /- \*\*\/mixed\*\* — 1 note · 1 source\b/, "mixed dir shows both segments");
+    assert.doesNotMatch(out, /0 notes/, "zero segments are omitted");
+    assert.doesNotMatch(out, /0 sources/, "zero segments are omitted");
   });
 });

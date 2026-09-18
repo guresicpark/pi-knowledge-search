@@ -242,7 +242,14 @@ function loadConfig(cwd) {
   const resolvePath = (p) => p.replace(/^~/, home);
   const dirs = (envDirs ? envDirs.split(",").map((d) => d.trim()) : file?.dirs ?? []).map(resolvePath).filter(Boolean);
   if (dirs.length === 0) return null;
-  const fileExtensions = (envStr("KNOWLEDGE_SEARCH_EXTENSIONS")?.split(",").map((e) => e.trim().toLowerCase()) ?? file?.fileExtensions?.map((e) => e.toLowerCase()) ?? DEFAULT_FILE_EXTENSIONS).filter(Boolean);
+  let fileExtensionsFromFile = file?.fileExtensions?.map((e) => e.toLowerCase());
+  if (fileExtensionsFromFile && sameExtensionSet(fileExtensionsFromFile, DEFAULT_DOC_EXTENSIONS)) {
+    console.error(
+      "pi-knowledge-search: upgrading legacy fileExtensions (text-only default) to the dual-group default \u2014 code extensions (.ts, .py, .sql, \u2026) are now indexed with jina-code. Re-run /knowledge index to pick them up."
+    );
+    fileExtensionsFromFile = void 0;
+  }
+  const fileExtensions = (envStr("KNOWLEDGE_SEARCH_EXTENSIONS")?.split(",").map((e) => e.trim().toLowerCase()) ?? fileExtensionsFromFile ?? DEFAULT_FILE_EXTENSIONS).filter(Boolean);
   const excludeDirs = envStr("KNOWLEDGE_SEARCH_EXCLUDE")?.split(",").map((d) => d.trim()) ?? file?.excludeDirs ?? ["node_modules", ".git", ".obsidian", ".trash"];
   const codeExtensions = envStr("KNOWLEDGE_SEARCH_CODE_EXTENSIONS")?.split(",").map((e) => e.trim().toLowerCase()).filter(Boolean) ?? file?.codeExtensions?.map((e) => e.toLowerCase()) ?? DEFAULT_CODE_EXTENSIONS;
   const legacy = file;
@@ -274,6 +281,12 @@ function loadConfig(cwd) {
 function envStr(key) {
   const v = process.env[key]?.trim();
   return v || void 0;
+}
+function sameExtensionSet(a, b) {
+  if (a.length !== b.length) return false;
+  const sortedA = [...a].sort();
+  const sortedB = [...b].sort();
+  return sortedA.every((ext, i) => ext === sortedB[i]);
 }
 function envInt(key) {
   const v = envStr(key);
@@ -906,7 +919,8 @@ var KnowledgeIndex = class _KnowledgeIndex {
           absPath,
           relPath: entry.relPath,
           sourceDir: entry.sourceDir,
-          headings: []
+          headings: [],
+          group: this.entryGroup(key, entry)
         };
         byPath.set(absPath, agg);
       }
@@ -1017,7 +1031,7 @@ var KnowledgeIndex = class _KnowledgeIndex {
         if (err) err(new Error("assembler failed"));
         else ok();
       };
-      const assembler = Assembler.connectTo(parser, {
+      Assembler.connectTo(parser, {
         onDone: (asm) => settle(() => resolve(asm.current))
       });
       stream.on("error", (e) => settle(() => resolve(null), () => reject(e)));

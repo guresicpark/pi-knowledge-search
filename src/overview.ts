@@ -2,11 +2,12 @@
  * Compact overview of indexed knowledge directories.
  *
  * Injected at session start so the agent knows which vault dirs exist and
- * how many notes each holds — a one-shot map without dumping folder trees,
- * keywords, or README bodies into context.
+ * how many notes (prose files) and sources (code files) each holds — a
+ * one-shot map without dumping folder trees, keywords, or README bodies
+ * into context.
  *
  * buildOverview still computes the per-folder detail (buckets + TF-IDF
- * keywords) for note counting and potential future consumers; only the
+ * keywords) for counting and potential future consumers; only the
  * source-dir list is rendered by formatOverview.
  */
 
@@ -22,13 +23,21 @@ export interface FileFacts {
   sourceDir: string;
   /** Section headings collected from all chunks of this file. */
   headings: string[];
+  /**
+   * Embedding group: `"text"` (nomic) files are notes, `"code"` (jina)
+   * files are sources. Optional — defaults to text (prose), matching
+   * pre-dual-model indexes.
+   */
+  group?: "code" | "text";
 }
 
 export interface OverviewFolder {
   /** Display path, POSIX-style, relative to the source dir. "" means the root of the source dir. */
   path: string;
-  /** Unique note count in this folder (recursive: includes nested files at deeper paths). */
+  /** Unique note count (prose/text-group files) in this folder (recursive). */
   noteCount: number;
+  /** Unique source count (code-group files, e.g. .ts/.sql) in this folder (recursive). */
+  sourceCount?: number;
   /** Top keywords surfaced by TF-IDF over folder contents. */
   keywords: string[];
   /**
@@ -43,21 +52,25 @@ export interface OverviewSource {
   dir: string;
   /** Short display name (basename of `dir`, with `~` substitution done upstream). */
   displayName: string;
-  /** Total unique note count in this source dir (over all folders, untrimmed). */
+  /** Total unique note count (prose files) in this source dir (over all folders, untrimmed). */
   noteCount: number;
+  /** Total unique source count (code files) in this source dir. */
+  sourceCount?: number;
   /**
    * Root-level context note if present (`NAPKIN.md`, `README.md`, or `_about.md`).
    * First ~400 chars, trimmed.
    */
   contextNote?: string;
-  /** Folders grouped at the configured depth, sorted by noteCount desc. */
+  /** Folders grouped at the configured depth, sorted by file count desc. */
   folders: OverviewFolder[];
 }
 
 export interface Overview {
   sources: OverviewSource[];
-  /** Total unique note count across all sources. */
+  /** Total unique note count (prose files) across all sources. */
   totalNotes: number;
+  /** Total unique source count (code files) across all sources. */
+  totalSources?: number;
 }
 
 export interface BuildOverviewOptions {
@@ -248,6 +261,7 @@ export function buildOverview(
 
   const sources: OverviewSource[] = [];
   let totalNotes = 0;
+  let totalSources = 0;
 
   for (const [sourceDir, folders] of bySource) {
     // Run TF-IDF per source dir (keeps keyword comparison local to each vault).
@@ -255,47 +269,68 @@ export function buildOverview(
 
     const folderList: OverviewFolder[] = [];
     for (const [folder, fileList] of folders) {
+      // Text-group files are notes (prose); code-group files are sources
+      // (.ts, .sql, … embedded by jina).
+      const noteCount = fileList.filter((f) => (f.group ?? "text") === "text").length;
+      const sourceCount = fileList.length - noteCount;
       folderList.push({
         path: folder,
-        noteCount: fileList.length,
+        noteCount,
+        sourceCount,
         keywords: keywords.get(folder) ?? [],
         aboutText: findFolderAbout(sourceDir, folder),
       });
     }
     folderList.sort(
-      (a, b) => b.noteCount - a.noteCount || a.path.localeCompare(b.path)
+      (a, b) =>
+        b.noteCount + (b.sourceCount ?? 0) - (a.noteCount + (a.sourceCount ?? 0)) ||
+        a.path.localeCompare(b.path)
     );
     const trimmedFolders = folderList.slice(0, maxFolders);
-    const sourceTotal = folderList.reduce((s, f) => s + f.noteCount, 0);
-    totalNotes += sourceTotal;
+    const sourceNotes = folderList.reduce((s, f) => s + f.noteCount, 0);
+    const sourceSources = folderList.reduce((s, f) => s + (f.sourceCount ?? 0), 0);
+    totalNotes += sourceNotes;
+    totalSources += sourceSources;
 
     sources.push({
       dir: sourceDir,
       displayName: path.basename(sourceDir) || sourceDir,
-      noteCount: sourceTotal,
+      noteCount: sourceNotes,
+      sourceCount: sourceSources,
       contextNote: findContextNote(sourceDir),
       folders: trimmedFolders,
     });
   }
 
-  return { sources, totalNotes };
+  return { sources, totalNotes, totalSources };
 }
 
 export function formatOverview(overview: Overview): string {
-  if (overview.totalNotes === 0) return "";
+  const totalSources = overview.totalSources ?? 0;
+  if (overview.totalNotes + totalSources === 0) return "";
   const lines: string[] = [];
   lines.push("## Knowledge-search vault overview");
   lines.push(
     `You have a local knowledge base indexed by pi-knowledge-search. Use the ` +
       `\`knowledge_search\` tool for semantic/keyword lookup and \`knowledge_kb_read\` to ` +
-      `pull a note by name or \`[[wikilink]]\`.`
+      `pull a note or source file by name or \`[[wikilink]]\`.`
   );
   lines.push("");
 
   const home = process.env.HOME || "";
   for (const src of overview.sources) {
     const dirDisplay = home && src.dir.startsWith(home) ? src.dir.replace(home, "~") : src.dir;
-    lines.push(`- **${dirDisplay}** — ${src.noteCount} note${src.noteCount === 1 ? "" : "s"}`);
+    // Notes = prose files (nomic); sources = code files (jina). Zero
+    // segments are omitted, so a prose-only vault reads as before.
+    const segments: string[] = [];
+    if (src.noteCount > 0) {
+      segments.push(`${src.noteCount} note${src.noteCount === 1 ? "" : "s"}`);
+    }
+    const srcSources = src.sourceCount ?? 0;
+    if (srcSources > 0) {
+      segments.push(`${srcSources} source${srcSources === 1 ? "" : "s"}`);
+    }
+    lines.push(`- **${dirDisplay}** — ${segments.join(" · ")}`);
   }
   return lines.join("\n").trimEnd();
 }

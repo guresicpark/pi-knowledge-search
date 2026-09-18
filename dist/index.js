@@ -251,7 +251,14 @@ function loadConfig(cwd) {
   const resolvePath = (p) => p.replace(/^~/, home);
   const dirs = (envDirs ? envDirs.split(",").map((d) => d.trim()) : file?.dirs ?? []).map(resolvePath).filter(Boolean);
   if (dirs.length === 0) return null;
-  const fileExtensions = (envStr("KNOWLEDGE_SEARCH_EXTENSIONS")?.split(",").map((e) => e.trim().toLowerCase()) ?? file?.fileExtensions?.map((e) => e.toLowerCase()) ?? DEFAULT_FILE_EXTENSIONS).filter(Boolean);
+  let fileExtensionsFromFile = file?.fileExtensions?.map((e) => e.toLowerCase());
+  if (fileExtensionsFromFile && sameExtensionSet(fileExtensionsFromFile, DEFAULT_DOC_EXTENSIONS)) {
+    console.error(
+      "pi-knowledge-search: upgrading legacy fileExtensions (text-only default) to the dual-group default \u2014 code extensions (.ts, .py, .sql, \u2026) are now indexed with jina-code. Re-run /knowledge index to pick them up."
+    );
+    fileExtensionsFromFile = void 0;
+  }
+  const fileExtensions = (envStr("KNOWLEDGE_SEARCH_EXTENSIONS")?.split(",").map((e) => e.trim().toLowerCase()) ?? fileExtensionsFromFile ?? DEFAULT_FILE_EXTENSIONS).filter(Boolean);
   const excludeDirs = envStr("KNOWLEDGE_SEARCH_EXCLUDE")?.split(",").map((d) => d.trim()) ?? file?.excludeDirs ?? ["node_modules", ".git", ".obsidian", ".trash"];
   const codeExtensions = envStr("KNOWLEDGE_SEARCH_CODE_EXTENSIONS")?.split(",").map((e) => e.trim().toLowerCase()).filter(Boolean) ?? file?.codeExtensions?.map((e) => e.toLowerCase()) ?? DEFAULT_CODE_EXTENSIONS;
   const legacy = file;
@@ -289,6 +296,12 @@ function saveConfig(config, cwd) {
 function envStr(key) {
   const v = process.env[key]?.trim();
   return v || void 0;
+}
+function sameExtensionSet(a, b) {
+  if (a.length !== b.length) return false;
+  const sortedA = [...a].sort();
+  const sortedB = [...b].sort();
+  return sortedA.every((ext, i) => ext === sortedB[i]);
 }
 function envInt(key) {
   const v = envStr(key);
@@ -921,7 +934,8 @@ var KnowledgeIndex = class _KnowledgeIndex {
           absPath,
           relPath: entry.relPath,
           sourceDir: entry.sourceDir,
-          headings: []
+          headings: [],
+          group: this.entryGroup(key, entry)
         };
         byPath.set(absPath, agg);
       }
@@ -1032,7 +1046,7 @@ var KnowledgeIndex = class _KnowledgeIndex {
         if (err) err(new Error("assembler failed"));
         else ok();
       };
-      const assembler = Assembler.connectTo(parser, {
+      Assembler.connectTo(parser, {
         onDone: (asm) => settle(() => resolve3(asm.current))
       });
       stream.on("error", (e) => settle(() => resolve3(null), () => reject(e)));
@@ -2110,45 +2124,61 @@ function buildOverview(files, sourceDirs, opts = {}) {
   }
   const sources = [];
   let totalNotes = 0;
+  let totalSources = 0;
   for (const [sourceDir, folders] of bySource) {
     const keywords = extractKeywords(folders, maxKeywords);
     const folderList = [];
     for (const [folder, fileList] of folders) {
+      const noteCount = fileList.filter((f) => (f.group ?? "text") === "text").length;
+      const sourceCount = fileList.length - noteCount;
       folderList.push({
         path: folder,
-        noteCount: fileList.length,
+        noteCount,
+        sourceCount,
         keywords: keywords.get(folder) ?? [],
         aboutText: findFolderAbout(sourceDir, folder)
       });
     }
     folderList.sort(
-      (a, b) => b.noteCount - a.noteCount || a.path.localeCompare(b.path)
+      (a, b) => b.noteCount + (b.sourceCount ?? 0) - (a.noteCount + (a.sourceCount ?? 0)) || a.path.localeCompare(b.path)
     );
     const trimmedFolders = folderList.slice(0, maxFolders);
-    const sourceTotal = folderList.reduce((s, f) => s + f.noteCount, 0);
-    totalNotes += sourceTotal;
+    const sourceNotes = folderList.reduce((s, f) => s + f.noteCount, 0);
+    const sourceSources = folderList.reduce((s, f) => s + (f.sourceCount ?? 0), 0);
+    totalNotes += sourceNotes;
+    totalSources += sourceSources;
     sources.push({
       dir: sourceDir,
       displayName: path3.basename(sourceDir) || sourceDir,
-      noteCount: sourceTotal,
+      noteCount: sourceNotes,
+      sourceCount: sourceSources,
       contextNote: findContextNote(sourceDir),
       folders: trimmedFolders
     });
   }
-  return { sources, totalNotes };
+  return { sources, totalNotes, totalSources };
 }
 function formatOverview(overview) {
-  if (overview.totalNotes === 0) return "";
+  const totalSources = overview.totalSources ?? 0;
+  if (overview.totalNotes + totalSources === 0) return "";
   const lines = [];
   lines.push("## Knowledge-search vault overview");
   lines.push(
-    `You have a local knowledge base indexed by pi-knowledge-search. Use the \`knowledge_search\` tool for semantic/keyword lookup and \`knowledge_kb_read\` to pull a note by name or \`[[wikilink]]\`.`
+    `You have a local knowledge base indexed by pi-knowledge-search. Use the \`knowledge_search\` tool for semantic/keyword lookup and \`knowledge_kb_read\` to pull a note or source file by name or \`[[wikilink]]\`.`
   );
   lines.push("");
   const home = process.env.HOME || "";
   for (const src of overview.sources) {
     const dirDisplay = home && src.dir.startsWith(home) ? src.dir.replace(home, "~") : src.dir;
-    lines.push(`- **${dirDisplay}** \u2014 ${src.noteCount} note${src.noteCount === 1 ? "" : "s"}`);
+    const segments = [];
+    if (src.noteCount > 0) {
+      segments.push(`${src.noteCount} note${src.noteCount === 1 ? "" : "s"}`);
+    }
+    const srcSources = src.sourceCount ?? 0;
+    if (srcSources > 0) {
+      segments.push(`${srcSources} source${srcSources === 1 ? "" : "s"}`);
+    }
+    lines.push(`- **${dirDisplay}** \u2014 ${segments.join(" \xB7 ")}`);
   }
   return lines.join("\n").trimEnd();
 }
@@ -2377,6 +2407,7 @@ function index_default(pi) {
       display: true,
       details: {
         totalNotes: overview.totalNotes,
+        totalSources: overview.totalSources ?? 0,
         sourceCount: overview.sources.length,
         forced: force
       }
@@ -2384,6 +2415,7 @@ function index_default(pi) {
     return {
       status: "injected",
       totalNotes: overview.totalNotes,
+      totalSources: overview.totalSources ?? 0,
       sourceCount: overview.sources.length
     };
   }
@@ -2458,6 +2490,7 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
     if (!currentConfig) return;
     index = new KnowledgeIndex(currentConfig, createEmbedder());
     const indexLoaded = index.load();
+    let startupOverview;
     indexLoaded.then(() => {
       if (event.reason === "startup" && currentConfig && index && index.chunkCount() > 0 && !currentConfig.autoInject) {
         const file = readRawConfig();
@@ -2467,7 +2500,7 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
         ctx.ui.notify("Knowledge lookup auto-injection enabled", "info");
       }
       try {
-        injectOverview(ctx, false);
+        startupOverview = injectOverview(ctx, false);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`knowledge-search: overview injection failed: ${msg}`);
@@ -2524,6 +2557,13 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
                 `Index: +${result.added} ~${result.updated} -${result.removed} (${result.size} files, ${result.chunks} chunks)`
               );
               setTimeout(() => ctx.ui.setStatus("knowledge-search", ""), 5e3);
+              const startupWasEmpty = startupOverview?.status === "injected" ? startupOverview.totalNotes + startupOverview.totalSources === 0 : startupOverview?.reason === "index is empty" || startupOverview?.reason === "empty overview";
+              if (startupWasEmpty) {
+                try {
+                  injectOverview(ctx, true);
+                } catch {
+                }
+              }
             }
           } catch {
           }

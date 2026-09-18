@@ -286,10 +286,12 @@ export class KnowledgeIndex {
     relPath: string;
     sourceDir: string;
     headings: string[];
+    /** Embedding group of the file's chunks (all chunks of a file share it). */
+    group: EmbedGroup;
   }> {
     const byPath = new Map<
       string,
-      { absPath: string; relPath: string; sourceDir: string; headings: string[] }
+      { absPath: string; relPath: string; sourceDir: string; headings: string[]; group: EmbedGroup }
     >();
     for (const [key, entry] of Object.entries(this.data.entries)) {
       const absPath = this.absPathFromKey(key);
@@ -300,6 +302,7 @@ export class KnowledgeIndex {
           relPath: entry.relPath,
           sourceDir: entry.sourceDir,
           headings: [],
+          group: this.entryGroup(key, entry),
         };
         byPath.set(absPath, agg);
       }
@@ -465,7 +468,9 @@ export class KnowledgeIndex {
       };
 
       // stream-json 3.x replaced the 2.x 'done' event with the onDone option.
-      const assembler = Assembler.connectTo<IndexData>(parser, {
+      // The assembler handle itself is not needed — errors surface via the
+      // parser stream, completion via onDone.
+      Assembler.connectTo<IndexData>(parser, {
         onDone: (asm) => settle(() => resolve(asm.current)),
       });
       stream.on("error", (e) => settle(() => resolve(null), () => reject(e)));
