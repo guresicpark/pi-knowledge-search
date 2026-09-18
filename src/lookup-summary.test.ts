@@ -12,6 +12,8 @@ function result(overrides: Partial<SearchResult> & { path: string }): SearchResu
     heading: "",
     matches: 1,
     lineRanges: [],
+    sources: [],
+    group: "text",
     ...overrides,
   };
 }
@@ -99,5 +101,41 @@ describe("formatLookupSummary", () => {
 
   it("returns a bare label when neither group has entries (defensive)", () => {
     assert.equal(formatLookupSummary([], [], identity), "Knowledge lookup");
+  });
+
+  it("groups jina-code hits in their own segment, nomic first", () => {
+    const results: SearchResult[] = [
+      result({
+        path: "/v/semantic.md",
+        sources: ["nomic"],
+        group: "text",
+        lineRanges: [[1, 5]],
+      }),
+      result({
+        path: "/src/guard.ts",
+        sources: ["jina-code"],
+        group: "code",
+        lineRanges: [[10, 22]],
+      }),
+    ];
+    assert.equal(
+      formatLookupSummary(results, [], identity),
+      "Knowledge lookup — nomic (/v/semantic.md:1-5) — jina-code (/src/guard.ts:10-22)",
+    );
+  });
+
+  it("a hit surfaced by several engines renders under each (bare path for secondary)", () => {
+    const results: SearchResult[] = [
+      result({
+        path: "/src/auth.ts",
+        sources: ["jina-code", "bm25"],
+        group: "code",
+        lineRanges: [[3, 9]],
+      }),
+    ];
+    assert.equal(
+      formatLookupSummary(results, [], identity),
+      "Knowledge lookup — jina-code (/src/auth.ts:3-9) — bm25 (/src/auth.ts)",
+    );
   });
 });

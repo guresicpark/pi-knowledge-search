@@ -15,10 +15,11 @@ import {
   getConfigPath,
   getIndexDir,
   DEFAULT_FILE_EXTENSIONS,
+  DEFAULT_CODE_EXTENSIONS,
   type Config,
   type ConfigFile,
 } from "./config.js";
-import { createEmbedder, EMBEDDING_MODEL, isTransformersModelCached } from "./embedder.js";
+import { createEmbedder, EMBEDDING_MODEL, CODE_EMBEDDING_MODEL, isTransformersModelCached, type EmbedGroup } from "./embedder.js";
 import {
   KnowledgeIndex,
   type Bm25FileHit,
@@ -207,7 +208,7 @@ export default function (pi: ExtensionAPI) {
     }
     if (!currentConfig) return;
 
-    // The engine is always nomic — every configured index embeds.
+    // The engine is always nomic + jina — every configured index embeds.
     index = new KnowledgeIndex(currentConfig, createEmbedder());
     // Fire-and-forget: don't block session_start on the (potentially
     // 99 MB) JSON.parse. injectOverview below awaits this promise; the
@@ -230,7 +231,7 @@ export default function (pi: ExtensionAPI) {
     indexLoaded
       .then(() => {
         // Auto-enable the per-turn knowledge lookup whenever the index
-        // holds chunks — with the always-nomic engine, chunks imply
+        // holds chunks — with the fixed local engine, chunks imply
         // vectors. Mirrors pi-local-rag's startup auto-enable (ragEnabled
         // flips on once chunks exist). /knowledge off is therefore a
         // per-session kill-switch: the next startup with an indexed vault
@@ -445,11 +446,20 @@ export default function (pi: ExtensionAPI) {
     const label = (text: string) => theme.fg("dim", text.padEnd(20));
     const lines: string[] = [theme.bold("pi-knowledge-search"), ""];
 
+    const vectorCounts = index?.vectorCountsByGroup() ?? { code: 0, text: 0 };
     lines.push(
       "  " +
         label("Embedding engine:") +
-        theme.fg("success", EMBEDDING_MODEL) +
-        theme.fg("dim", "  (local ONNX via Transformers.js — fixed, not configurable)")
+        theme.fg("success", "nomic + jina-code") +
+        theme.fg("dim", "  (local ONNX via Transformers.js — fixed, not configurable)"),
+      "  " +
+        label("Text model:") +
+        theme.fg("dim", EMBEDDING_MODEL) +
+        theme.fg("muted", `  ${vectorCounts.text} vectors`),
+      "  " +
+        label("Code model:") +
+        theme.fg("dim", CODE_EMBEDDING_MODEL) +
+        theme.fg("muted", `  ${vectorCounts.code} vectors`),
     );
 
     if (index) {
@@ -475,9 +485,18 @@ export default function (pi: ExtensionAPI) {
       lines.push("    " + theme.fg("dim", "(none — add with /knowledge exclude <name>)"));
     }
 
+    // Extension groups, mirroring /rag ext list: code exts route to jina,
+    // the rest to nomic.
     lines.push("", "  " + theme.bold("File extensions:"));
     const exts = currentConfig?.fileExtensions ?? [];
-    lines.push("    " + theme.fg("muted", exts.join(" ")));
+    const codeExts = exts.filter((e) => currentConfig?.codeExtensions.includes(e) ?? false);
+    const textExts = exts.filter((e) => !codeExts.includes(e));
+    lines.push(
+      "    " + theme.fg("dim", "code ") + theme.fg("muted", codeExts.join(" ")),
+      "    " + theme.fg("dim", "      ") + theme.fg("dim", `→ ${CODE_EMBEDDING_MODEL}`),
+      "    " + theme.fg("dim", "text ") + theme.fg("muted", textExts.join(" ")),
+      "    " + theme.fg("dim", "      ") + theme.fg("dim", `→ ${EMBEDDING_MODEL}`),
+    );
 
     lines.push(
       "",
@@ -699,27 +718,36 @@ export default function (pi: ExtensionAPI) {
     try {
       await ensureIndexLoaded();
 
-      // Cold-start notice: a missing model triggers a ~111 MB download that
-      // can stall the first index for minutes — say so before it happens
-      // (mirrors pi-local-rag's onModelLoad).
-      if (!isTransformersModelCached(EMBEDDING_MODEL)) {
-        ctx.ui.notify(
-          `⏳ Loading embedding model: ${EMBEDDING_MODEL} — first run downloads it (~111 MB, this can take a few minutes)`,
-          "info"
-        );
-      }
-
       const theme = ctx.ui.theme;
       const verb = theme.fg("accent", "Indexing");
+      // Cold-start notices: a missing model triggers a download that can
+      // stall the first index for minutes — say so before it happens
+      // (mirrors pi-local-rag's onModelLoad). Gated per group on the scan
+      // result so jina is only announced when code files are actually
+      // being indexed.
+      const modelLoadAnnounced = new Set<EmbedGroup>();
+      const announceModelLoad = (group: EmbedGroup, model: string) => {
+        if (modelLoadAnnounced.has(group) || isTransformersModelCached(model)) return;
+        modelLoadAnnounced.add(group);
+        const size = group === "code" ? "~170 MB" : "~111 MB";
+        ctx.ui.notify(
+          `⏳ Loading ${group} embedding model: ${model} — first run downloads it (${size}, this can take a few minutes)`,
+          "info"
+        );
+      };
+
       const { added, updated, removed } = await index!.sync({
         onProgress: (p: SyncProgress) => {
           if (p.phase === "scan") {
             const label =
               p.filesToProcess > 0
-                ? `Found ${p.filesToProcess} file(s) to index · ${p.unchanged} unchanged · ${p.totalChunks} chunks`
+                ? `Found ${p.filesToProcess} file(s) to index · ${p.unchanged} unchanged · ${p.totalChunks} chunks (${p.chunksByGroup.code} code · ${p.chunksByGroup.text} text)`
                 : `Nothing to index · ${p.unchanged} files unchanged`;
             ctx.ui.setStatus("knowledge-search", `■ Scanning… ${label}`);
             ctx.ui.setWidget("knowledge-search", [verb, theme.fg("dim", label)]);
+            // Fire the scan result before the embed work starts (mirrors pi-local-rag's onModelLoad).
+            if (p.chunksByGroup.text > 0) announceModelLoad("text", EMBEDDING_MODEL);
+            if (p.chunksByGroup.code > 0) announceModelLoad("code", CODE_EMBEDDING_MODEL);
             return;
           }
           if (p.phase === "embed") {
@@ -729,10 +757,18 @@ export default function (pi: ExtensionAPI) {
               "knowledge-search",
               `■ Indexing ${percent}% │ ${p.done}/${p.total} chunks`
             );
+            // One line per embedding model (code → jina, text → nomic),
+            // like pi-local-rag's embed progress widget.
+            const groupLines = (["code", "text"] as const).map((group) => {
+              const done = p.doneByGroup[group];
+              const total = p.totalByGroup[group];
+              const model = group === "code" ? "jina-code" : "nomic";
+              return `${theme.fg("dim", `${group.padEnd(5)} ${done}/${total}`)}  ${theme.fg("muted", model)}`;
+            });
             ctx.ui.setWidget("knowledge-search", [
               `${verb}  ${bar}  ${theme.fg("success", `${percent}%`)}`,
               `${theme.fg("dim", "file:    ")}${p.currentFile ?? "…"}`,
-              `${theme.fg("dim", "chunks:  ")}${theme.fg("success", String(p.done))}/${p.total}`,
+              ...groupLines,
             ]);
             return;
           }
@@ -743,7 +779,7 @@ export default function (pi: ExtensionAPI) {
       clearProgressUI();
 
       // Like /rag index: flip injection on as soon as the store actually
-      // has chunks (always-nomic ⇒ vectors), so a fresh index doesn't need
+      // has chunks (fixed local engine ⇒ vectors), so a fresh index doesn't need
       // a manual `on`.
       if (currentConfig && index!.chunkCount() > 0 && !currentConfig.autoInject) {
         const file = readRawConfig();
@@ -849,13 +885,15 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Reset the config to fresh install defaults at the default location.
-    // The embedding engine is not part of the config — it is always nomic.
+    // The embedding engine is not part of the config — it is always nomic
+    // (text) + jina (code); codeExtensions persists the code-group routing.
     // The HuggingFace model cache is machine-wide and shared with
     // pi-local-rag, so it is intentionally NOT touched.
     saveConfig(
       {
         dirs: [],
         fileExtensions: DEFAULT_FILE_EXTENSIONS,
+        codeExtensions: DEFAULT_CODE_EXTENSIONS,
         excludeDirs: ["node_modules", ".git", ".obsidian", ".trash"],
       },
       sessionCwd

@@ -1,6 +1,6 @@
 # pi-knowledge-search
 
-Hybrid **local** search over local files for [pi](https://github.com/badlogic/pi). Indexes directories of text/markdown files using local ONNX vector embeddings (always `nomic-ai/nomic-embed-text-v1.5` — the engine is fixed, not configurable) **and** SQLite FTS5 keyword search, exposes `knowledge_search` + `knowledge_kb_read` tools the LLM can call, and auto-injects a knowledge lookup on every prompt (like pi-local-rag's RAG lookup). Everything runs on your machine — no embedding APIs, no cloud services. Indexing runs on session startup; mid-session file changes are picked up with `/knowledge index`.
+Hybrid **local** search over local files for [pi](https://github.com/badlogic/pi). Indexes directories of text/markdown files using local ONNX vector embeddings from two dedicated models (`nomic-ai/nomic-embed-text-v1.5` for prose, `jinaai/jina-embeddings-v2-base-code` for source code — the engine is fixed, not configurable) **and** SQLite FTS5 keyword search, exposes `knowledge_search` + `knowledge_kb_read` tools the LLM can call, and auto-injects a knowledge lookup on every prompt (like pi-local-rag's RAG lookup). Everything runs on your machine — no embedding APIs, no cloud services. Indexing runs on session startup; mid-session file changes are picked up with `/knowledge index`.
 
 On session start, injects a folder+keyword overview of the indexed vault as a custom message so the model knows what’s worth searching for before it asks.
 
@@ -9,21 +9,23 @@ On session start, injects a folder+keyword overview of the indexed vault as a cu
 Like pi-local-rag's RAG lookup, every user prompt triggers an automatic **knowledge lookup**: the prompt runs through hybrid search (top 5 chunks, min score 0.1) and the hits are injected as a message right after the prompt — full excerpts for the model, and a green summary box for you (red on failure):
 
 ```
-Knowledge lookup — nomic (event_dispatcher.rst:1-8,9-37,notes/a.md:12-25) — bm25 (dir/file1:2-10,dir2/file:22-50)
+Knowledge lookup — nomic (event_dispatcher.rst:1-8,9-37,notes/a.md:12-25), jina-code (src/auth.ts:1-9) — bm25 (dir/file1:2-10,dir2/file:22-50)
 ```
 
-Each group lists `file:start-end,…` entries with the exact line ranges where the hits live; a bare number is a single-line hit. The **nomic** group holds the fused hits the vector side drove into the ranking; the **bm25** group holds the keyword side's view — hits the BM25 term dominated (e.g. exact error-code matches the embeddings treat as noise) plus files only the FTS5 side-car found. A group is omitted when empty, so a pure-keyword fallback renders as `Knowledge lookup — bm25 (…)`. Line ranges only appear on entries indexed by the current format (index version 4) — entries from an older-but-compatible index are kept as-is on load (no re-embedding) and fall back to a `file (n)` hit count until the file is next re-indexed.
+Each group lists `file:start-end,…` entries with the exact line ranges where the hits live; a bare number is a single-line hit. The **nomic** group holds the prose hits surfaced by the nomic vector space, **jina-code** the code hits surfaced by the jina vector space — a hit found by several engines renders under each (secondary attributions as a bare path). The **bm25** group holds the keyword side's view — hits the BM25 term dominated (e.g. exact error-code matches the embeddings treat as noise) plus files only the FTS5 side-car found. A group is omitted when empty, so a pure-keyword fallback renders as `Knowledge lookup — bm25 (…)`. Line ranges only appear on entries indexed by the current format (index version 5) — entries from an older-but-compatible index are kept as-is on load (no re-embedding) and fall back to a `file (n)` hit count until the file is next re-indexed.
 
 Injection is automatically enabled whenever the index holds vectors — at session start and after `/knowledge index` — so `/knowledge off` acts as a per-session kill-switch that the next startup flips back on (`autoInject` in the config).
 
 ## How search works
 
-Every query runs against two backends and blends the results exactly like pi-local-rag's hybrid search — `0.4 × BM25 + 0.6 × vector`:
+Every query runs against three backends and blends the results exactly like pi-local-rag's hybrid search — `0.4 × BM25 + 0.6 × vector`:
 
-- **Vector cosine similarity** — good for conceptual/fuzzy queries ("how did we handle X"). Raw cosine on the unit-normalized nomic embeddings, clamped at 0.
+- **Vector cosine similarity, two spaces** — good for conceptual/fuzzy queries ("how did we handle X"). Prose chunks live in the nomic space, code chunks in the jina space; each space's query is embedded with its own model (only when that space has stored vectors), and a chunk is only ever scored against its own space's query vector. Raw cosine on the unit-normalized embeddings, clamped at 0.
 - **BM25 full-text** via SQLite FTS5 — good for exact matches, proper nouns, error strings, file paths, code identifiers. Raw BM25 scores are min-max normalized across the candidate set and get a 1.5× boost (capped at 1) when the first meaningful query term appears in the file path.
 
-Multi-term queries use implicit AND (space-separated quoted phrases), matching pi-local-rag, so chunks missing a term are excluded rather than diluting the result set. Either backend alone still surfaces relevant hits: if the embedder fails transiently, search falls back to pure BM25; if the FTS side-car is empty, it falls back to pure vector. Indexes predating the fixed engine are re-embedded once on upgrade (see [Engine-signature invalidation](#engine-signature-invalidation)).
+Multi-term queries use implicit AND (space-separated quoted phrases), matching pi-local-rag, so chunks missing a term are excluded rather than diluting the result set. Either backend alone still surfaces relevant hits: if the embedder fails transiently, search falls back to pure BM25; if the FTS side-car is empty, it falls back to pure vector.
+
+**Result totals, proportions, and relevance floors** mirror pi-local-rag's dual-space selection: the result total is **7 slots when both embedding spaces store vectors, else 5** (capped by `limit`), split between code and prose **in proportion to each space's stored vector count** (integer quotas, at least 1 per group, code group first; a group that can't fill its quota yields the slack to the other group). Each group enforces its own relevance floor — **0.35 for jina-code hits, 0.4 for everything else** — so unrelated hits never pad the list, and a code hit ranked below 0.4 but above 0.35 still survives. Indexes predating the dual-model engine keep their nomic vectors and only re-embed code files (see [Engine-signature invalidation](#engine-signature-invalidation)).
 
 ## Tools
 
@@ -31,7 +33,7 @@ The extension registers two LLM-facing tools:
 
 | Tool                | What it does                                                                                                                                                                                                              |
 | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `knowledge_search`  | Hybrid vector + BM25 search over indexed files (pi-local-rag's alpha blend: 0.4 × BM25 + 0.6 × vector). Returns passage-level excerpts.                                                                                   |
+| `knowledge_search`  | Hybrid vector + BM25 search over indexed files (pi-local-rag's alpha blend: 0.4 × BM25 + 0.6 × vector, dual nomic/jina vector spaces with ratio-based result quotas). Returns passage-level excerpts.                                        |
 | `knowledge_kb_read` | Resolve a note reference — `[[wikilink]]`, basename, or relative path — to an indexed file and return its full content. Use when the model knows a note's name but not its full path, instead of running find/grep first. |
 
 `knowledge_kb_read` handles `[[Foo]]`, `[[Foo|alias]]`, `[[Foo#Heading]]`, bare names with or without extension (`Foo`, `Foo.md`), and relative paths (`evergreen/foo`). Multi-match references get a disambiguation prompt instead of guessing.
@@ -136,27 +138,37 @@ All fields except `dirs` are optional — the example shows the defaults for `ex
 
 `autoInject` (default `true`) controls the per-turn knowledge lookup; it is re-enabled automatically at startup while the index holds vectors.
 
-Default `fileExtensions` mirror the extensions pi-local-rag's nomic model indexes:
+Default `fileExtensions` mirror the union of pi-local-rag's two embedding groups:
 
 ```
-.md .mdx .txt .rst .html .htm .json .jsonc .yaml .yml .toml .ini .xml .csv .tsv .env .gitignore .dockerfile
+code → jina:  .ts .tsx .js .jsx .mjs .cjs .py .rs .go .java .kt .kts .scala .c .cc .cpp .cxx
+              .h .hpp .hxx .cs .fs .vb .swift .m .mm .rb .php .pl .lua .dart .ex .exs .erl
+              .clj .cljs .edn .vue .svelte .astro .twig .css .scss .sass .less .sh .bash
+              .zsh .fish .ps1 .sql .graphql .gql .proto .tf .hcl
+text → nomic: .md .mdx .txt .rst .html .htm .json .jsonc .yaml .yml .toml .ini .xml .csv
+              .tsv .env .gitignore .dockerfile
 ```
 
-(.pdf/.docx also go to nomic in pi-local-rag but need extraction libraries and are not indexed here.) Extension matching is case-insensitive; code extensions (`.ts`, `.py`, …) are not in nomic's group — set `fileExtensions` explicitly if you want them.
+(.pdf/.docx also go to nomic in pi-local-rag but need extraction libraries and are not indexed here.) Extension matching is case-insensitive. A `codeExtensions` config key (default: the code list above) controls which extensions route to the jina model; everything else in `fileExtensions` goes to nomic. `KNOWLEDGE_SEARCH_CODE_EXTENSIONS` overrides it via env.
 
 Files larger than **500 KB** are skipped during scanning (mirroring pi-local-rag's `TEXT_MAX_BYTES`) — this keeps minified bundles, dumped JSON/CSV, and base64 blobs from blowing up read time, chunk count, and embedding wall time. Files that exceed the cap after having been indexed are dropped on the next sync.
 
-> **Migrating from older configs:** legacy `provider` and `dimensions` keys are ignored — the embedding engine is always nomic and not configurable. Vectors previously built by any other engine are removed on the first load after upgrading, and the next sync re-embeds everything with nomic.
+> **Migrating from older configs:** legacy `provider` and `dimensions` keys are ignored — the embedding engine is always nomic (text) + jina (code) and not configurable. Vectors previously built by any other engine are removed on the first load after upgrading, and the next sync re-embeds everything.
 
-### Embedding engine (always nomic)
+### Embedding engine (always nomic + jina-code)
 
-The embedding engine is fixed: `nomic-ai/nomic-embed-text-v1.5` (768-dim, q8 quantized) via [Transformers.js](https://huggingface.co/docs/transformers.js) local ONNX inference — no API key, no server, no configuration. It uses the model's `search_query:` / `search_document:` task prefixes, mirroring pi-local-rag's text pipeline. Model weights are downloaded once (~111 MB) into a shared HuggingFace cache (`~/.cache/huggingface/transformers` by default, or `PI_RAG_MODEL_CACHE` / `TRANSFORMERS_CACHE` / `HF_HOME`), so pi-knowledge-search and pi-local-rag reuse the same download. `/knowledge index` shows a notice before the first download.
+The embedding engine is fixed, mirroring pi-local-rag's two embedding groups:
+
+- **Text/prose:** `nomic-ai/nomic-embed-text-v1.5` (768-dim, q8 quantized) — uses the model's `search_query:` / `search_document:` task prefixes. Documents embed with the same `Title: path > heading` context line as before.
+- **Code:** `jinaai/jina-embeddings-v2-base-code` (768-dim, q8 quantized) — takes no task prefixes; document chunks embed with the file **basename as a context line** (pi-local-rag's file-context scheme), anchoring filename-oriented queries without touching the stored chunk content.
+
+Both run via [Transformers.js](https://huggingface.co/docs/transformers.js) local ONNX inference — no API key, no server, no configuration. Weights are downloaded once (~111 MB nomic, ~170 MB jina-code) into a shared HuggingFace cache (`~/.cache/huggingface/transformers` by default, or `PI_RAG_MODEL_CACHE` / `TRANSFORMERS_CACHE` / `HF_HOME`), so pi-knowledge-search and pi-local-rag reuse the same downloads. `/knowledge index` shows a notice before the first download of each model (jina only when code files are being indexed).
 
 Transformers.js pulls in `sharp` (for vision preprocessing); since pi loads pi-local-rag alongside this extension in the same process, `sharp` is pinned to exactly the same version pi-local-rag resolves (0.35.3 → libvips 8.18.3) via npm `overrides`. Loading two different libvips dylibs into one process makes macOS objc emit a duplicate-class warning (`GNotificationCenterDelegate implemented in both …`) that can cause spurious casting failures and mysterious crashes.
 
 ### Engine-signature invalidation
 
-Vectors from different engines, models, or dimensionalities are not comparable. The index records the signature of the engine that built it — now the constant `transformers:nomic-ai/nomic-embed-text-v1.5:768`. On load, a mismatch (any index predating the fixed engine, or built by a removed remote provider) removes all existing embeddings and the next sync re-embeds everything with nomic.
+Vectors from different engines, models, or dimensionalities are not comparable. The index records the signature of the engine that built it — now the constant `transformers:nomic-ai/nomic-embed-text-v1.5+jinaai/jina-embeddings-v2-base-code:768`. On load, a mismatch with any other engine removes all existing embeddings and the next sync re-embeds everything. The one exception is the **legacy nomic-only signature** (`transformers:nomic-ai/nomic-embed-text-v1.5:768`): its prose vectors are still valid, so on first load after upgrading to the dual-model engine the index is adopted as-is and only **code-group files are dropped** — the next sync re-embeds just those with jina.
 
 ### Environment variable overrides
 
@@ -164,7 +176,7 @@ Every config field can be overridden via environment variables. This is useful f
 
 ## How it works
 
-1. On session start, loads the index from disk and incrementally syncs — re-indexes new or modified files and drops deleted ones, across every configured directory. Older-but-compatible indexes (e.g. a pre-line-tracking version 3) are adopted as-is without a full re-embed; only an embedding-engine change (or a pre-chunk flat index) forces re-embedding everything. Files at or above 500 KB are skipped (see [Setup](#setup))
+1. On session start, loads the index from disk and incrementally syncs — re-indexes new or modified files and drops deleted ones, across every configured directory. Code files embed with jina, everything else with nomic (per-model progress lines in `/knowledge index`). Older-but-compatible indexes (e.g. a pre-line-tracking version 3) are adopted as-is without a full re-embed; only an embedding-engine change (or a pre-chunk flat index) forces re-embedding. Files at or above 500 KB are skipped (see [Setup](#setup))
 2. Registers two LLM-facing tools: `knowledge_search` for hybrid ranked search and `knowledge_kb_read` for resolving a note reference to a full file (see [Tools](#tools))
 3. Before every agent turn, runs an automatic knowledge lookup on the prompt and injects the top hits as a message right after it (see [Knowledge lookup](#knowledge-lookup))
 4. Returns ranked results with file paths, relevance scores, content excerpts, and the exact line ranges of each hit

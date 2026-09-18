@@ -24,6 +24,7 @@ const envKeys = [
 let loadConfig: (typeof import("./config.js"))["loadConfig"];
 let getConfigPath: (typeof import("./config.js"))["getConfigPath"];
 let saveConfig: (typeof import("./config.js"))["saveConfig"];
+let classifyFileGroup: (typeof import("./config.js"))["classifyFileGroup"];
 
 const originalEnv: Record<string, string | undefined> = {};
 
@@ -47,6 +48,7 @@ describe("config", () => {
     loadConfig = configModule.loadConfig;
     getConfigPath = configModule.getConfigPath;
     saveConfig = configModule.saveConfig;
+    classifyFileGroup = configModule.classifyFileGroup;
   });
 
   beforeEach(() => {
@@ -124,8 +126,20 @@ describe("config", () => {
 
     const config = loadConfig();
     assert.ok(config);
-    // Defaults mirror pi-local-rag's nomic text group (DEFAULT_DOC_EXTS).
+    // Defaults mirror pi-local-rag's extension groups (DEFAULT_TEXT_EXTS):
+    // code extensions ride the jina model, everything else nomic.
     assert.deepStrictEqual(config.fileExtensions, [
+      ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+      ".py", ".rs", ".go", ".java", ".kt", ".kts", ".scala",
+      ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hxx",
+      ".cs", ".fs", ".vb",
+      ".swift", ".m", ".mm",
+      ".rb", ".php", ".pl", ".lua", ".dart", ".ex", ".exs", ".erl", ".clj", ".cljs", ".edn",
+      ".vue", ".svelte", ".astro", ".twig",
+      ".css", ".scss", ".sass", ".less",
+      ".sh", ".bash", ".zsh", ".fish", ".ps1",
+      ".sql", ".graphql", ".gql", ".proto",
+      ".tf", ".hcl",
       ".md", ".mdx", ".txt", ".rst",
       ".html", ".htm",
       ".json", ".jsonc", ".yaml", ".yml", ".toml", ".ini", ".xml", ".csv", ".tsv",
@@ -136,6 +150,9 @@ describe("config", () => {
     assert.ok(config.excludeDirs.includes(".obsidian"));
     assert.ok(config.excludeDirs.includes(".trash"));
     assert.equal(config.dimensions, 768);
+    // Code-group classification defaults to pi-local-rag's code list.
+    assert.ok(config.codeExtensions.includes(".ts"));
+    assert.ok(!config.codeExtensions.includes(".md"));
   });
 
   it("lowercases file extensions from file and env", () => {
@@ -172,7 +189,7 @@ describe("config", () => {
     }
   });
 
-  it("the engine is always nomic — constant signature and dimensions", () => {
+  it("the engine is always nomic + jina — constant signature and dimensions", () => {
     fs.writeFileSync(
       configFile,
       JSON.stringify({ dirs: ["/tmp/docs"] })
@@ -181,7 +198,22 @@ describe("config", () => {
     const config = loadConfig();
     assert.ok(config);
     assert.equal(config.dimensions, 768);
-    assert.equal(config.modelSignature, "transformers:nomic-ai/nomic-embed-text-v1.5:768");
+    assert.equal(
+      config.modelSignature,
+      "transformers:nomic-ai/nomic-embed-text-v1.5+jinaai/jina-embeddings-v2-base-code:768"
+    );
+  });
+
+  it("classifies files into embedding groups by extension (pi-local-rag's classifyFile)", () => {
+    assert.equal(classifyFileGroup("/v/auth.ts"), "code");
+    assert.equal(classifyFileGroup("/v/Auth.tsx"), "code");
+    assert.equal(classifyFileGroup("/v/schema.sql"), "code");
+    assert.equal(classifyFileGroup("/v/note.md"), "text");
+    assert.equal(classifyFileGroup("/v/config.yaml"), "text");
+    assert.equal(classifyFileGroup("/v/no-extension"), "text");
+    // Custom code list overrides the default.
+    assert.equal(classifyFileGroup("/v/custom.weird", [".weird"]), "code");
+    assert.equal(classifyFileGroup("/v/auth.ts", [".weird"]), "text");
   });
 
   it("ignores legacy provider/dimensions keys instead of throwing", () => {
@@ -195,11 +227,14 @@ describe("config", () => {
     );
 
     // The engine is fixed; legacy keys are ignored (with a warning to
-    // stderr) and the nomic signature/dimensions still apply.
+    // stderr) and the dual-model signature/dimensions still apply.
     const config = loadConfig();
     assert.ok(config);
     assert.equal(config.dimensions, 768);
-    assert.equal(config.modelSignature, "transformers:nomic-ai/nomic-embed-text-v1.5:768");
+    assert.equal(
+      config.modelSignature,
+      "transformers:nomic-ai/nomic-embed-text-v1.5+jinaai/jina-embeddings-v2-base-code:768"
+    );
   });
 
   it("autoInject defaults to true and can be overridden by file and env", () => {

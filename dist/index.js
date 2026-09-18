@@ -10,13 +10,19 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 // src/embedder.ts
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 var EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5";
 var EMBEDDING_DIMENSIONS = 768;
+var CODE_EMBEDDING_MODEL = "jinaai/jina-embeddings-v2-base-code";
+function embeddingModelFor(group) {
+  return group === "code" ? CODE_EMBEDDING_MODEL : EMBEDDING_MODEL;
+}
+var TRANSFORMERS_QUERY_PREFIX = "search_query: ";
+var CODE_QUERY_PREFIX = "";
 function createEmbedder() {
-  return new TransformersEmbedder(EMBEDDING_MODEL);
+  return new TransformersEmbedder();
 }
 function truncate(text, maxChars = 1e4) {
   return text.length > maxChars ? text.slice(0, maxChars) : text;
@@ -26,8 +32,10 @@ function summarizeErrors(errs, max = 3) {
   const shown = list.slice(0, max).join("; ");
   return list.length > max ? `${shown} (+${list.length - max} more)` : shown;
 }
-var TRANSFORMERS_QUERY_PREFIX = "search_query: ";
-var TRANSFORMERS_DOC_PREFIX = "search_document: ";
+function buildQueryInput(group, text) {
+  const prefix = group === "code" ? CODE_QUERY_PREFIX : TRANSFORMERS_QUERY_PREFIX;
+  return prefix + text.replace(/\s+/g, " ").trim();
+}
 var TRANSFORMERS_BATCH_SIZE = 16;
 function resolveTransformersCacheDir() {
   if (process.env.PI_RAG_MODEL_CACHE) return process.env.PI_RAG_MODEL_CACHE;
@@ -39,46 +47,46 @@ function isTransformersModelCached(model) {
   return existsSync(join(resolveTransformersCacheDir(), model, "onnx", "model_quantized.onnx"));
 }
 var TransformersEmbedder = class {
-  model;
-  pipelinePromise = null;
-  constructor(model) {
-    this.model = model;
-  }
+  /** One pipeline load promise per group so both models coexist lazily. */
+  pipelinePromises = /* @__PURE__ */ new Map();
   /**
-   * Lazily load the ONNX feature-extraction pipeline (q8 quantized weights).
-   * The load promise is cached so concurrent first calls share a single
-   * download; a failed load is evicted so the next call retries.
+   * Lazily load the ONNX feature-extraction pipeline (q8 quantized weights)
+   * for a group. The load promise is cached so concurrent first calls share
+   * a single download; a failed load is evicted so the next call retries.
    */
-  getPipeline() {
-    if (!this.pipelinePromise) {
-      this.pipelinePromise = (async () => {
-        const { pipeline, env } = await import("@huggingface/transformers");
-        env.cacheDir = resolveTransformersCacheDir();
-        return pipeline("feature-extraction", this.model, { dtype: "q8" });
-      })();
-      this.pipelinePromise.catch(() => {
-        this.pipelinePromise = null;
-      });
-    }
-    return this.pipelinePromise;
+  getPipeline(group) {
+    const existing = this.pipelinePromises.get(group);
+    if (existing) return existing;
+    const loadPromise = (async () => {
+      const { pipeline, env } = await import("@huggingface/transformers");
+      env.cacheDir = resolveTransformersCacheDir();
+      return pipeline("feature-extraction", embeddingModelFor(group), { dtype: "q8" });
+    })();
+    this.pipelinePromises.set(group, loadPromise);
+    loadPromise.catch(() => {
+      this.pipelinePromises.set(group, null);
+    });
+    return loadPromise;
   }
-  async embed(text, signal) {
+  async embed(text, group = "text", signal) {
     if (signal?.aborted) throw new Error("Aborted");
-    const pipe = await this.getPipeline();
-    const input = TRANSFORMERS_QUERY_PREFIX + text.replace(/\s+/g, " ").trim();
-    const output = await pipe(truncate(input), { pooling: "mean", normalize: true });
+    const pipe = await this.getPipeline(group);
+    const output = await pipe(truncate(buildQueryInput(group, text)), {
+      pooling: "mean",
+      normalize: true
+    });
     return Array.from(output.data);
   }
-  async embedBatch(texts, signal, _concurrency) {
+  async embedBatch(texts, group = "text", signal, _concurrency) {
     const results = new Array(texts.length).fill(null);
     if (texts.length === 0) return results;
     let failed = 0;
     const errs = /* @__PURE__ */ new Set();
     try {
-      const pipe = await this.getPipeline();
+      const pipe = await this.getPipeline(group);
       for (let start = 0; start < texts.length; start += TRANSFORMERS_BATCH_SIZE) {
         if (signal?.aborted) throw new Error("Aborted");
-        const batch = texts.slice(start, start + TRANSFORMERS_BATCH_SIZE).map((t) => TRANSFORMERS_DOC_PREFIX + truncate(t));
+        const batch = texts.slice(start, start + TRANSFORMERS_BATCH_SIZE).map((t) => truncate(t));
         const output = await pipe(batch, { pooling: "mean", normalize: true });
         const flattened = output.data;
         const dim = flattened.length / batch.length;
@@ -91,7 +99,7 @@ var TransformersEmbedder = class {
       errs.add(err.message);
       if (failed > 0) {
         console.error(
-          `Transformers embedding failed for ${failed}/${texts.length} chunks: ${summarizeErrors(errs)}`
+          `Transformers embedding failed for ${failed}/${texts.length} chunks (${embeddingModelFor(group)}): ${summarizeErrors(errs)}`
         );
       }
     }
@@ -100,7 +108,65 @@ var TransformersEmbedder = class {
 };
 
 // src/config.ts
-var DEFAULT_FILE_EXTENSIONS = [
+var DEFAULT_CODE_EXTENSIONS = [
+  ".ts",
+  ".tsx",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+  ".py",
+  ".rs",
+  ".go",
+  ".java",
+  ".kt",
+  ".kts",
+  ".scala",
+  ".c",
+  ".cc",
+  ".cpp",
+  ".cxx",
+  ".h",
+  ".hpp",
+  ".hxx",
+  ".cs",
+  ".fs",
+  ".vb",
+  ".swift",
+  ".m",
+  ".mm",
+  ".rb",
+  ".php",
+  ".pl",
+  ".lua",
+  ".dart",
+  ".ex",
+  ".exs",
+  ".erl",
+  ".clj",
+  ".cljs",
+  ".edn",
+  ".vue",
+  ".svelte",
+  ".astro",
+  ".twig",
+  ".css",
+  ".scss",
+  ".sass",
+  ".less",
+  ".sh",
+  ".bash",
+  ".zsh",
+  ".fish",
+  ".ps1",
+  ".sql",
+  ".graphql",
+  ".gql",
+  ".proto",
+  ".tf",
+  ".hcl"
+];
+var DEFAULT_DOC_EXTENSIONS = [
   ".md",
   ".mdx",
   ".txt",
@@ -120,6 +186,13 @@ var DEFAULT_FILE_EXTENSIONS = [
   ".gitignore",
   ".dockerfile"
 ];
+var DEFAULT_FILE_EXTENSIONS = [...DEFAULT_CODE_EXTENSIONS, ...DEFAULT_DOC_EXTENSIONS];
+function classifyFileGroup(filePath, codeExtensions) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (!ext) return "text";
+  const codeExts = codeExtensions ?? DEFAULT_CODE_EXTENSIONS;
+  return codeExts.includes(ext) ? "code" : "text";
+}
 function defaultConfigFile(cwd) {
   return path.join(cwd || process.cwd(), ".pi", "knowledge-search.json");
 }
@@ -180,10 +253,11 @@ function loadConfig(cwd) {
   if (dirs.length === 0) return null;
   const fileExtensions = (envStr("KNOWLEDGE_SEARCH_EXTENSIONS")?.split(",").map((e) => e.trim().toLowerCase()) ?? file?.fileExtensions?.map((e) => e.toLowerCase()) ?? DEFAULT_FILE_EXTENSIONS).filter(Boolean);
   const excludeDirs = envStr("KNOWLEDGE_SEARCH_EXCLUDE")?.split(",").map((d) => d.trim()) ?? file?.excludeDirs ?? ["node_modules", ".git", ".obsidian", ".trash"];
+  const codeExtensions = envStr("KNOWLEDGE_SEARCH_CODE_EXTENSIONS")?.split(",").map((e) => e.trim().toLowerCase()).filter(Boolean) ?? file?.codeExtensions?.map((e) => e.toLowerCase()) ?? DEFAULT_CODE_EXTENSIONS;
   const legacy = file;
   if (legacy && (legacy.provider !== void 0 || legacy.dimensions !== void 0)) {
     console.error(
-      'pi-knowledge-search: ignoring "provider"/"dimensions" config keys \u2014 the embedding engine is always nomic-embed-text-v1.5 (local ONNX).'
+      'pi-knowledge-search: ignoring "provider"/"dimensions" config keys \u2014 the embedding engine is always nomic-embed-text-v1.5 (text) + jina-embeddings-v2-base-code (code), local ONNX.'
     );
   }
   const indexDir = getIndexDir(cwd);
@@ -197,9 +271,10 @@ function loadConfig(cwd) {
   return {
     dirs,
     fileExtensions,
+    codeExtensions,
     excludeDirs,
     dimensions: EMBEDDING_DIMENSIONS,
-    modelSignature: `transformers:${EMBEDDING_MODEL}:${EMBEDDING_DIMENSIONS}`,
+    modelSignature: `transformers:${EMBEDDING_MODEL}+${CODE_EMBEDDING_MODEL}:${EMBEDDING_DIMENSIONS}`,
     indexDir,
     autoInject: envBool("KNOWLEDGE_SEARCH_AUTO_INJECT") ?? file?.autoInject ?? true,
     overview
@@ -781,7 +856,19 @@ function toFtsQuery(q) {
 }
 
 // src/index-store.ts
-var INDEX_VERSION = 4;
+var RESULT_TOTAL_QUOTA = 5;
+var RESULT_TOTAL_QUOTA_DUAL_SPACE = 7;
+var MIN_HYBRID_SCORE_CODE = 0.35;
+var MIN_HYBRID_SCORE_TEXT = 0.4;
+function splitResultQuotas(total, codeVectorCount, proseVectorCount) {
+  if (total < 2) return { codeQuota: total, proseQuota: 0 };
+  const vectorTotal = codeVectorCount + proseVectorCount;
+  const codeShare = vectorTotal > 0 ? codeVectorCount / vectorTotal : 0.5;
+  const codeQuota = Math.min(total - 1, Math.max(1, Math.round(total * codeShare)));
+  return { codeQuota, proseQuota: total - codeQuota };
+}
+var INDEX_VERSION = 5;
+var LEGACY_TEXT_ONLY_SIGNATURE = `transformers:${EMBEDDING_MODEL}:${EMBEDDING_DIMENSIONS}`;
 var MIN_LOADABLE_INDEX_VERSION = 3;
 var MAX_EXCERPT_LENGTH = 3500;
 var TEXT_MAX_BYTES = 5e5;
@@ -883,9 +970,27 @@ var KnowledgeIndex = class _KnowledgeIndex {
           parsed = JSON.parse(raw);
         }
         const dimsOk = this.isFtsOnly || parsed?.dimensions === this.config.dimensions;
-        const sigOk = this.isFtsOnly || parsed?.embeddingModel === this.config.modelSignature;
+        const sigOk = this.isFtsOnly || parsed?.embeddingModel === this.config.modelSignature || parsed?.embeddingModel === LEGACY_TEXT_ONLY_SIGNATURE;
         if (parsed && parsed.version >= MIN_LOADABLE_INDEX_VERSION && parsed.version <= INDEX_VERSION && dimsOk && sigOk) {
           this.data = { ...parsed, version: INDEX_VERSION };
+          if (!this.isFtsOnly && parsed.embeddingModel === LEGACY_TEXT_ONLY_SIGNATURE) {
+            const staleCodePaths = /* @__PURE__ */ new Set();
+            for (const key of Object.keys(this.data.entries)) {
+              const entry = this.data.entries[key];
+              if (this.entryGroup(key, entry) === "code") {
+                staleCodePaths.add(this.absPathFromKey(key));
+              }
+            }
+            for (const key of Object.keys(this.data.entries)) {
+              if (staleCodePaths.has(this.absPathFromKey(key))) {
+                delete this.data.entries[key];
+              }
+            }
+            this.data.embeddingModel = this.config.modelSignature;
+            for (const absPath of staleCodePaths) {
+              this.fts.deleteByAbsPath(absPath);
+            }
+          }
         }
       } catch {
       }
@@ -1047,6 +1152,30 @@ var KnowledgeIndex = class _KnowledgeIndex {
     return hashIdx >= 0 ? key.slice(0, hashIdx) : key;
   }
   /**
+   * Embedding group an entry belongs to — the group recorded at index time,
+   * or derived from the file extension for entries predating the field
+   * (all-text legacy indexes; those entries' code-group counterparts were
+   * dropped on load).
+   */
+  entryGroup(key, entry) {
+    return entry.group ?? classifyFileGroup(this.absPathFromKey(key), this.config.codeExtensions);
+  }
+  /**
+   * Stored vector counts per embedding space (entries with an actual
+   * vector). Drives which spaces get a query embedding and the ratio-based
+   * result quota split — pi-local-rag's per-table embeddedCount.
+   */
+  vectorCountsByGroup() {
+    let code = 0;
+    let text = 0;
+    for (const [key, entry] of Object.entries(this.data.entries)) {
+      if (!entry.vector || entry.vector.length === 0) continue;
+      if (this.entryGroup(key, entry) === "code") code += 1;
+      else text += 1;
+    }
+    return { code, text };
+  }
+  /**
    * Remove all chunks for a given absolute file path from both the vector
    * store and the FTS side-car.
    */
@@ -1068,9 +1197,20 @@ var KnowledgeIndex = class _KnowledgeIndex {
     return toRemove.length;
   }
   /**
-   * Prepare embedding text for a chunk with title context.
+   * Prepare embedding text for a chunk, per embedding group:
+   *
+   * - text (nomic): title/heading context line, as before.
+   * - code (jina): the file basename as a context line — pi-local-rag's
+   *   file-context scheme. jina-code was trained on code-with-context
+   *   pairs (docstring/question → code); a bare slice loses its file
+   *   identity, and the basename anchors filename-oriented queries without
+   *   touching the stored chunk content or FTS text.
    */
-  chunkEmbedText(relPath, heading, chunkText) {
+  chunkEmbedText(group, relPath, heading, chunkText) {
+    if (group === "code") {
+      return `${path2.basename(relPath)}
+${chunkText}`;
+    }
     const title = relPath.replace(/\.[^.]+$/, "").replace(/\//g, " > ");
     const sectionContext = heading && heading !== "intro" ? ` > ${heading}` : "";
     return `Title: ${title}${sectionContext}
@@ -1119,15 +1259,20 @@ ${chunkText}`;
     const report = opts?.onProgress;
     if (toProcess.length > 0) {
       const allChunkTexts = [];
+      const allChunkGroups = [];
       const chunkMeta = [];
       for (let fi = 0; fi < toProcess.length; fi++) {
         const file = toProcess[fi];
+        const group = classifyFileGroup(file.absPath, this.config.codeExtensions);
         for (let ci = 0; ci < file.chunks.length; ci++) {
           const chunk = file.chunks[ci];
-          allChunkTexts.push(this.chunkEmbedText(file.relPath, chunk.heading, chunk.text));
+          allChunkTexts.push(this.chunkEmbedText(group, file.relPath, chunk.heading, chunk.text));
+          allChunkGroups.push(group);
           chunkMeta.push({ fileIdx: fi, chunkIdx: ci });
         }
       }
+      const chunksByGroup = { code: 0, text: 0 };
+      for (const group of allChunkGroups) chunksByGroup[group] += 1;
       report?.({
         phase: "scan",
         filesToProcess: toProcess.length,
@@ -1135,32 +1280,51 @@ ${chunkText}`;
         // subtracted — they were deleted from disk, so the fresh scan never
         // saw them; subtracting them here produced negative "unchanged" counts.
         unchanged: allFiles.length - toProcess.length,
-        totalChunks: allChunkTexts.length
+        totalChunks: allChunkTexts.length,
+        chunksByGroup
       });
       const allVectors = new Array(allChunkTexts.length).fill(null);
       if (this.embedder) {
         const BATCH_SIZE = 16;
-        for (let i = 0; i < allChunkTexts.length; i += BATCH_SIZE) {
-          const batchTexts = allChunkTexts.slice(i, i + BATCH_SIZE);
-          const vectors = await this.embedder.embedBatch(batchTexts);
-          for (let j = 0; j < vectors.length; j++) {
-            allVectors[i + j] = vectors[j];
-          }
-          const lastMeta = chunkMeta[Math.min(i + vectors.length, chunkMeta.length) - 1];
+        const doneByGroup = { code: 0, text: 0 };
+        const emitEmbedProgress = (upto) => {
+          const lastMeta = chunkMeta[Math.min(upto, chunkMeta.length) - 1];
           report?.({
             phase: "embed",
-            done: Math.min(i + vectors.length, allChunkTexts.length),
+            done: Math.min(upto, allChunkTexts.length),
             total: allChunkTexts.length,
-            currentFile: lastMeta ? toProcess[lastMeta.fileIdx].relPath : void 0
+            currentFile: lastMeta ? toProcess[lastMeta.fileIdx].relPath : void 0,
+            doneByGroup: { ...doneByGroup },
+            totalByGroup: { ...chunksByGroup }
           });
+        };
+        for (const group of ["text", "code"]) {
+          const groupIndexes = [];
+          for (let i = 0; i < allChunkGroups.length; i++) {
+            if (allChunkGroups[i] === group) groupIndexes.push(i);
+          }
+          for (let g = 0; g < groupIndexes.length; g += BATCH_SIZE) {
+            const batchIndexes = groupIndexes.slice(g, g + BATCH_SIZE);
+            const batchTexts = batchIndexes.map((i) => allChunkTexts[i]);
+            const vectors = await this.embedder.embedBatch(batchTexts, group);
+            for (let j = 0; j < batchIndexes.length; j++) {
+              allVectors[batchIndexes[j]] = vectors[j];
+              if (vectors[j]) doneByGroup[group] += 1;
+            }
+            const lastIdx = batchIndexes[batchIndexes.length - 1];
+            emitEmbedProgress(lastIdx + 1);
+          }
         }
+        emitEmbedProgress(allChunkTexts.length);
       } else {
         const lastMeta = chunkMeta[chunkMeta.length - 1];
         report?.({
           phase: "embed",
           done: allChunkTexts.length,
           total: allChunkTexts.length,
-          currentFile: lastMeta ? toProcess[lastMeta.fileIdx].relPath : void 0
+          currentFile: lastMeta ? toProcess[lastMeta.fileIdx].relPath : void 0,
+          doneByGroup: { ...chunksByGroup },
+          totalByGroup: { ...chunksByGroup }
         });
       }
       const processedFiles = /* @__PURE__ */ new Set();
@@ -1185,6 +1349,7 @@ ${chunkText}`;
           sourceDir: file.sourceDir,
           mtime: file.mtime,
           vector: storedVector,
+          group: allChunkGroups[i],
           excerpt,
           heading: chunk.heading,
           chunkIndex: chunkIdx,
@@ -1233,12 +1398,18 @@ ${chunkText}`;
         "vectorSearch() requires an embedder \u2014 configure a provider or use search()/hybridSearch() instead."
       );
     }
-    const queryVector = await this.embedder.embed(query, signal);
+    const queryVectorByGroup = /* @__PURE__ */ new Map();
     const scored = [];
     for (const [key, entry] of Object.entries(this.data.entries)) {
-      if (!entry.vector) continue;
+      if (!entry.vector || entry.vector.length === 0) continue;
+      const group = this.entryGroup(key, entry);
+      let queryVector = queryVectorByGroup.get(group);
+      if (!queryVector) {
+        queryVector = await this.embedder.embed(query, group, signal);
+        queryVectorByGroup.set(group, queryVector);
+      }
       const score = dotProduct(queryVector, entry.vector);
-      scored.push({ key, absPath: this.absPathFromKey(key), score });
+      scored.push({ key, absPath: this.absPathFromKey(key), score, group });
     }
     scored.sort((a, b) => b.score - a.score);
     const matchesByFile = /* @__PURE__ */ new Map();
@@ -1268,7 +1439,9 @@ ${chunkText}`;
         excerpt: entry.excerpt,
         heading: entry.heading,
         matches: matchesByFile.get(s.absPath) ?? 1,
-        lineRanges: (rangesByFile.get(s.absPath) ?? []).sort((a, b) => a[0] - b[0])
+        lineRanges: (rangesByFile.get(s.absPath) ?? []).sort((a, b) => a[0] - b[0]),
+        sources: [],
+        group: s.group
       };
     });
   }
@@ -1280,9 +1453,10 @@ ${chunkText}`;
     return this.hybridSearch(query, limit, signal);
   }
   /**
-   * Hybrid search — mirrors pi-local-rag's `hybridSearch` for the nomic
-   * (prose-only) store: FTS5 BM25 + cosine embeddings blended as
-   * `alpha * bm25 + (1 - alpha) * vector` with alpha = 0.4, instead of RRF.
+   * Hybrid search — mirrors pi-local-rag's `hybridSearch` over both
+   * embedding spaces (nomic prose + jina code): FTS5 BM25 + cosine
+   * embeddings blended as `alpha * bm25 + (1 - alpha) * vector` with
+   * alpha = 0.4, instead of RRF.
    *
    *  - BM25 raw scores are min-max normalized across the FTS candidate set
    *    (range 0 → all candidates score 1, so ties stay rankable)
@@ -1308,10 +1482,20 @@ ${chunkText}`;
    * BM25 (FTS5 side-car) file hits harvested from the candidate set before
    * fusion — the keyword-side view of the same query, so callers can show
    * what pure keyword matching found alongside the blended ranking.
+   *
+   * Dual-space search, mirroring pi-local-rag: chunks live in two
+   * independent embedding spaces (text → nomic, code → jina). Each space's
+   * query is embedded only when that space has stored vectors; result
+   * selection is pi-local-rag's ratio-based quota split — the total
+   * (RESULT_TOTAL_QUOTA_DUAL_SPACE = 7 when both spaces store vectors, else
+   * RESULT_TOTAL_QUOTA = 5, capped by `limit`) is divided between code and
+   * prose in proportion to each space's stored vector count (integer
+   * quotas, min 1 per group, code group first), and each group enforces its
+   * own relevance floor (MIN_HYBRID_SCORE_CODE = 0.35 for hits the jina
+   * space surfaced, MIN_HYBRID_SCORE_TEXT = 0.4 for everything else).
    */
   async searchWithBm25(query, limit, signal) {
     const ALPHA = 0.4;
-    const MIN_HYBRID_SCORE = 0.4;
     const ftsCandidateLimit = Math.max(limit * 20, 200);
     const vectorCandidateLimit = Math.max(limit * 10, 100);
     let ftsCandidates;
@@ -1320,25 +1504,37 @@ ${chunkText}`;
     } catch {
       ftsCandidates = [];
     }
-    let vectorSimilarityByKey = /* @__PURE__ */ new Map();
+    const { code: codeVectorCount, text: proseVectorCount } = this.vectorCountsByGroup();
+    const vectorSimilarityByKey = /* @__PURE__ */ new Map();
+    const vectorSourceByKey = /* @__PURE__ */ new Map();
     if (this.embedder) {
-      try {
-        const queryVector = await this.embedder.embed(query, signal);
-        const scored2 = [];
-        for (const [key, entry] of Object.entries(this.data.entries)) {
-          if (!entry.vector) continue;
-          scored2.push({ key, sim: Math.max(0, dotProduct(queryVector, entry.vector)) });
-        }
-        scored2.sort((a, b) => b.sim - a.sim);
-        vectorSimilarityByKey = new Map(
-          scored2.slice(0, vectorCandidateLimit).map((s) => [s.key, s.sim])
-        );
-      } catch (err) {
-        if (process.env.KNOWLEDGE_SEARCH_DEBUG) {
-          console.error(`knowledge-search: vector search failed: ${err.message}`);
-        }
-        vectorSimilarityByKey = /* @__PURE__ */ new Map();
-      }
+      const spaceFor = (group) => group === "code" ? "jina-code" : "nomic";
+      await Promise.all(
+        ["text", "code"].map(async (group) => {
+          const storedCount = group === "code" ? codeVectorCount : proseVectorCount;
+          if (!storedCount) return;
+          try {
+            const queryVector = await this.embedder.embed(query, group, signal);
+            const scored2 = [];
+            for (const [key, entry] of Object.entries(this.data.entries)) {
+              if (!entry.vector || entry.vector.length === 0) continue;
+              if (this.entryGroup(key, entry) !== group) continue;
+              scored2.push({ key, sim: Math.max(0, dotProduct(queryVector, entry.vector)) });
+            }
+            scored2.sort((a, b) => b.sim - a.sim);
+            for (const s of scored2.slice(0, vectorCandidateLimit)) {
+              vectorSimilarityByKey.set(s.key, s.sim);
+              vectorSourceByKey.set(s.key, spaceFor(group));
+            }
+          } catch (err) {
+            if (process.env.KNOWLEDGE_SEARCH_DEBUG) {
+              console.error(
+                `knowledge-search: ${spaceFor(group)} vector search failed: ${err.message}`
+              );
+            }
+          }
+        })
+      );
     }
     const candidateKeys = /* @__PURE__ */ new Set([
       ...ftsCandidates.map((c) => c.key),
@@ -1373,21 +1569,61 @@ ${chunkText}`;
     const hasAnyVectors = vectorSimilarityByKey.size > 0;
     const meaningfulQueryTerms = query.toLowerCase().split(/\s+/).filter((t) => t.length > 1);
     const firstQueryTerm = meaningfulQueryTerms[0];
+    const sourcesByKey = /* @__PURE__ */ new Map();
+    const attributeSource = (key, source) => {
+      const attributed = sourcesByKey.get(key) ?? [];
+      if (!attributed.includes(source)) attributed.push(source);
+      sourcesByKey.set(key, attributed);
+    };
+    for (const c of ftsCandidates) attributeSource(c.key, "bm25");
+    for (const [key, source] of vectorSourceByKey) attributeSource(key, source);
     const scored = [];
     for (const key of candidateKeys) {
       let bm25Normalized = bm25ByKey.get(key) ?? 0;
-      const path5 = this.absPathFromKey(key);
-      if (firstQueryTerm && path5.toLowerCase().includes(firstQueryTerm)) {
+      const absPath = this.absPathFromKey(key);
+      if (firstQueryTerm && absPath.toLowerCase().includes(firstQueryTerm)) {
         bm25Normalized = Math.min(1, bm25Normalized * 1.5);
       }
       const vectorSimilarity = vectorSimilarityByKey.get(key) ?? 0;
       const hybridScore = hasAnyVectors ? ALPHA * bm25Normalized + (1 - ALPHA) * vectorSimilarity : bm25Normalized;
-      if (hybridScore >= MIN_HYBRID_SCORE) scored.push({ key, score: hybridScore });
+      scored.push({ key, score: hybridScore });
     }
     scored.sort((a, b) => b.score - a.score);
+    const isCodeHit = (key) => sourcesByKey.get(key)?.includes("jina-code") ?? false;
+    const minScoreFor = (key) => isCodeHit(key) ? MIN_HYBRID_SCORE_CODE : MIN_HYBRID_SCORE_TEXT;
+    const ranked = scored.filter(
+      (s) => s.score > 0 && s.score >= minScoreFor(s.key)
+    );
+    const codeHits = ranked.filter((s) => isCodeHit(s.key));
+    const proseHits = ranked.filter((s) => !isCodeHit(s.key));
+    const bothSpacesHaveVectors = codeVectorCount > 0 && proseVectorCount > 0;
+    const total = Math.min(
+      limit,
+      bothSpacesHaveVectors ? RESULT_TOTAL_QUOTA_DUAL_SPACE : RESULT_TOTAL_QUOTA
+    );
+    let selected;
+    if (codeHits.length > 0 && proseHits.length > 0) {
+      const { codeQuota, proseQuota } = splitResultQuotas(total, codeVectorCount, proseVectorCount);
+      const codePrimary = codeHits.slice(0, codeQuota);
+      const prosePrimary = proseHits.slice(0, proseQuota);
+      const shortfall = total - (codePrimary.length + prosePrimary.length);
+      let codeExtra = [];
+      let proseExtra = [];
+      if (shortfall > 0) {
+        const filler = [
+          ...codeHits.slice(codePrimary.length),
+          ...proseHits.slice(prosePrimary.length)
+        ].sort((a, b) => b.score - a.score).slice(0, shortfall);
+        codeExtra = filler.filter((s) => isCodeHit(s.key));
+        proseExtra = filler.filter((s) => !isCodeHit(s.key));
+      }
+      selected = [...codePrimary, ...codeExtra, ...prosePrimary, ...proseExtra];
+    } else {
+      selected = (codeHits.length > 0 ? codeHits : proseHits).slice(0, total);
+    }
     const matchesByFile = /* @__PURE__ */ new Map();
     const rangesByFile = /* @__PURE__ */ new Map();
-    for (const { key } of scored) {
+    for (const { key } of ranked) {
       const absPath = this.absPathFromKey(key);
       matchesByFile.set(absPath, (matchesByFile.get(absPath) ?? 0) + 1);
       const entry = this.data.entries[key];
@@ -1399,7 +1635,7 @@ ${chunkText}`;
     }
     const seen = /* @__PURE__ */ new Set();
     const out = [];
-    for (const { key, score } of scored) {
+    for (const { key, score } of selected) {
       const entry = this.data.entries[key];
       const absPath = this.absPathFromKey(key);
       if (seen.has(absPath)) continue;
@@ -1408,6 +1644,7 @@ ${chunkText}`;
       const bm25Norm = bm25ByKey.get(key) ?? 0;
       const sim = vectorSimilarityByKey.get(key) ?? 0;
       const source = hasAnyVectors && (1 - ALPHA) * sim >= ALPHA * bm25Norm ? "vector" : "bm25";
+      const group = entry ? this.entryGroup(key, entry) : classifyFileGroup(absPath, this.config.codeExtensions);
       if (entry) {
         out.push({
           path: absPath,
@@ -1416,7 +1653,9 @@ ${chunkText}`;
           heading: entry.heading,
           matches: matchesByFile.get(absPath) ?? 1,
           lineRanges: (rangesByFile.get(absPath) ?? []).sort((a, b) => a[0] - b[0]),
-          source
+          source,
+          sources: sourcesByKey.get(key) ?? [],
+          group
         });
       } else {
         out.push({
@@ -1426,7 +1665,9 @@ ${chunkText}`;
           heading: "",
           matches: matchesByFile.get(absPath) ?? 1,
           lineRanges: [],
-          source
+          source,
+          sources: sourcesByKey.get(key) ?? [],
+          group
         });
       }
       if (out.length >= limit) break;
@@ -1461,11 +1702,13 @@ ${chunkText}`;
     this.removeAllChunks(absPath);
     let vectors;
     if (this.embedder) {
-      const texts = chunks.map((c) => this.chunkEmbedText(relPath, c.heading, c.text));
-      vectors = await this.embedder.embedBatch(texts);
+      const group = classifyFileGroup(absPath, this.config.codeExtensions);
+      const texts = chunks.map((c) => this.chunkEmbedText(group, relPath, c.heading, c.text));
+      vectors = await this.embedder.embedBatch(texts, group);
     } else {
       vectors = new Array(chunks.length).fill(null);
     }
+    const fileGroup = classifyFileGroup(absPath, this.config.codeExtensions);
     for (let i = 0; i < chunks.length; i++) {
       const vector = vectors[i];
       if (this.embedder && !vector) continue;
@@ -1478,6 +1721,7 @@ ${chunkText}`;
         sourceDir,
         mtime: stat.mtimeMs,
         vector: storedVector,
+        group: fileGroup,
         excerpt,
         heading: chunks[i].heading,
         chunkIndex: i,
@@ -1778,8 +2022,8 @@ function extractKeywords(filesByFolder, maxKeywords) {
   for (const [folder, files] of filesByFolder) {
     const tf = /* @__PURE__ */ new Map();
     for (const f of files) {
-      const basename4 = path3.basename(f.relPath, path3.extname(f.relPath));
-      for (const tok of tokenize(basename4)) {
+      const basename5 = path3.basename(f.relPath, path3.extname(f.relPath));
+      for (const tok of tokenize(basename5)) {
         tf.set(tok, (tf.get(tok) ?? 0) + 2);
       }
       const headings = f.headings.slice(0, 6);
@@ -2061,6 +2305,7 @@ function readNote(absPath, opts = {}) {
 
 // src/lookup-summary.ts
 var LOOKUP_TOP_K = 5;
+var ENGINE_DISPLAY_ORDER = ["nomic", "jina-code", "bm25"];
 var MAX_RANGES_PER_FILE = 3;
 function formatFileHit(absPath, lineRanges, displayPath, matches) {
   const display = displayPath(absPath);
@@ -2072,17 +2317,26 @@ function formatFileHit(absPath, lineRanges, displayPath, matches) {
   return matches === void 0 ? display : `${display} (${matches})`;
 }
 function formatLookupSummary(results, bm25Files, displayPath) {
-  const nomicSummaries = results.filter((r) => r.source !== "bm25").map((r) => formatFileHit(r.path, r.lineRanges ?? [], displayPath, r.matches ?? 1));
+  const entriesByEngine = /* @__PURE__ */ new Map();
+  const addEntry = (engine, entry) => {
+    const list = entriesByEngine.get(engine) ?? [];
+    list.push(entry);
+    entriesByEngine.set(engine, list);
+  };
+  for (const r of results) {
+    const engines = r.sources && r.sources.length > 0 ? r.sources : r.source === "bm25" ? ["bm25"] : ["nomic"];
+    for (const engine of engines) {
+      const primary = engine === engines[0] ? formatFileHit(r.path, r.lineRanges ?? [], displayPath, r.matches ?? 1) : displayPath(r.path);
+      addEntry(engine, primary);
+    }
+  }
   const resultPaths = new Set(results.map((r) => r.path));
-  const bm25Summaries = [
-    ...results.filter((r) => r.source === "bm25").map((r) => formatFileHit(r.path, r.lineRanges ?? [], displayPath)),
-    // Raw keyword hits that never surfaced in the fused results — the files
-    // only the FTS5 side-car found.
-    ...bm25Files.filter((f) => !resultPaths.has(f.path)).slice(0, LOOKUP_TOP_K).map((f) => formatFileHit(f.path, f.lineRanges, displayPath))
-  ];
-  const parts = [];
-  if (nomicSummaries.length > 0) parts.push(`nomic (${nomicSummaries.join(",")})`);
-  if (bm25Summaries.length > 0) parts.push(`bm25 (${bm25Summaries.join(",")})`);
+  for (const f of bm25Files.filter((f2) => !resultPaths.has(f2.path)).slice(0, LOOKUP_TOP_K)) {
+    addEntry("bm25", formatFileHit(f.path, f.lineRanges, displayPath));
+  }
+  const parts = ENGINE_DISPLAY_ORDER.filter((engine) => entriesByEngine.has(engine)).map(
+    (engine) => `${engine} (${entriesByEngine.get(engine).join(",")})`
+  );
   if (parts.length === 0) return "Knowledge lookup";
   return `Knowledge lookup \u2014 ${parts.join(" \u2014 ")}`;
 }
@@ -2355,8 +2609,11 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
     const theme = ctx.ui.theme;
     const label = (text) => theme.fg("dim", text.padEnd(20));
     const lines = [theme.bold("pi-knowledge-search"), ""];
+    const vectorCounts = index?.vectorCountsByGroup() ?? { code: 0, text: 0 };
     lines.push(
-      "  " + label("Embedding engine:") + theme.fg("success", EMBEDDING_MODEL) + theme.fg("dim", "  (local ONNX via Transformers.js \u2014 fixed, not configurable)")
+      "  " + label("Embedding engine:") + theme.fg("success", "nomic + jina-code") + theme.fg("dim", "  (local ONNX via Transformers.js \u2014 fixed, not configurable)"),
+      "  " + label("Text model:") + theme.fg("dim", EMBEDDING_MODEL) + theme.fg("muted", `  ${vectorCounts.text} vectors`),
+      "  " + label("Code model:") + theme.fg("dim", CODE_EMBEDDING_MODEL) + theme.fg("muted", `  ${vectorCounts.code} vectors`)
     );
     if (index) {
       lines.push("  " + label("Indexed:") + theme.fg("success", `${index.size()} files \xB7 ${index.chunkCount()} chunks`));
@@ -2380,7 +2637,14 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
     }
     lines.push("", "  " + theme.bold("File extensions:"));
     const exts = currentConfig?.fileExtensions ?? [];
-    lines.push("    " + theme.fg("muted", exts.join(" ")));
+    const codeExts = exts.filter((e) => currentConfig?.codeExtensions.includes(e) ?? false);
+    const textExts = exts.filter((e) => !codeExts.includes(e));
+    lines.push(
+      "    " + theme.fg("dim", "code ") + theme.fg("muted", codeExts.join(" ")),
+      "    " + theme.fg("dim", "      ") + theme.fg("dim", `\u2192 ${CODE_EMBEDDING_MODEL}`),
+      "    " + theme.fg("dim", "text ") + theme.fg("muted", textExts.join(" ")),
+      "    " + theme.fg("dim", "      ") + theme.fg("dim", `\u2192 ${EMBEDDING_MODEL}`)
+    );
     lines.push(
       "",
       "  " + label("Lookup inject:") + (currentConfig?.autoInject ? theme.fg("success", "enabled") : theme.fg("warning", "disabled")) + theme.fg("dim", `  topK=${5}  minScore=${0.1}`)
@@ -2533,20 +2797,26 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
     };
     try {
       await ensureIndexLoaded();
-      if (!isTransformersModelCached(EMBEDDING_MODEL)) {
-        ctx.ui.notify(
-          `\u23F3 Loading embedding model: ${EMBEDDING_MODEL} \u2014 first run downloads it (~111 MB, this can take a few minutes)`,
-          "info"
-        );
-      }
       const theme = ctx.ui.theme;
       const verb = theme.fg("accent", "Indexing");
+      const modelLoadAnnounced = /* @__PURE__ */ new Set();
+      const announceModelLoad = (group, model) => {
+        if (modelLoadAnnounced.has(group) || isTransformersModelCached(model)) return;
+        modelLoadAnnounced.add(group);
+        const size = group === "code" ? "~170 MB" : "~111 MB";
+        ctx.ui.notify(
+          `\u23F3 Loading ${group} embedding model: ${model} \u2014 first run downloads it (${size}, this can take a few minutes)`,
+          "info"
+        );
+      };
       const { added, updated, removed } = await index.sync({
         onProgress: (p) => {
           if (p.phase === "scan") {
-            const label = p.filesToProcess > 0 ? `Found ${p.filesToProcess} file(s) to index \xB7 ${p.unchanged} unchanged \xB7 ${p.totalChunks} chunks` : `Nothing to index \xB7 ${p.unchanged} files unchanged`;
+            const label = p.filesToProcess > 0 ? `Found ${p.filesToProcess} file(s) to index \xB7 ${p.unchanged} unchanged \xB7 ${p.totalChunks} chunks (${p.chunksByGroup.code} code \xB7 ${p.chunksByGroup.text} text)` : `Nothing to index \xB7 ${p.unchanged} files unchanged`;
             ctx.ui.setStatus("knowledge-search", `\u25A0 Scanning\u2026 ${label}`);
             ctx.ui.setWidget("knowledge-search", [verb, theme.fg("dim", label)]);
+            if (p.chunksByGroup.text > 0) announceModelLoad("text", EMBEDDING_MODEL);
+            if (p.chunksByGroup.code > 0) announceModelLoad("code", CODE_EMBEDDING_MODEL);
             return;
           }
           if (p.phase === "embed") {
@@ -2556,10 +2826,16 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
               "knowledge-search",
               `\u25A0 Indexing ${percent}% \u2502 ${p.done}/${p.total} chunks`
             );
+            const groupLines = ["code", "text"].map((group) => {
+              const done = p.doneByGroup[group];
+              const total = p.totalByGroup[group];
+              const model = group === "code" ? "jina-code" : "nomic";
+              return `${theme.fg("dim", `${group.padEnd(5)} ${done}/${total}`)}  ${theme.fg("muted", model)}`;
+            });
             ctx.ui.setWidget("knowledge-search", [
               `${verb}  ${bar}  ${theme.fg("success", `${percent}%`)}`,
               `${theme.fg("dim", "file:    ")}${p.currentFile ?? "\u2026"}`,
-              `${theme.fg("dim", "chunks:  ")}${theme.fg("success", String(p.done))}/${p.total}`
+              ...groupLines
             ]);
             return;
           }
@@ -2639,6 +2915,7 @@ Retrieved ${results.length} chunk${results.length === 1 ? "" : "s"} via hybrid s
       {
         dirs: [],
         fileExtensions: DEFAULT_FILE_EXTENSIONS,
+        codeExtensions: DEFAULT_CODE_EXTENSIONS,
         excludeDirs: ["node_modules", ".git", ".obsidian", ".trash"]
       },
       sessionCwd

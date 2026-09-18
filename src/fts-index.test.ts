@@ -5,8 +5,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { KnowledgeIndex, type SyncProgress } from "./index-store.js";
 import { FtsChunkIndex, toFtsQuery } from "./fts-index.js";
-import { DEFAULT_FILE_EXTENSIONS, type Config } from "./config.js";
-import type { Embedder } from "./embedder.js";
+import { DEFAULT_FILE_EXTENSIONS, DEFAULT_CODE_EXTENSIONS, type Config } from "./config.js";
+import type { Embedder, EmbedGroup } from "./embedder.js";
 
 // ---------------------------------------------------------------------------
 // FTS side-car + hybrid search
@@ -16,6 +16,7 @@ function makeConfig(dir: string, dimensions = 4): Config {
   return {
     dirs: ["/tmp/does-not-matter"],
     fileExtensions: [".md"],
+    codeExtensions: DEFAULT_CODE_EXTENSIONS,
     excludeDirs: [],
     dimensions,
     modelSignature: "transformers:nomic-ai/nomic-embed-text-v1.5:768",
@@ -27,17 +28,19 @@ function makeConfig(dir: string, dimensions = 4): Config {
 
 /**
  * Deterministic stub embedder that returns vectors from a predefined table.
- * Lets us assert exact ranking without depending on a real provider.
+ * Lets us assert exact ranking without depending on a real provider. Keys
+ * may be prefixed with the embedding group (`code:query`) to give each
+ * space its own query vector; unprefixed keys match any group.
  */
 class TableEmbedder implements Embedder {
   constructor(private table: Record<string, number[]>) {}
-  async embed(text: string): Promise<number[]> {
-    const v = this.table[text];
-    if (!v) throw new Error(`TableEmbedder: no vector for "${text}"`);
+  async embed(text: string, group: EmbedGroup = "text"): Promise<number[]> {
+    const v = this.table[`${group}:${text}`] ?? this.table[text];
+    if (!v) throw new Error(`TableEmbedder: no vector for "${group}:${text}"`);
     return v;
   }
-  async embedBatch(texts: string[]): Promise<(number[] | null)[]> {
-    return texts.map((t) => this.table[t] ?? null);
+  async embedBatch(texts: string[], group: EmbedGroup = "text"): Promise<(number[] | null)[]> {
+    return texts.map((t) => this.table[`${group}:${t}`] ?? this.table[t] ?? null);
   }
 }
 
@@ -610,6 +613,221 @@ describe("KnowledgeIndex hybrid search", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Dual-space search — pi-local-rag's nomic + jina-code embedding groups
+// ---------------------------------------------------------------------------
+
+describe("KnowledgeIndex dual-space search (nomic + jina)", () => {
+  let tmpDir: string;
+
+  before(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ks-dual-"));
+  });
+
+  beforeEach(() => {
+    for (const f of fs.readdirSync(tmpDir)) {
+      fs.rmSync(path.join(tmpDir, f), { recursive: true, force: true });
+    }
+  });
+
+  after(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /** Seed entries with an explicit embedding group (bypasses embed pipeline). */
+  function seed(
+    index: KnowledgeIndex,
+    entries: Array<{
+      absPath: string;
+      excerpt: string;
+      vector: number[];
+      group: "code" | "text";
+    }>,
+  ): void {
+    const internal = index as unknown as {
+      data: { entries: Record<string, unknown> };
+    };
+    for (const e of entries) {
+      internal.data.entries[`${e.absPath}#0`] = {
+        relPath: path.basename(e.absPath),
+        sourceDir: path.dirname(e.absPath),
+        mtime: 1,
+        vector: e.vector,
+        group: e.group,
+        excerpt: e.excerpt,
+        heading: "",
+        chunkIndex: 0,
+        startLine: 0,
+        endLine: 3,
+      };
+    }
+  }
+
+  it("surfaces hits from both spaces — each chunk scored against its own model's query vector", async () => {
+    // Separate query vectors per space: nomic queries embed with the nomic
+    // model, code queries with jina — cross-space comparison is meaningless.
+    const embedder = new TableEmbedder({
+      "text:authentication flow": [1, 0, 0, 0],
+      "code:authentication flow": [0, 1, 0, 0],
+    });
+    const idx = new KnowledgeIndex(makeConfig(tmpDir), embedder);
+    await idx.load();
+
+    seed(idx, [
+      {
+        absPath: "/v/releasing.md",
+        excerpt: "shipping the release candidate gradually",
+        vector: [0.95, 0.1, 0, 0], // cosine ~0.99 with the nomic query
+        group: "text",
+      },
+      {
+        absPath: "/v/guard.ts",
+        excerpt: "exports the verifySession helper",
+        vector: [0.1, 0.95, 0, 0], // cosine ~0.99 with the jina query
+        group: "code",
+      },
+    ]);
+    (idx as unknown as { rebuildFtsFromEntries: () => void }).rebuildFtsFromEntries();
+
+    const results = await idx.searchWithBm25("authentication flow", 5).then((r) => r.results);
+    assert.equal(results.length, 2, "both spaces' best hits surface");
+    // Equal hybrid scores: quota order puts the code group first.
+    assert.equal(results[0].path, "/v/guard.ts");
+    assert.equal(results[0].group, "code");
+    assert.deepEqual(results[0].sources, ["jina-code"]);
+    assert.equal(results[1].path, "/v/releasing.md");
+    assert.equal(results[1].group, "text");
+    assert.deepEqual(results[1].sources, ["nomic"]);
+    await idx.close();
+  });
+
+  it("a code hit never found by BM25 is attributed to jina-code only", async () => {
+    const embedder = new TableEmbedder({
+      "code:database migration": [1, 0, 0, 0],
+    });
+    const idx = new KnowledgeIndex(makeConfig(tmpDir), embedder);
+    await idx.load();
+
+    seed(idx, [
+      {
+        absPath: "/v/migrate.ts",
+        excerpt: "runs the pending schema upgrades",
+        vector: [0.95, 0.1, 0, 0],
+        group: "code",
+      },
+    ]);
+    (idx as unknown as { rebuildFtsFromEntries: () => void }).rebuildFtsFromEntries();
+
+    // The query shares no keyword with the excerpt — only the code space
+    // surfaces the file (the text-space query embed throws: no table entry).
+    const { results } = await idx.searchWithBm25("database migration", 5);
+    assert.equal(results.length, 1);
+    assert.equal(results[0].path, "/v/migrate.ts");
+    assert.deepEqual(results[0].sources, ["jina-code"]);
+    assert.equal(results[0].group, "code");
+    await idx.close();
+  });
+
+  it("applies per-space relevance floors (code 0.35, text 0.4)", async () => {
+    const embedder = new TableEmbedder({
+      "text:orbital telemetry": [1, 0, 0, 0],
+      "code:orbital telemetry": [1, 0, 0, 0],
+    });
+    const idx = new KnowledgeIndex(makeConfig(tmpDir), embedder);
+    await idx.load();
+
+    // Both files score hybrid = 0.6 × 0.6 = 0.36: above the jina floor
+    // (0.35), below the nomic/BM25 floor (0.4) — only the code hit survives.
+    seed(idx, [
+      {
+        absPath: "/v/telemetry.ts",
+        excerpt: "downlinks the sensor frames",
+        vector: [0.6, 0, 0, 0],
+        group: "code",
+      },
+      {
+        absPath: "/v/journal.md",
+        excerpt: "morning pages about breakfast",
+        vector: [0.6, 0, 0, 0],
+        group: "text",
+      },
+    ]);
+    (idx as unknown as { rebuildFtsFromEntries: () => void }).rebuildFtsFromEntries();
+
+    const { results } = await idx.searchWithBm25("orbital telemetry", 5);
+    assert.equal(results.length, 1, "the prose hit below the 0.4 floor is cut");
+    assert.equal(results[0].path, "/v/telemetry.ts", "the code hit above the 0.35 floor survives");
+    await idx.close();
+  });
+
+  it("fills 7 quota slots split by stored vector proportion (dual space)", async () => {
+    const embedder = new TableEmbedder({
+      "text:service manual": [1, 0, 0, 0],
+      "code:service manual": [1, 0, 0, 0],
+    });
+    const idx = new KnowledgeIndex(makeConfig(tmpDir), embedder);
+    await idx.load();
+
+    // 4 code files vs 3 prose files → quotas 4/3 of the 7 dual-space slots.
+    const entries = [];
+    for (let i = 0; i < 4; i++) {
+      entries.push({
+        absPath: `/v/module-${i}.ts`,
+        excerpt: `module ${i} internals described plainly`,
+        vector: [0.95, 0.1, 0, 0],
+        group: "code" as const,
+      });
+    }
+    for (let i = 0; i < 3; i++) {
+      entries.push({
+        absPath: `/v/handbook-${i}.md`,
+        excerpt: `handbook ${i} chapter with distinct wording`,
+        vector: [0.95, 0.1, 0, 0],
+        group: "text" as const,
+      });
+    }
+    seed(idx, entries);
+    (idx as unknown as { rebuildFtsFromEntries: () => void }).rebuildFtsFromEntries();
+
+    const { results } = await idx.searchWithBm25("service manual", 8);
+    assert.equal(results.length, 7, "7 slots when both spaces store vectors (limit 8 shrinks to 7)");
+    const codeResults = results.filter((r) => r.group === "code");
+    const proseResults = results.filter((r) => r.group === "text");
+    assert.equal(codeResults.length, 4, "code quota follows the 4/7 corpus proportion");
+    assert.equal(proseResults.length, 3, "prose quota follows the 3/7 corpus proportion");
+    // Code group fills first (code-first policy at equal quota rank).
+    assert.deepEqual(
+      results.map((r) => r.group),
+      ["code", "code", "code", "code", "text", "text", "text"],
+    );
+    await idx.close();
+  });
+
+  it("caps the total at 5 slots when only one space stores vectors", async () => {
+    const embedder = new TableEmbedder({ "text:quartz mining": [1, 0, 0, 0] });
+    const idx = new KnowledgeIndex(makeConfig(tmpDir), embedder);
+    await idx.load();
+
+    // 8 prose files, no code files — single-space store → 5 slots, not 8.
+    const entries = [];
+    for (let i = 0; i < 8; i++) {
+      entries.push({
+        absPath: `/v/mine-${i}.md`,
+        excerpt: `mining notes volume ${i} about crystals`,
+        vector: [0.95, 0.1, 0, 0],
+        group: "text" as const,
+      });
+    }
+    seed(idx, entries);
+    (idx as unknown as { rebuildFtsFromEntries: () => void }).rebuildFtsFromEntries();
+
+    const { results } = await idx.searchWithBm25("quartz mining", 20);
+    assert.equal(results.length, 5, "single-space store takes the 5-slot total");
+    assert.ok(results.every((r) => r.group === "text"));
+    await idx.close();
+  });
+});
+
 describe("KnowledgeIndex FTS-only mode (no embedder)", () => {
   let tmpDir: string;
   let vaultDir: string;
@@ -640,6 +858,7 @@ describe("KnowledgeIndex FTS-only mode (no embedder)", () => {
     return {
       dirs: [vaultDir],
       fileExtensions: [".md"],
+      codeExtensions: DEFAULT_CODE_EXTENSIONS,
       excludeDirs: [],
       dimensions: 512,
         modelSignature: "transformers:nomic-ai/nomic-embed-text-v1.5:768",
@@ -745,11 +964,11 @@ describe("KnowledgeIndex FTS-only mode (no embedder)", () => {
     assert.ok(events.some((e) => e.phase === "save"));
   });
 
-  it("default extensions index nomic's text group, not code files", async () => {
+  it("default extensions index both embedding groups (code → jina, text → nomic)", async () => {
     fs.writeFileSync(path.join(vaultDir, "a.md"), "# Note\n\nSome markdown prose worth indexing.");
     fs.writeFileSync(path.join(vaultDir, "data.json"), JSON.stringify({ topic: "rollbacks", steps: 3 }));
     fs.writeFileSync(path.join(vaultDir, "conf.YAML"), "topic: rollbacks\nsteps: 3\n");
-    fs.writeFileSync(path.join(vaultDir, "script.ts"), "export const x = 1; // code is not in nomic's group\n");
+    fs.writeFileSync(path.join(vaultDir, "script.ts"), "export const x = 1; // code rides the jina group\n");
 
     const indexDir = path.join(tmpDir, "idx-default-exts");
     fs.mkdirSync(indexDir);
@@ -757,6 +976,7 @@ describe("KnowledgeIndex FTS-only mode (no embedder)", () => {
       {
         dirs: [vaultDir],
         fileExtensions: DEFAULT_FILE_EXTENSIONS,
+        codeExtensions: DEFAULT_CODE_EXTENSIONS,
         excludeDirs: [],
         dimensions: 512,
             modelSignature: "transformers:nomic-ai/nomic-embed-text-v1.5:768",
@@ -770,7 +990,7 @@ describe("KnowledgeIndex FTS-only mode (no embedder)", () => {
     await idx.sync();
 
     const indexed = idx.listFiles().map((f) => f.relPath).sort();
-    assert.deepStrictEqual(indexed, ["a.md", "conf.YAML", "data.json"]);
+    assert.deepStrictEqual(indexed, ["a.md", "conf.YAML", "data.json", "script.ts"]);
     await idx.close();
   });
 

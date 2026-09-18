@@ -3,9 +3,18 @@ import * as path from "node:path";
 import Assembler from "stream-json/assembler.js";
 import makeParser from "stream-json/index.js";
 import type { Config } from "./config.js";
+import { classifyFileGroup } from "./config.js";
+import { EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, type EmbedGroup } from "./embedder.js";
 import type { Embedder } from "./embedder.js";
 import { chunkMarkdown, type Chunk } from "./chunker.js";
 import { FtsChunkIndex, type FtsChunk } from "./fts-index.js";
+
+/**
+ * Which engine surfaced a chunk as a candidate: BM25 (FTS5 keyword),
+ * nomic (prose vector space), or jina-code (code vector space) — mirrors
+ * pi-local-rag's RetrievalSource.
+ */
+export type RetrievalSource = "bm25" | "nomic" | "jina-code";
 
 interface IndexEntry {
   /** Relative path from its source directory root */
@@ -16,6 +25,12 @@ interface IndexEntry {
   mtime: number;
   /** Embedding vector (empty array when running FTS-only without an embedder) */
   vector: number[];
+  /**
+   * Embedding group the vector was produced with (`"code"` = jina,
+   * `"text"` = nomic). Optional only for entries from pre-dual-model
+   * indexes — those are derived from the file extension on load.
+   */
+  group?: EmbedGroup;
   /** This chunk's content for excerpt display */
   excerpt: string;
   /** Section heading this chunk falls under */
@@ -71,6 +86,73 @@ export interface SearchResult {
    * (e.g. plain `vectorSearch()`).
    */
   source?: "vector" | "bm25";
+  /**
+   * Every engine that surfaced this hit as a candidate — `"bm25"` (FTS5
+   * side-car), `"nomic"` (prose vector space), `"jina-code"` (code vector
+   * space). A hit found by several engines lists them all, mirroring
+   * pi-local-rag's per-engine provenance. Empty outside hybrid search
+   * (e.g. plain `vectorSearch()`).
+   */
+  sources: RetrievalSource[];
+  /**
+   * Embedding group the hit's chunk was indexed with — `"code"` hits are
+   * embedded/searched in the jina space, `"text"` in the nomic space.
+   * Derived from the file extension for entries predating the field.
+   */
+  group: EmbedGroup;
+}
+
+// ---------------------------------------------------------------------------
+// Result quotas — pi-local-rag's ratio-based split across embedding spaces
+// ---------------------------------------------------------------------------
+
+/**
+ * Total number of result slots when at most one embedding space has
+ * stored vectors (or a single group fills the result alone). `limit` can
+ * only shrink this, never grow it.
+ */
+export const RESULT_TOTAL_QUOTA = 5;
+
+/**
+ * Result-slot total for stores with vectors in both embedding spaces —
+ * a mixed corpus has two groups to fill, so more hits feed the
+ * ratio-based quota split. Same rule as RESULT_TOTAL_QUOTA otherwise:
+ * `limit` can only shrink it.
+ */
+export const RESULT_TOTAL_QUOTA_DUAL_SPACE = 7;
+
+/**
+ * Minimum hybrid score per embedding space — anything below is treated as
+ * unrelated and omitted, so a query with one related file returns just that
+ * file instead of padding the list with noise. Calibrated on real indexes
+ * (see pi-local-rag's MIN_HYBRID_SCORE_CODE/TEXT):
+ *
+ * - jina-code space: unrelated queries top out at ~0.28-0.33, related code
+ *   hits start at ~0.38 (vague) and run to 0.63+ (keyword matches)
+ * - nomic space + BM25-only hits: unrelated tops out at ~0.31-0.39, related
+ *   starts at ~0.65. 0.4 is also exactly the ceiling of a pure keyword-only
+ *   match (alpha × bm25=1 + (1-alpha) × cos~0), so those always survive.
+ */
+export const MIN_HYBRID_SCORE_CODE = 0.35;
+export const MIN_HYBRID_SCORE_TEXT = 0.4;
+
+/**
+ * Split `total` result slots between the code and prose groups in
+ * proportion to the store's stored vector counts (the corpus
+ * composition ratio). Integer quotas that sum exactly to `total`, each
+ * at least 1 — except `total < 2`, where both minimums can't hold and
+ * the single slot goes to the code group (code-first policy).
+ */
+export function splitResultQuotas(
+  total: number,
+  codeVectorCount: number,
+  proseVectorCount: number,
+): { codeQuota: number; proseQuota: number } {
+  if (total < 2) return { codeQuota: total, proseQuota: 0 };
+  const vectorTotal = codeVectorCount + proseVectorCount;
+  const codeShare = vectorTotal > 0 ? codeVectorCount / vectorTotal : 0.5;
+  const codeQuota = Math.min(total - 1, Math.max(1, Math.round(total * codeShare)));
+  return { codeQuota, proseQuota: total - codeQuota };
 }
 
 /**
@@ -97,17 +179,41 @@ export interface HybridSearchWithBm25 {
  * Progress events emitted by sync() for UI rendering.
  *
  * - scan: directory scan finished — reports how many files need
- *   (re)embedding, how many are unchanged, and the total chunk count
+ *   (re)embedding, how many are unchanged, the total chunk count, and the
+ *   chunk split per embedding group (code → jina, text → nomic)
  * - embed: one embed batch completed — done/total chunks plus the file
- *   the latest batch ended in (best effort)
+ *   the latest batch ended in (best effort), and per-group cumulative
+ *   progress for the per-model progress lines
  * - save: the index is being persisted to disk
  */
 export type SyncProgress =
-  | { phase: "scan"; filesToProcess: number; unchanged: number; totalChunks: number }
-  | { phase: "embed"; done: number; total: number; currentFile?: string }
+  | {
+      phase: "scan";
+      filesToProcess: number;
+      unchanged: number;
+      totalChunks: number;
+      chunksByGroup: { code: number; text: number };
+    }
+  | {
+      phase: "embed";
+      done: number;
+      total: number;
+      currentFile?: string;
+      doneByGroup: { code: number; text: number };
+      totalByGroup: { code: number; text: number };
+    }
   | { phase: "save" };
 
-const INDEX_VERSION = 4; // Bumped from 3 for per-chunk line ranges
+const INDEX_VERSION = 5; // Bumped from 4 for per-chunk embedding groups (nomic/jina dual space)
+
+/**
+ * Signature of the pre-dual-model engine (nomic-only). Indexes built by it
+ * hold valid nomic vectors for text-group files — only code-group files
+ * were embedded with the wrong model. On load they are adopted and the
+ * code-group entries dropped (re-embedded by sync), instead of discarding
+ * every vector.
+ */
+const LEGACY_TEXT_ONLY_SIGNATURE = `transformers:${EMBEDDING_MODEL}:${EMBEDDING_DIMENSIONS}`;
 
 /**
  * Oldest on-disk index format we can adopt without re-embedding. v3
@@ -251,18 +357,24 @@ export class KnowledgeIndex {
         }
         // Accept the on-disk index when:
         //  - version is a known-compatible chunked format (current or an
-        //    older one — v3 and v4 differ only by optional per-chunk line
-        //    ranges, so an older index is migrated, not re-embedded) AND
+        //    older one — v3/v4 differ only by optional fields, so an older
+        //    index is migrated, not re-embedded) AND
         //  - dimensions match OR we're in FTS-only mode (dimensions are a
         //    vector-only concern; FTS-only installs should never invalidate
         //    a perfectly good entry map over them) AND
         //  - the embedding-engine signature matches OR we're in FTS-only
         //    mode. Vectors built by a different engine/model are not
-        //    comparable — drop them and re-embed everything.
+        //    comparable — drop them and re-embed everything. The one
+        //    exception is the legacy nomic-only signature: its text-group
+        //    vectors are still valid under the current dual-model engine,
+        //    so the index is adopted with only code-group entries removed
+        //    (they were embedded with the wrong model).
         const dimsOk =
           this.isFtsOnly || parsed?.dimensions === this.config.dimensions;
         const sigOk =
-          this.isFtsOnly || parsed?.embeddingModel === this.config.modelSignature;
+          this.isFtsOnly ||
+          parsed?.embeddingModel === this.config.modelSignature ||
+          parsed?.embeddingModel === LEGACY_TEXT_ONLY_SIGNATURE;
         if (
           parsed &&
           parsed.version >= MIN_LOADABLE_INDEX_VERSION &&
@@ -275,6 +387,31 @@ export class KnowledgeIndex {
           // fall back to the per-file match count in search — no re-embed
           // needed to keep their vectors.
           this.data = { ...parsed, version: INDEX_VERSION };
+          if (!this.isFtsOnly && parsed.embeddingModel === LEGACY_TEXT_ONLY_SIGNATURE) {
+            // Migrate nomic-only → dual-model: drop code-group entries
+            // (their vectors came from nomic and must be re-embedded with
+            // jina); text-group vectors stay valid. Record the current
+            // signature so the migration runs only once.
+            const staleCodePaths = new Set<string>();
+            for (const key of Object.keys(this.data.entries)) {
+              const entry = this.data.entries[key];
+              if (this.entryGroup(key, entry) === "code") {
+                staleCodePaths.add(this.absPathFromKey(key));
+              }
+            }
+            for (const key of Object.keys(this.data.entries)) {
+              if (staleCodePaths.has(this.absPathFromKey(key))) {
+                delete this.data.entries[key];
+              }
+            }
+            this.data.embeddingModel = this.config.modelSignature;
+            // The FTS side-car is loaded by this point (top of load()) —
+            // drop the stale code files' keyword rows so sync() re-indexes
+            // them cleanly.
+            for (const absPath of staleCodePaths) {
+              this.fts.deleteByAbsPath(absPath);
+            }
+          }
         }
         // Version (older than v3), dimension, or signature mismatch → keep
         // fresh data, caller will re-index.
@@ -464,6 +601,32 @@ export class KnowledgeIndex {
   }
 
   /**
+   * Embedding group an entry belongs to — the group recorded at index time,
+   * or derived from the file extension for entries predating the field
+   * (all-text legacy indexes; those entries' code-group counterparts were
+   * dropped on load).
+   */
+  private entryGroup(key: string, entry: IndexEntry): EmbedGroup {
+    return entry.group ?? classifyFileGroup(this.absPathFromKey(key), this.config.codeExtensions);
+  }
+
+  /**
+   * Stored vector counts per embedding space (entries with an actual
+   * vector). Drives which spaces get a query embedding and the ratio-based
+   * result quota split — pi-local-rag's per-table embeddedCount.
+   */
+  vectorCountsByGroup(): { code: number; text: number } {
+    let code = 0;
+    let text = 0;
+    for (const [key, entry] of Object.entries(this.data.entries)) {
+      if (!entry.vector || entry.vector.length === 0) continue;
+      if (this.entryGroup(key, entry) === "code") code += 1;
+      else text += 1;
+    }
+    return { code, text };
+  }
+
+  /**
    * Remove all chunks for a given absolute file path from both the vector
    * store and the FTS side-car.
    */
@@ -489,9 +652,19 @@ export class KnowledgeIndex {
   }
 
   /**
-   * Prepare embedding text for a chunk with title context.
+   * Prepare embedding text for a chunk, per embedding group:
+   *
+   * - text (nomic): title/heading context line, as before.
+   * - code (jina): the file basename as a context line — pi-local-rag's
+   *   file-context scheme. jina-code was trained on code-with-context
+   *   pairs (docstring/question → code); a bare slice loses its file
+   *   identity, and the basename anchors filename-oriented queries without
+   *   touching the stored chunk content or FTS text.
    */
-  private chunkEmbedText(relPath: string, heading: string, chunkText: string): string {
+  private chunkEmbedText(group: EmbedGroup, relPath: string, heading: string, chunkText: string): string {
+    if (group === "code") {
+      return `${path.basename(relPath)}\n${chunkText}`;
+    }
     const title = relPath.replace(/\.[^.]+$/, "").replace(/\//g, " > ");
     const sectionContext = heading && heading !== "intro" ? ` > ${heading}` : "";
     return `Title: ${title}${sectionContext}\n\n${chunkText}`;
@@ -559,18 +732,25 @@ export class KnowledgeIndex {
     const report = opts?.onProgress;
 
     if (toProcess.length > 0) {
-      // Flatten all chunks for batch embedding
+      // Flatten all chunks for batch embedding, tracking each chunk's
+      // embedding group (code files → jina, everything else → nomic).
       const allChunkTexts: string[] = [];
+      const allChunkGroups: EmbedGroup[] = [];
       const chunkMeta: { fileIdx: number; chunkIdx: number }[] = [];
 
       for (let fi = 0; fi < toProcess.length; fi++) {
         const file = toProcess[fi];
+        const group = classifyFileGroup(file.absPath, this.config.codeExtensions);
         for (let ci = 0; ci < file.chunks.length; ci++) {
           const chunk = file.chunks[ci];
-          allChunkTexts.push(this.chunkEmbedText(file.relPath, chunk.heading, chunk.text));
+          allChunkTexts.push(this.chunkEmbedText(group, file.relPath, chunk.heading, chunk.text));
+          allChunkGroups.push(group);
           chunkMeta.push({ fileIdx: fi, chunkIdx: ci });
         }
       }
+
+      const chunksByGroup = { code: 0, text: 0 };
+      for (const group of allChunkGroups) chunksByGroup[group] += 1;
 
       report?.({
         phase: "scan",
@@ -580,30 +760,50 @@ export class KnowledgeIndex {
         // saw them; subtracting them here produced negative "unchanged" counts.
         unchanged: allFiles.length - toProcess.length,
         totalChunks: allChunkTexts.length,
+        chunksByGroup,
       });
 
-      // Embed in batches — skipped entirely in FTS-only mode.
+      // Embed in batches — skipped entirely in FTS-only mode. Each group is
+      // embedded with its own model (text → nomic, code → jina), mirroring
+      // pi-local-rag's per-group pipelines; progress reports cumulative
+      // per-group counts so the UI can render one line per model.
       const allVectors: (number[] | null)[] = new Array(allChunkTexts.length).fill(null);
       if (this.embedder) {
         // One chunk per sync step matches pi-local-rag's BATCH_SIZE (16 texts
         // per ONNX forward pass), so each step is a single padded forward pass
         // and progress ticks per pass instead of every 50 chunks.
         const BATCH_SIZE = 16;
-        for (let i = 0; i < allChunkTexts.length; i += BATCH_SIZE) {
-          const batchTexts = allChunkTexts.slice(i, i + BATCH_SIZE);
-          const vectors = await this.embedder.embedBatch(batchTexts);
-          for (let j = 0; j < vectors.length; j++) {
-            allVectors[i + j] = vectors[j];
-          }
-          // Best-effort current file: the file the finished batch ended in.
-          const lastMeta = chunkMeta[Math.min(i + vectors.length, chunkMeta.length) - 1];
+        const doneByGroup = { code: 0, text: 0 };
+        const emitEmbedProgress = (upto: number) => {
+          const lastMeta = chunkMeta[Math.min(upto, chunkMeta.length) - 1];
           report?.({
             phase: "embed",
-            done: Math.min(i + vectors.length, allChunkTexts.length),
+            done: Math.min(upto, allChunkTexts.length),
             total: allChunkTexts.length,
             currentFile: lastMeta ? toProcess[lastMeta.fileIdx].relPath : undefined,
+            doneByGroup: { ...doneByGroup },
+            totalByGroup: { ...chunksByGroup },
           });
+        };
+        for (const group of ["text", "code"] as const) {
+          const groupIndexes: number[] = [];
+          for (let i = 0; i < allChunkGroups.length; i++) {
+            if (allChunkGroups[i] === group) groupIndexes.push(i);
+          }
+          for (let g = 0; g < groupIndexes.length; g += BATCH_SIZE) {
+            const batchIndexes = groupIndexes.slice(g, g + BATCH_SIZE);
+            const batchTexts = batchIndexes.map((i) => allChunkTexts[i]);
+            const vectors = await this.embedder.embedBatch(batchTexts, group);
+            for (let j = 0; j < batchIndexes.length; j++) {
+              allVectors[batchIndexes[j]] = vectors[j];
+              if (vectors[j]) doneByGroup[group] += 1;
+            }
+            const lastIdx = batchIndexes[batchIndexes.length - 1];
+            emitEmbedProgress(lastIdx + 1);
+          }
         }
+        // Cover a group with zero chunks so both model lines always render.
+        emitEmbedProgress(allChunkTexts.length);
       } else {
         // FTS-only: no embedding work, jump the bar straight to complete so
         // the UI doesn't sit at 0% through the store loop.
@@ -613,6 +813,8 @@ export class KnowledgeIndex {
           done: allChunkTexts.length,
           total: allChunkTexts.length,
           currentFile: lastMeta ? toProcess[lastMeta.fileIdx].relPath : undefined,
+          doneByGroup: { ...chunksByGroup },
+          totalByGroup: { ...chunksByGroup },
         });
       }
 
@@ -648,6 +850,7 @@ export class KnowledgeIndex {
           sourceDir: file.sourceDir,
           mtime: file.mtime,
           vector: storedVector,
+          group: allChunkGroups[i],
           excerpt,
           heading: chunk.heading,
           chunkIndex: chunkIdx,
@@ -705,13 +908,23 @@ export class KnowledgeIndex {
         "vectorSearch() requires an embedder — configure a provider or use search()/hybridSearch() instead.",
       );
     }
-    const queryVector = await this.embedder.embed(query, signal);
+    // One query embedding per group that actually has stored vectors — a
+    // chunk is only ever compared against its own space's query vector
+    // (nomic vectors against the nomic query, jina vectors against the
+    // jina query; cross-space similarities are meaningless).
+    const queryVectorByGroup = new Map<EmbedGroup, number[]>();
 
-    const scored: { key: string; absPath: string; score: number }[] = [];
+    const scored: { key: string; absPath: string; score: number; group: EmbedGroup }[] = [];
     for (const [key, entry] of Object.entries(this.data.entries)) {
-      if (!entry.vector) continue;
+      if (!entry.vector || entry.vector.length === 0) continue;
+      const group = this.entryGroup(key, entry);
+      let queryVector = queryVectorByGroup.get(group);
+      if (!queryVector) {
+        queryVector = await this.embedder.embed(query, group, signal);
+        queryVectorByGroup.set(group, queryVector);
+      }
       const score = dotProduct(queryVector, entry.vector);
-      scored.push({ key, absPath: this.absPathFromKey(key), score });
+      scored.push({ key, absPath: this.absPathFromKey(key), score, group });
     }
 
     scored.sort((a, b) => b.score - a.score);
@@ -733,7 +946,7 @@ export class KnowledgeIndex {
 
     // Deduplicate: keep only the best-scoring chunk per file
     const seenPaths = new Set<string>();
-    const deduped: { key: string; absPath: string; score: number }[] = [];
+    const deduped: { key: string; absPath: string; score: number; group: EmbedGroup }[] = [];
 
     for (const item of scored) {
       if (seenPaths.has(item.absPath)) continue;
@@ -753,6 +966,8 @@ export class KnowledgeIndex {
           heading: entry.heading,
           matches: matchesByFile.get(s.absPath) ?? 1,
           lineRanges: (rangesByFile.get(s.absPath) ?? []).sort((a, b) => a[0] - b[0]),
+          sources: [] as RetrievalSource[],
+          group: s.group,
         };
       });
   }
@@ -766,9 +981,10 @@ export class KnowledgeIndex {
   }
 
   /**
-   * Hybrid search — mirrors pi-local-rag's `hybridSearch` for the nomic
-   * (prose-only) store: FTS5 BM25 + cosine embeddings blended as
-   * `alpha * bm25 + (1 - alpha) * vector` with alpha = 0.4, instead of RRF.
+   * Hybrid search — mirrors pi-local-rag's `hybridSearch` over both
+   * embedding spaces (nomic prose + jina code): FTS5 BM25 + cosine
+   * embeddings blended as `alpha * bm25 + (1 - alpha) * vector` with
+   * alpha = 0.4, instead of RRF.
    *
    *  - BM25 raw scores are min-max normalized across the FTS candidate set
    *    (range 0 → all candidates score 1, so ties stay rankable)
@@ -799,6 +1015,17 @@ export class KnowledgeIndex {
    * BM25 (FTS5 side-car) file hits harvested from the candidate set before
    * fusion — the keyword-side view of the same query, so callers can show
    * what pure keyword matching found alongside the blended ranking.
+   *
+   * Dual-space search, mirroring pi-local-rag: chunks live in two
+   * independent embedding spaces (text → nomic, code → jina). Each space's
+   * query is embedded only when that space has stored vectors; result
+   * selection is pi-local-rag's ratio-based quota split — the total
+   * (RESULT_TOTAL_QUOTA_DUAL_SPACE = 7 when both spaces store vectors, else
+   * RESULT_TOTAL_QUOTA = 5, capped by `limit`) is divided between code and
+   * prose in proportion to each space's stored vector count (integer
+   * quotas, min 1 per group, code group first), and each group enforces its
+   * own relevance floor (MIN_HYBRID_SCORE_CODE = 0.35 for hits the jina
+   * space surfaced, MIN_HYBRID_SCORE_TEXT = 0.4 for everything else).
    */
   async searchWithBm25(
     query: string,
@@ -806,14 +1033,6 @@ export class KnowledgeIndex {
     signal?: AbortSignal,
   ): Promise<HybridSearchWithBm25> {
     const ALPHA = 0.4;
-    // Floor on the blended score: anything below is treated as unrelated and
-    // omitted entirely — a query with only one related file returns just that
-    // file instead of padding the result list with noise. Calibrated on a
-    // real nomic index (8782 chunks): unrelated queries top out at ~0.31-0.38
-    // (anisotropic baseline, cos ~0.52 × (1 - ALPHA)), while related hits
-    // start at ~0.8. 0.4 is also exactly the ceiling for a pure keyword-only
-    // match (ALPHA × bm25=1 + (1-ALPHA) × cos~0), so those always survive.
-    const MIN_HYBRID_SCORE = 0.4;
     const ftsCandidateLimit = Math.max(limit * 20, 200);
     const vectorCandidateLimit = Math.max(limit * 10, 100);
 
@@ -825,32 +1044,50 @@ export class KnowledgeIndex {
       ftsCandidates = [];
     }
 
-    // Vector candidates: raw cosine similarity on unit-normalized embeddings
-    // (dot product), clamped at 0, top-K by similarity. One backend failing
-    // must not take down the other.
-    let vectorSimilarityByKey = new Map<string, number>();
+    // Per-space stored vector counts — they gate the query embeddings and
+    // drive the ratio-based result quota split.
+    const { code: codeVectorCount, text: proseVectorCount } = this.vectorCountsByGroup();
+
+    // Vector candidates per space: raw cosine similarity on unit-normalized
+    // embeddings (dot product), clamped at 0, top-K by similarity. Each
+    // model's query is only embedded when its own space has stored vectors
+    // (skips loading a model the store can't use); a space whose embedding
+    // fails is skipped without taking down the other.
+    const vectorSimilarityByKey = new Map<string, number>();
+    const vectorSourceByKey = new Map<string, RetrievalSource>();
     if (this.embedder) {
-      try {
-        const queryVector = await this.embedder.embed(query, signal);
-        const scored: { key: string; sim: number }[] = [];
-        for (const [key, entry] of Object.entries(this.data.entries)) {
-          if (!entry.vector) continue;
-          scored.push({ key, sim: Math.max(0, dotProduct(queryVector, entry.vector)) });
-        }
-        scored.sort((a, b) => b.sim - a.sim);
-        vectorSimilarityByKey = new Map(
-          scored.slice(0, vectorCandidateLimit).map((s) => [s.key, s.sim]),
-        );
-      } catch (err) {
-        // Surface a readable hint on first failure; swallow otherwise.
-        if (process.env.KNOWLEDGE_SEARCH_DEBUG) {
-          console.error(`knowledge-search: vector search failed: ${(err as Error).message}`);
-        }
-        vectorSimilarityByKey = new Map();
-      }
+      const spaceFor = (group: EmbedGroup): RetrievalSource =>
+        group === "code" ? "jina-code" : "nomic";
+      await Promise.all(
+        (["text", "code"] as const).map(async (group) => {
+          const storedCount = group === "code" ? codeVectorCount : proseVectorCount;
+          if (!storedCount) return;
+          try {
+            const queryVector = await this.embedder!.embed(query, group, signal);
+            const scored: { key: string; sim: number }[] = [];
+            for (const [key, entry] of Object.entries(this.data.entries)) {
+              if (!entry.vector || entry.vector.length === 0) continue;
+              if (this.entryGroup(key, entry) !== group) continue;
+              scored.push({ key, sim: Math.max(0, dotProduct(queryVector, entry.vector)) });
+            }
+            scored.sort((a, b) => b.sim - a.sim);
+            for (const s of scored.slice(0, vectorCandidateLimit)) {
+              vectorSimilarityByKey.set(s.key, s.sim);
+              vectorSourceByKey.set(s.key, spaceFor(group));
+            }
+          } catch (err) {
+            // Surface a readable hint on first failure; swallow otherwise.
+            if (process.env.KNOWLEDGE_SEARCH_DEBUG) {
+              console.error(
+                `knowledge-search: ${spaceFor(group)} vector search failed: ${(err as Error).message}`
+              );
+            }
+          }
+        }),
+      );
     }
 
-    // Union of candidate keys from both backends.
+    // Union of candidate keys from all engines.
     const candidateKeys = new Set<string>([
       ...ftsCandidates.map((c) => c.key),
       ...vectorSimilarityByKey.keys(),
@@ -895,6 +1132,17 @@ export class KnowledgeIndex {
     const meaningfulQueryTerms = query.toLowerCase().split(/\s+/).filter((t) => t.length > 1);
     const firstQueryTerm = meaningfulQueryTerms[0];
 
+    // Per-engine provenance for every candidate: which engine(s) surfaced
+    // it (BM25, nomic space, jina-code space) — pi-local-rag's sources.
+    const sourcesByKey = new Map<string, RetrievalSource[]>();
+    const attributeSource = (key: string, source: RetrievalSource) => {
+      const attributed = sourcesByKey.get(key) ?? [];
+      if (!attributed.includes(source)) attributed.push(source);
+      sourcesByKey.set(key, attributed);
+    };
+    for (const c of ftsCandidates) attributeSource(c.key, "bm25");
+    for (const [key, source] of vectorSourceByKey) attributeSource(key, source);
+
     // Score every candidate: normalized BM25 (with a filename boost) blended
     // with the vector similarity, exactly pi-local-rag's alpha blend.
     const scored: { key: string; score: number }[] = [];
@@ -903,24 +1151,75 @@ export class KnowledgeIndex {
       // Boost when the first meaningful query term appears in the file path
       // (the absolute path — pi-local-rag's file_path). Guarded on the term
       // so an empty query can't spuriously boost every result.
-      const path = this.absPathFromKey(key);
-      if (firstQueryTerm && path.toLowerCase().includes(firstQueryTerm)) {
+      const absPath = this.absPathFromKey(key);
+      if (firstQueryTerm && absPath.toLowerCase().includes(firstQueryTerm)) {
         bm25Normalized = Math.min(1, bm25Normalized * 1.5);
       }
       const vectorSimilarity = vectorSimilarityByKey.get(key) ?? 0;
       const hybridScore = hasAnyVectors
         ? ALPHA * bm25Normalized + (1 - ALPHA) * vectorSimilarity
         : bm25Normalized;
-      if (hybridScore >= MIN_HYBRID_SCORE) scored.push({ key, score: hybridScore });
+      scored.push({ key, score: hybridScore });
     }
     scored.sort((a, b) => b.score - a.score);
+
+    // Result selection is a ratio-based quota split (see the method doc):
+    // each candidate is floored by its own space's relevance floor — a
+    // candidate's space is whichever embedding engine surfaced it; BM25-only
+    // hits ride the text floor (their keyword-match ceiling is exactly 0.4).
+    // The ranked survivors are split into code hits (surfaced by jina) and
+    // prose hits; quotas are allocated proportionally to each space's stored
+    // vector count (integer quotas summing exactly to the total, at least 1
+    // per group when both qualify, code group first — a code hit outranks a
+    // prose hit at equal quota rank). A group with fewer qualifying hits
+    // than its quota yields the slack to the other group's next-best hits
+    // (best hybrid first), so the total stays filled. Chunks found only by
+    // BM25 rank with the prose group. Within a group, order is by hybrid
+    // score. When only one group qualifies, it takes the whole total.
+    const isCodeHit = (key: string) => sourcesByKey.get(key)?.includes("jina-code") ?? false;
+    const minScoreFor = (key: string) =>
+      isCodeHit(key) ? MIN_HYBRID_SCORE_CODE : MIN_HYBRID_SCORE_TEXT;
+    const ranked = scored.filter(
+      (s) => s.score > 0 && s.score >= minScoreFor(s.key),
+    );
+    const codeHits = ranked.filter((s) => isCodeHit(s.key));
+    const proseHits = ranked.filter((s) => !isCodeHit(s.key));
+
+    const bothSpacesHaveVectors = codeVectorCount > 0 && proseVectorCount > 0;
+    const total = Math.min(
+      limit,
+      bothSpacesHaveVectors ? RESULT_TOTAL_QUOTA_DUAL_SPACE : RESULT_TOTAL_QUOTA,
+    );
+
+    let selected: { key: string; score: number }[];
+    if (codeHits.length > 0 && proseHits.length > 0) {
+      const { codeQuota, proseQuota } = splitResultQuotas(total, codeVectorCount, proseVectorCount);
+      const codePrimary = codeHits.slice(0, codeQuota);
+      const prosePrimary = proseHits.slice(0, proseQuota);
+      const shortfall = total - (codePrimary.length + prosePrimary.length);
+      let codeExtra: typeof codeHits = [];
+      let proseExtra: typeof proseHits = [];
+      if (shortfall > 0) {
+        const filler = [
+          ...codeHits.slice(codePrimary.length),
+          ...proseHits.slice(prosePrimary.length),
+        ]
+          .sort((a, b) => b.score - a.score)
+          .slice(0, shortfall);
+        codeExtra = filler.filter((s) => isCodeHit(s.key));
+        proseExtra = filler.filter((s) => !isCodeHit(s.key));
+      }
+      selected = [...codePrimary, ...codeExtra, ...prosePrimary, ...proseExtra];
+    } else {
+      selected = (codeHits.length > 0 ? codeHits : proseHits).slice(0, total);
+    }
 
     // Collect per-file match counts and line ranges (pre-dedup) so callers
     // can show "file (N hits, L..-L..)" even though only the best chunk per
     // file is returned.
     const matchesByFile = new Map<string, number>();
     const rangesByFile = new Map<string, Array<[number, number]>>();
-    for (const { key } of scored) {
+    for (const { key } of ranked) {
       const absPath = this.absPathFromKey(key);
       matchesByFile.set(absPath, (matchesByFile.get(absPath) ?? 0) + 1);
       const entry = this.data.entries[key];
@@ -931,10 +1230,10 @@ export class KnowledgeIndex {
       }
     }
 
-    // Dedup: keep only the best chunk per file.
+    // Dedup: keep only the best chunk per file, in quota order.
     const seen = new Set<string>();
     const out: SearchResult[] = [];
-    for (const { key, score } of scored) {
+    for (const { key, score } of selected) {
       const entry = this.data.entries[key];
       // Key might exist in FTS but not in vector store if vector side is
       // stale. Look up excerpt/heading via FTS fallback in that case.
@@ -949,6 +1248,9 @@ export class KnowledgeIndex {
       const sim = vectorSimilarityByKey.get(key) ?? 0;
       const source: "vector" | "bm25" =
         hasAnyVectors && (1 - ALPHA) * sim >= ALPHA * bm25Norm ? "vector" : "bm25";
+      const group = entry
+        ? this.entryGroup(key, entry)
+        : classifyFileGroup(absPath, this.config.codeExtensions);
       if (entry) {
         out.push({
           path: absPath,
@@ -958,6 +1260,8 @@ export class KnowledgeIndex {
           matches: matchesByFile.get(absPath) ?? 1,
           lineRanges: (rangesByFile.get(absPath) ?? []).sort((a, b) => a[0] - b[0]),
           source,
+          sources: sourcesByKey.get(key) ?? [],
+          group,
         });
       } else {
         // Vector-less — synthesise from whatever FTS has.
@@ -969,6 +1273,8 @@ export class KnowledgeIndex {
           matches: matchesByFile.get(absPath) ?? 1,
           lineRanges: [],
           source,
+          sources: sourcesByKey.get(key) ?? [],
+          group,
         });
       }
       if (out.length >= limit) break;
@@ -1008,15 +1314,19 @@ export class KnowledgeIndex {
     // Remove old chunks for this file
     this.removeAllChunks(absPath);
 
-    // Embed and store each chunk (vectors remain empty in FTS-only mode)
+    // Embed and store each chunk (vectors remain empty in FTS-only mode).
+    // The whole file goes to one embedding group — code extension → jina,
+    // everything else → nomic.
     let vectors: (number[] | null)[];
     if (this.embedder) {
-      const texts = chunks.map((c) => this.chunkEmbedText(relPath, c.heading, c.text));
-      vectors = await this.embedder.embedBatch(texts);
+      const group = classifyFileGroup(absPath, this.config.codeExtensions);
+      const texts = chunks.map((c) => this.chunkEmbedText(group, relPath, c.heading, c.text));
+      vectors = await this.embedder.embedBatch(texts, group);
     } else {
       vectors = new Array(chunks.length).fill(null);
     }
 
+    const fileGroup = classifyFileGroup(absPath, this.config.codeExtensions);
     for (let i = 0; i < chunks.length; i++) {
       const vector = vectors[i];
       if (this.embedder && !vector) continue;
@@ -1030,6 +1340,7 @@ export class KnowledgeIndex {
         sourceDir,
         mtime: stat.mtimeMs,
         vector: storedVector,
+        group: fileGroup,
         excerpt,
         heading: chunks[i].heading,
         chunkIndex: i,

@@ -1,22 +1,35 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { EMBEDDING_DIMENSIONS, EMBEDDING_MODEL } from "./embedder.js";
+import {
+  EMBEDDING_DIMENSIONS,
+  EMBEDDING_MODEL,
+  CODE_EMBEDDING_MODEL,
+  type EmbedGroup,
+} from "./embedder.js";
 
 export interface Config {
   /** Directories to index */
   dirs: string[];
   /** File extensions to index (with dots) */
   fileExtensions: string[];
+  /**
+   * Extensions routed to the code embedding group (jina); everything else
+   * in `fileExtensions` goes to the text group (nomic). Mirrors
+   * pi-local-rag's code/text extension split.
+   */
+  codeExtensions: string[];
   /** Directory names to skip */
   excludeDirs: string[];
-  /** Embedding dimensions — always the nomic model's fixed 768 */
+  /** Embedding dimensions — both models' fixed 768 */
   dimensions: number;
   /**
    * Signature of the engine that produces the embeddings
-   * (`transformers:nomic-ai/nomic-embed-text-v1.5:768`). The index persists
-   * the signature its vectors were built with; a mismatch on load removes
-   * all existing embeddings and forces a full re-embed. Constant — the
-   * engine is not configurable.
+   * (`transformers:nomic-ai/nomic-embed-text-v1.5+jinaai/jina-embeddings-v2-base-code:768`).
+   * The index persists the signature its vectors were built with; a mismatch
+   * on load drops incompatible embeddings and forces a re-embed (text-only
+   * nomic vectors from the legacy single-model engine are kept — see
+   * index-store's legacy migration). Constant — the engine is not
+   * configurable.
    */
   modelSignature: string;
   /** Where to store the index */
@@ -39,26 +52,57 @@ export interface OverviewConfig {
 }
 
 /**
- * Default file extensions — exactly the text/prose group pi-local-rag's
- * nomic model indexes (DEFAULT_DOC_EXTS). Binary document types (.pdf,
- * .docx) also go to nomic there but require extraction libraries
- * (unpdf/mammoth) and are therefore not included here.
+ * Default file extensions — the union of pi-local-rag's two embedding
+ * groups (DEFAULT_TEXT_EXTS): code extensions are embedded by
+ * jina-embeddings-v2-base-code, everything else by nomic. Binary document
+ * types (.pdf, .docx) also go to nomic there but require extraction
+ * libraries (unpdf/mammoth) and are therefore not included here.
  */
-export const DEFAULT_FILE_EXTENSIONS = [
+export const DEFAULT_CODE_EXTENSIONS = [
+  ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+  ".py", ".rs", ".go", ".java", ".kt", ".kts", ".scala",
+  ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hxx",
+  ".cs", ".fs", ".vb",
+  ".swift", ".m", ".mm",
+  ".rb", ".php", ".pl", ".lua", ".dart", ".ex", ".exs", ".erl", ".clj", ".cljs", ".edn",
+  ".vue", ".svelte", ".astro", ".twig",
+  ".css", ".scss", ".sass", ".less",
+  ".sh", ".bash", ".zsh", ".fish", ".ps1",
+  ".sql", ".graphql", ".gql", ".proto",
+  ".tf", ".hcl",
+];
+
+/** Text/prose + data/config extensions → embedded by nomic (DEFAULT_DOC_EXTS). */
+export const DEFAULT_DOC_EXTENSIONS = [
   ".md", ".mdx", ".txt", ".rst",
   ".html", ".htm",
   ".json", ".jsonc", ".yaml", ".yml", ".toml", ".ini", ".xml", ".csv", ".tsv",
   ".env", ".gitignore", ".dockerfile",
 ];
 
+export const DEFAULT_FILE_EXTENSIONS = [...DEFAULT_CODE_EXTENSIONS, ...DEFAULT_DOC_EXTENSIONS];
+
+/**
+ * Which embedding group a file belongs to: code extensions route to the
+ * jina code model, everything else to nomic — pi-local-rag's classifyFile.
+ * `codeExtensions` defaults to the built-in code list.
+ */
+export function classifyFileGroup(filePath: string, codeExtensions?: string[]): EmbedGroup {
+  const ext = path.extname(filePath).toLowerCase();
+  if (!ext) return "text";
+  const codeExts = codeExtensions ?? DEFAULT_CODE_EXTENSIONS;
+  return codeExts.includes(ext) ? "code" : "text";
+}
+
 /**
  * Raw shape stored in the config file. There is no embedding-engine
- * configuration — nomic is always used — so a legacy `provider` or
- * `dimensions` key is ignored (with a one-time warning).
+ * configuration — nomic (text) + jina (code) are always used — so a legacy
+ * `provider` or `dimensions` key is ignored (with a one-time warning).
  */
 export interface ConfigFile {
   dirs?: string[];
   fileExtensions?: string[];
+  codeExtensions?: string[];
   excludeDirs?: string[];
   autoInject?: boolean;
   overview?: Partial<OverviewConfig>;
@@ -195,13 +239,24 @@ export function loadConfig(cwd?: string): Config | null {
     .map((d) => d.trim()) ??
     file?.excludeDirs ?? ["node_modules", ".git", ".obsidian", ".trash"];
 
-  // The embedding engine is not configurable — always nomic. Legacy
-  // `provider` / `dimensions` keys in old configs are ignored with a
-  // one-time notice so their owners aren't left wondering.
+  // Code-group extensions (jina model). User-configurable, defaulting to
+  // pi-local-rag's code list; fileExtensions governs what is scanned, this
+  // governs which embedding model a scanned file goes to.
+  const codeExtensions =
+    envStr("KNOWLEDGE_SEARCH_CODE_EXTENSIONS")
+      ?.split(",")
+      .map((e) => e.trim().toLowerCase())
+      .filter(Boolean) ??
+      file?.codeExtensions?.map((e) => e.toLowerCase()) ??
+      DEFAULT_CODE_EXTENSIONS;
+
+  // The embedding engine is not configurable — always nomic (text) + jina
+  // (code). Legacy `provider` / `dimensions` keys in old configs are
+  // ignored with a one-time notice so their owners aren't left wondering.
   const legacy = file as Record<string, unknown> | null;
   if (legacy && (legacy.provider !== undefined || legacy.dimensions !== undefined)) {
     console.error(
-      "pi-knowledge-search: ignoring \"provider\"/\"dimensions\" config keys — the embedding engine is always nomic-embed-text-v1.5 (local ONNX)."
+      "pi-knowledge-search: ignoring \"provider\"/\"dimensions\" config keys — the embedding engine is always nomic-embed-text-v1.5 (text) + jina-embeddings-v2-base-code (code), local ONNX."
     );
   }
 
@@ -226,9 +281,10 @@ export function loadConfig(cwd?: string): Config | null {
   return {
     dirs,
     fileExtensions,
+    codeExtensions,
     excludeDirs: excludeDirs,
     dimensions: EMBEDDING_DIMENSIONS,
-    modelSignature: `transformers:${EMBEDDING_MODEL}:${EMBEDDING_DIMENSIONS}`,
+    modelSignature: `transformers:${EMBEDDING_MODEL}+${CODE_EMBEDDING_MODEL}:${EMBEDDING_DIMENSIONS}`,
     indexDir,
     autoInject: envBool("KNOWLEDGE_SEARCH_AUTO_INJECT") ?? file?.autoInject ?? true,
     overview,

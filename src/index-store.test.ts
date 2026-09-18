@@ -3,8 +3,13 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { KnowledgeIndex, dotProduct, type SyncProgress } from "./index-store.js";
-import type { Config } from "./config.js";
+import {
+  KnowledgeIndex,
+  splitResultQuotas,
+  dotProduct,
+  type SyncProgress,
+} from "./index-store.js";
+import { DEFAULT_CODE_EXTENSIONS, type Config } from "./config.js";
 import type { Embedder } from "./embedder.js";
 
 describe("dotProduct", () => {
@@ -71,6 +76,7 @@ function makeConfig(dir: string, dimensions = 4): Config {
   return {
     dirs: ["/tmp/does-not-matter"],
     fileExtensions: [".md"],
+    codeExtensions: DEFAULT_CODE_EXTENSIONS,
     excludeDirs: [],
     dimensions,
     modelSignature: "transformers:nomic-ai/nomic-embed-text-v1.5:768",
@@ -187,7 +193,7 @@ describe("KnowledgeIndex streaming load/save", () => {
     await reader.load();
     assert.equal(reader.chunkCount(), 1);
     const internal = reader as unknown as { data: { version: number; entries: Record<string, unknown> } };
-    assert.equal(internal.data.version, 4, "version should normalize to the current format on load");
+    assert.equal(internal.data.version, 5, "version should normalize to the current format on load");
     const entry = internal.data.entries["/vault/a.md#0"] as { vector: number[] };
     assert.deepStrictEqual(entry.vector, [1, 0, 0, 0], "existing vectors must be preserved");
     await reader.close();
@@ -342,7 +348,8 @@ describe("KnowledgeIndex embedding signature", () => {
     return {
       dirs: ["/tmp/does-not-matter"],
       fileExtensions: [".md"],
-      excludeDirs: [],
+      codeExtensions: DEFAULT_CODE_EXTENSIONS,
+    excludeDirs: [],
       dimensions,
         modelSignature: signature,
       indexDir: dir,
@@ -416,6 +423,80 @@ describe("KnowledgeIndex embedding signature", () => {
     assert.equal(raw.embeddingModel, "transformers:nomic-ai/nomic-embed-text-v1.5:4");
     await idx.close();
   });
+
+  it("migrates a nomic-only index: keeps text vectors, drops code vectors", async () => {
+    // The pre-dual-model engine embedded EVERYTHING with nomic. On load,
+    // text-group entries keep their vectors; code-group entries are dropped
+    // (wrong model) and re-embedded by sync.
+    const legacySignature = "transformers:nomic-ai/nomic-embed-text-v1.5:768";
+    const map: Record<string, unknown> = {
+      "/vault/note.md#0": {
+        relPath: "note.md",
+        sourceDir: "/vault",
+        mtime: 1,
+        vector: [1, 0, 0, 0],
+        excerpt: "prose entry",
+        heading: "",
+        chunkIndex: 0,
+      },
+      "/vault/util.ts#0": {
+        relPath: "util.ts",
+        sourceDir: "/vault",
+        mtime: 1,
+        vector: [0, 1, 0, 0],
+        excerpt: "code entry",
+        heading: "",
+        chunkIndex: 0,
+      },
+    };
+    fs.writeFileSync(
+      path.join(tmpDir, "index.json"),
+      JSON.stringify({
+        version: 4,
+        dimensions: 4,
+        embeddingModel: legacySignature,
+        entries: map,
+      })
+    );
+
+    const dualSignature = "transformers:nomic+code:4";
+    const idx = new KnowledgeIndex(makeSigConfig(tmpDir, dualSignature), new StubEmbedder());
+    await idx.load();
+    const internal = idx as unknown as {
+      data: { entries: Record<string, { vector: number[] }>; embeddingModel: string | null };
+    };
+    assert.equal(idx.chunkCount(), 1, "only the text-group entry survives");
+    assert.ok(internal.data.entries["/vault/note.md#0"], "prose entry kept");
+    assert.deepStrictEqual(internal.data.entries["/vault/note.md#0"].vector, [1, 0, 0, 0]);
+    assert.ok(!internal.data.entries["/vault/util.ts#0"], "code entry dropped (needs jina re-embed)");
+    assert.equal(internal.data.embeddingModel, dualSignature, "signature upgraded so migration runs once");
+    await idx.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Result quota split — pi-local-rag's ratio-based dual-space selection
+// ---------------------------------------------------------------------------
+
+describe("splitResultQuotas", () => {
+  it("splits slots in proportion to each space's stored vector count", () => {
+    assert.deepEqual(splitResultQuotas(7, 4, 3), { codeQuota: 4, proseQuota: 3 });
+    assert.deepEqual(splitResultQuotas(7, 1, 6), { codeQuota: 1, proseQuota: 6 });
+    assert.deepEqual(splitResultQuotas(5, 3, 5), { codeQuota: 2, proseQuota: 3 });
+  });
+
+  it("gives each group at least one slot when both qualify", () => {
+    assert.deepEqual(splitResultQuotas(2, 1, 99), { codeQuota: 1, proseQuota: 1 });
+  });
+
+  it("goes code-first when only one slot exists", () => {
+    assert.deepEqual(splitResultQuotas(1, 1, 99), { codeQuota: 1, proseQuota: 0 });
+    assert.deepEqual(splitResultQuotas(0, 5, 5), { codeQuota: 0, proseQuota: 0 });
+  });
+
+  it("splits 50/50 when the store has no vectors at all", () => {
+    assert.deepEqual(splitResultQuotas(5, 0, 0), { codeQuota: 3, proseQuota: 2 });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -482,6 +563,133 @@ describe("KnowledgeIndex text file size cap", () => {
     await idx.updateFile(bigFile, vault);
     assert.equal(idx.size(), 0, "oversized file must not be indexed");
     await idx.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dual-engine store — both embedding groups (nomic + jina) coexist in the
+// single vector store, and files route to their group's model by extension.
+// ---------------------------------------------------------------------------
+
+describe("KnowledgeIndex dual-engine store (nomic + jina)", () => {
+  let tmpDir: string;
+
+  before(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ks-dual-store-"));
+  });
+
+  beforeEach(() => {
+    for (const f of fs.readdirSync(tmpDir)) {
+      fs.rmSync(path.join(tmpDir, f), { recursive: true, force: true });
+    }
+  });
+
+  after(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function makeMixedConfig(dir: string): Config {
+    return {
+      dirs: ["/tmp/does-not-matter"],
+      fileExtensions: [".md", ".ts"],
+      codeExtensions: DEFAULT_CODE_EXTENSIONS,
+      excludeDirs: [],
+      dimensions: 4,
+      modelSignature: "transformers:test+nomic:4",
+      indexDir: dir,
+      autoInject: false,
+      overview: { inject: false, maxDepth: 2, maxFoldersPerDir: 20, maxKeywordsPerFolder: 5 },
+    };
+  }
+
+  /** Deterministic vectors per group + a log of every (group, docInput) call. */
+  function recordingEmbedder(logs: { group: string; docInput: string }[] = []): Embedder {
+    return {
+      async embed(text: string, group: "code" | "text" = "text") {
+        // Unit query vector per group so each space matches its own docs.
+        return group === "code" ? [0, 1, 0, 0] : [1, 0, 0, 0];
+      },
+      async embedBatch(texts: string[], group: "code" | "text" = "text") {
+        for (const t of texts) logs.push({ group, docInput: t });
+        return texts.map(() => (group === "code" ? [0, 1, 0, 0] : [1, 0, 0, 0]));
+      },
+    };
+  }
+
+  it("routes each file to its group's model by extension (sync + updateFile)", async () => {
+    const vault = path.join(tmpDir, "vault");
+    fs.mkdirSync(vault, { recursive: true });
+    fs.writeFileSync(path.join(vault, "note.md"), "# Note\n\nProse about deployment rollbacks.\n");
+    fs.writeFileSync(path.join(vault, "util.ts"), "export function helper() {}\n");
+    // Case-insensitive extension matching must reach the code group too.
+    fs.writeFileSync(path.join(vault, "Script.TS"), "export const retryLimit = 42; // uppercase extension\n");
+
+    const logs: { group: string; docInput: string }[] = [];
+    const config = makeMixedConfig(path.join(tmpDir, "idx"));
+    config.dirs = [vault];
+    const idx = new KnowledgeIndex(config, recordingEmbedder(logs));
+    await idx.load();
+    const { added } = await idx.sync();
+    assert.equal(added, 3);
+
+    // Group routing: prose → text/nomic, code → code/jina.
+    const byGroup = (g: string) => logs.filter((l) => l.group === g);
+    assert.ok(byGroup("text").length >= 1, "prose chunks embed with the text group (nomic)");
+    assert.ok(byGroup("code").length >= 2, "code chunks embed with the code group (jina)");
+    assert.ok(
+      byGroup("text").every((l) => l.docInput.startsWith("Title: ")),
+      "text-group doc input keeps the Title: context scheme",
+    );
+    const utilCall = byGroup("code").find((l) => l.docInput.startsWith("util.ts"));
+    assert.ok(utilCall, "code-group doc input prepends the file basename (jina file-context scheme)");
+
+    // Stored entries carry the group.
+    const internal = idx as unknown as { data: { entries: Record<string, { group?: string }> } };
+    assert.equal(internal.data.entries[`${path.join(vault, "note.md")}#0`].group, "text");
+    assert.equal(internal.data.entries[`${path.join(vault, "util.ts")}#0`].group, "code");
+    assert.equal(internal.data.entries[`${path.join(vault, "Script.TS")}#0`].group, "code",
+      "uppercase extension routes to the code group too");
+
+    // updateFile uses the same routing.
+    logs.length = 0;
+    fs.writeFileSync(path.join(vault, "util.ts"), "export function helper2() {}\n");
+    await idx.updateFile(path.join(vault, "util.ts"), vault);
+    assert.ok(logs.every((l) => l.group === "code"), "updateFile re-embeds code files with the code group");
+    assert.ok(logs[0]?.docInput.startsWith("util.ts"));
+    await idx.close();
+  });
+
+  it("both engines' vectors persist and stay searchable after save/load", async () => {
+    const vault = path.join(tmpDir, "vault2");
+    fs.mkdirSync(vault, { recursive: true });
+    fs.writeFileSync(path.join(vault, "note.md"), "# Note\n\nProse about deployment rollbacks.\n");
+    fs.writeFileSync(path.join(vault, "util.ts"), "export function helper() {}\n");
+
+    const indexDir = path.join(tmpDir, "idx2");
+    const writerConfig = makeMixedConfig(indexDir);
+    writerConfig.dirs = [vault];
+    const writer = new KnowledgeIndex(writerConfig, recordingEmbedder());
+    await writer.load();
+    await writer.sync();
+    assert.deepEqual(writer.vectorCountsByGroup(), { code: 1, text: 1 });
+    await writer.close();
+
+    // Reopen from disk: both groups' vectors survive the round-trip.
+    const reader = new KnowledgeIndex(makeMixedConfig(indexDir), recordingEmbedder());
+    await reader.load();
+    assert.deepEqual(reader.vectorCountsByGroup(), { code: 1, text: 1 },
+      "the store holds both engines' vectors after reload");
+
+    const internal = reader as unknown as { data: { entries: Record<string, { group?: string; vector: number[] }> } };
+    assert.deepEqual(internal.data.entries[`${path.join(vault, "note.md")}#0`].vector, [1, 0, 0, 0]);
+    assert.deepEqual(internal.data.entries[`${path.join(vault, "util.ts")}#0`].vector, [0, 1, 0, 0]);
+
+    // A query returns hits from both spaces — each scored against its own
+    // model's query vector (query vectors: text → [1,0,0,0], code → [0,1,0,0]).
+    const { results } = await reader.searchWithBm25("rollback helper", 5);
+    const groups = results.map((r) => r.group).sort();
+    assert.deepEqual(groups, ["code", "text"], "hits from both embedding engines surface");
+    await reader.close();
   });
 });
 

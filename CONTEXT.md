@@ -1,6 +1,6 @@
 # pi-knowledge-search
 
-Hybrid local-file search for pi. Indexes text/markdown with both vector embeddings and SQLite FTS5 keyword search, fuses results via RRF, and exposes a `knowledge_search` tool to the LLM.
+Hybrid local-file search for pi. Indexes text/markdown **and source code** with both vector embeddings (dual spaces: nomic for prose, jina for code) and SQLite FTS5 keyword search, blends results with an alpha-weighted score, and exposes a `knowledge_search` tool to the LLM.
 
 ## Language
 
@@ -20,16 +20,26 @@ A SQLite FTS5 database that sits *next to* the vector index and holds the same C
 _Avoid_: keyword index (too generic), secondary index.
 
 **RRF** (Reciprocal Rank Fusion):
-The fusion strategy. Both backends produce a ranked list for a query; each doc's final score is `Σ 1/(k + rank)` across lists, with `k = 60`. Docs both backends agree on get boosted; docs either backend finds alone still surface.
+Historical term for the fusion strategy. Replaced by the **alpha blend**: both backends produce a ranked list for a query and each chunk's final score is `0.4 × normalized BM25 + 0.6 × cosine` (alpha = 0.4, like pi-local-rag).
+_Avoid_: RRF, rank fusion (except when discussing the removed design).
+
+**Result quota**:
+The per-group slot count in a hybrid result list. The **total** is 7 slots when both Embed groups store vectors, else 5 — capped by the caller's limit. Slots are **split in proportion to each space's stored vector count** (integer quotas, min 1 per group, code group first). A group that can't fill its quota yields the slack to the other group.
+
+**Relevance floor**:
+The minimum hybrid score per Embed group — **0.35 for jina-code hits, 0.4 for nomic/BM25 hits**. Anything below is treated as unrelated and omitted.
 
 **Hybrid search**:
-The default search mode — runs vector and FTS in parallel and fuses via RRF. Falls back to pure FTS if the embedder errors, pure vector if the FTS side-car is empty.
+The default search mode — runs the vector spaces and FTS in parallel and blends with `0.4 × BM25 + 0.6 × vector`. Falls back to pure FTS if the embedder errors, pure vector if the FTS side-car is empty.
+
+**Embed group**:
+Which embedding model a file's Chunks belong to: **code** (jina) or **text** (nomic). Decided by file extension (`codeExtensions` config, defaulting to pi-local-rag's code list). Each group is a separate vector space with its own query embedding, relevance floor, and result quota.
 
 **Embedder**:
-The provider-agnostic interface for turning text into vectors. Providers: **OpenAI**, **OpenAI-compatible** (local/self-hosted), **Bedrock**, **Ollama**. Chosen per config at startup.
+The local ONNX (Transformers.js) engine turning text into vectors — one pipeline per Embed group: **nomic-embed-text-v1.5** for prose, **jina-embeddings-v2-base-code** for source code. Not configurable.
 
 **Provider**:
-A concrete Embedder implementation. Swappable via config.
+Historical term for a swappable Embedder backend. Removed — the engine is fixed (local nomic + jina).
 
 **Sync worker**:
 Background watcher that re-indexes files on change. Keeps both the Vector index and the FTS5 side-car in sync.
@@ -44,7 +54,8 @@ The public tool exposed to the LLM — takes a query, returns ranked results. Th
 
 - A file produces one or more **Chunks** via the **Chunker**.
 - Each **Chunk** is stored in both the **Vector index** and the **FTS5 side-car**, keyed by `${absPath}#${chunkIndex}`.
-- **Hybrid search** fans a query out to both indices, then merges with **RRF (k=60)**.
+- **Hybrid search** fans a query out to both indices, then merges with the **alpha blend** (`0.4 × BM25 + 0.6 × cosine`).
+- Each **Embed group** is its own vector space: its query is embedded only when that space holds vectors, and result slots are allocated by the **Result quota** split under per-group **Relevance floors**.
 - The **Embedder** is only used at write time (and for the query-side vector) — the **FTS5 side-car** doesn't use it.
 - The **Sync worker** keeps both indices consistent as files change.
 - **Backfill** populates the FTS5 side-car from the Vector index without re-running the **Embedder**.
